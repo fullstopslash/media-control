@@ -4,6 +4,6 @@ project: media-control
 
 # Todo - media-control
 
-## Pending <!-- desk:filter project:media-control status:pending -->
+## Pending <!-- the-desk:filter project:media-control status:pending -->
 
-## Completed <!-- desk:filter project:media-control status:completed -->
+## Completed <!-- the-desk:filter project:media-control status:completed -->
