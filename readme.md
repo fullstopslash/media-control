@@ -1,16 +1,30 @@
 # media-control
 
-## Description
+Rust applet for managing floating media windows on Hyprland. Handles mpv, PiP, and Jellyfin Media Player with automatic avoidance, positioning, and Jellyfin server integration.
 
-a rust applet to control media windows on hyprland.
+## Install
 
-## Installation
+```sh
+cargo build --release
+```
 
-cargo build then make sure the app is in PATH.
+Add `target/release/media-control` and `target/release/media-control-daemon` to your PATH.
 
 ## Usage
 
+```sh
+media-control fullscreen              # toggle fullscreen
+media-control move h|j|k|l            # move window directionally
+media-control close                   # close media window
+media-control pin-and-float           # pin and float current window
+media-control mark-watched            # mark current Jellyfin item watched
+media-control chapter next|prev       # chapter navigation
+media-control-daemon foreground       # start avoidance daemon
+```
 
+## Configuration
+
+`~/.config/hypr/media-windows.conf` (TOML)
 
 ## License
 
