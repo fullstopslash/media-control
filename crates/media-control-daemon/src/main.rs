@@ -188,10 +188,6 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_avoid_time = Instant::now();
     let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
 
-    // Track active window to skip redundant activewindow events
-    // (mpv title updates trigger activewindow every ~1s with the same window)
-    let mut last_active_window = String::new();
-
     info!("Event loop started, listening for Hyprland events and FIFO triggers");
 
     loop {
@@ -201,34 +197,17 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
                 match line_result {
                     Ok(Some(line)) => {
                         // Parse event: "eventname>>data"
-                        let (event, data) = line.split_once(">>").unwrap_or((&line, ""));
+                        let (event, _data) = line.split_once(">>").unwrap_or((&line, ""));
 
-                        // Determine if this event should trigger avoidance
-                        let should_trigger = match event {
-                            // Use activewindowv2 (provides window address) instead of
-                            // activewindow (provides CLASS,TITLE which changes every ~1s
-                            // for mpv due to playback position in title).
-                            "activewindowv2" => {
-                                if data != last_active_window {
-                                    last_active_window = data.to_string();
-                                    true
-                                } else {
-                                    false
+                        // Events that trigger avoidance
+                        match event {
+                            "workspace" | "activewindow" | "movewindow" | "openwindow" | "closewindow" | "swapwindow" => {
+                                if last_avoid_time.elapsed() >= debounce_duration {
+                                    trigger_avoid(&ctx).await;
+                                    last_avoid_time = Instant::now();
                                 }
                             }
-                            // These events always indicate a real layout change
-                            "workspace" | "movewindow" | "openwindow" | "closewindow" | "swapwindow" => true,
-                            _ => false,
-                        };
-
-                        if should_trigger {
-                            debug!("Triggering avoid for event: {}", event);
-                            if last_avoid_time.elapsed() >= debounce_duration {
-                                trigger_avoid(&ctx).await;
-                                last_avoid_time = Instant::now();
-                            } else {
-                                debug!("Debounced ({}ms since last)", last_avoid_time.elapsed().as_millis());
-                            }
+                            _ => {}
                         }
                     }
                     Ok(None) => {

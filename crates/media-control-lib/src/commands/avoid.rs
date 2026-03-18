@@ -455,6 +455,26 @@ async fn handle_mouseover_geometry(
     }
 
     let (target_x, target_y) = calculate_target_position(ctx, focused.x, focused.y, focused.width);
+    let media_w = ctx.config.positions.width;
+    let media_h = ctx.config.positions.height;
+
+    // Verify target doesn't overlap with any non-media window on the workspace
+    let target_overlaps = clients.iter().any(|c| {
+        c.address != focused.address
+            && c.workspace.id == focused.workspace_id
+            && c.mapped
+            && !c.hidden
+            && rectangles_overlap(
+                target_x, target_y, media_w, media_h,
+                c.at[0], c.at[1], c.size[0], c.size[1],
+            )
+    });
+
+    if target_overlaps {
+        tracing::debug!("avoid: target ({}, {}) also overlaps, skipping", target_x, target_y);
+        return Ok(());
+    }
+
     move_media_window(ctx, focused.address, target_x, target_y, None, None).await?;
 
     if let Some(prev_addr) = find_previous_focus(clients, focused.workspace_id, ctx) {
@@ -469,12 +489,26 @@ async fn handle_geometry_overlap(
     focused: &FocusedWindow<'_>,
     media_windows: &[MediaWindow],
 ) -> Result<()> {
+    let media_w = ctx.config.positions.width;
+    let media_h = ctx.config.positions.height;
+
     for window in media_windows {
         if rectangles_overlap(
             window.x, window.y, window.width, window.height,
             focused.x, focused.y, focused.width, focused.height,
         ) {
             let (target_x, target_y) = calculate_target_position(ctx, window.x, window.y, focused.width);
+
+            // Verify the target position doesn't also overlap with the focused window.
+            // Without this check, the avoider bounces the window back and forth.
+            if rectangles_overlap(
+                target_x, target_y, media_w, media_h,
+                focused.x, focused.y, focused.width, focused.height,
+            ) {
+                tracing::debug!("avoid: target ({}, {}) also overlaps, skipping", target_x, target_y);
+                return Ok(());
+            }
+
             tracing::debug!("avoid: overlap detected, moving to ({}, {})", target_x, target_y);
             move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
             return Ok(());
