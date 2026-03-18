@@ -131,6 +131,14 @@ pub struct NowPlayingItem {
     /// Item type (Episode, Movie, etc.)
     #[serde(rename = "Type")]
     pub type_field: String,
+
+    /// File path on server (available in NowPlayingQueueFullItems)
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// When the item was added to the library
+    #[serde(default)]
+    pub date_created: Option<String>,
 }
 
 /// Current playback state.

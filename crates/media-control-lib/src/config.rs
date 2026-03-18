@@ -425,15 +425,21 @@ impl Default for NextEpisodeConfig {
     }
 }
 
-/// A rule mapping a library name to a next-episode strategy.
+/// A rule mapping a library to a next-episode strategy.
+///
+/// Rules can match by `library` name (requires API call) or `path_contains`
+/// (matches against the item's file path, no API call needed).
 #[derive(Debug, Clone, Deserialize)]
 pub struct NextEpisodeRule {
-    /// Library name to match (case-insensitive). None = default/fallback.
+    /// Library name to match (case-insensitive). Requires Ancestors API call.
     pub library: Option<String>,
 
-    /// Jellyfin library ID. If provided, skips the slow library detection API call.
-    /// Get this from Jellyfin's admin dashboard or the API.
+    /// Jellyfin library ID for strategy queries.
     pub library_id: Option<String>,
+
+    /// Match if the item's file path contains this string (case-insensitive).
+    /// Faster than library name matching since it uses session data directly.
+    pub path_contains: Option<String>,
 
     /// Strategy to use for this library.
     pub strategy: NextEpisodeStrategy,
@@ -445,8 +451,10 @@ pub struct NextEpisodeRule {
 pub enum NextEpisodeStrategy {
     /// Use Jellyfin's NextUp API (next unwatched episode in series).
     NextUp,
-    /// Most recently acquired unwatched item in the library.
+    /// Most recently acquired unwatched item in the library (jump to newest).
     RecentUnwatched,
+    /// Next older unwatched item after the current one (walk down the timeline).
+    NextOlder,
     /// Next in box set/collection if applicable, otherwise random unwatched.
     SeriesOrRandom,
     /// Random unwatched item from the library.
@@ -461,10 +469,28 @@ pub struct ResolvedStrategy {
 }
 
 impl NextEpisodeConfig {
-    /// Find the strategy and library ID for a given library name.
+    /// Find the strategy for an item, trying path-based matching first (fast),
+    /// then library name matching (requires API call), then default.
     ///
-    /// Rules are matched in order. A rule with `library: None` matches anything
-    /// (acts as default). If no rules match, returns `NextUp` with no library ID.
+    /// Rules are matched in order. First matching rule wins.
+    pub fn resolve_by_path(&self, item_path: Option<&str>) -> Option<ResolvedStrategy> {
+        let path = item_path?;
+        let path_lower = path.to_lowercase();
+
+        for rule in &self.rules {
+            if let Some(ref pattern) = rule.path_contains {
+                if path_lower.contains(&pattern.to_lowercase()) {
+                    return Some(ResolvedStrategy {
+                        strategy: rule.strategy,
+                        library_id: rule.library_id.clone(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the strategy by library name. Falls back to default rule.
     pub fn resolve_strategy(&self, library_name: &str) -> ResolvedStrategy {
         for rule in &self.rules {
             let matched = match &rule.library {

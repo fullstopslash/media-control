@@ -157,12 +157,17 @@ pub async fn mark_watched_and_next(ctx: &CommandContext) -> Result<()> {
     let item_id = item.id.clone();
     let series_id = item.series_id.clone();
     let session_id = session.id.clone();
+    let item_path = item.path.clone();
+    let item_date = item.date_created.clone();
 
     // Run mark_watched and next-episode strategy resolution in parallel.
     // They're independent — marking doesn't affect which item we pick next.
     let (mark_result, next_item_id) = tokio::join!(
         jellyfin.mark_watched(&item_id),
-        execute_next_strategy(&jellyfin, &ctx.config, &item_id, series_id.as_deref()),
+        execute_next_strategy(
+            &jellyfin, &ctx.config, &item_id,
+            series_id.as_deref(), item_path.as_deref(), item_date.as_deref(),
+        ),
     );
 
     if let Err(e) = mark_result {
@@ -188,50 +193,47 @@ async fn execute_next_strategy(
     config: &crate::config::Config,
     current_item_id: &str,
     series_id: Option<&str>,
+    item_path: Option<&str>,
+    item_date: Option<&str>,
 ) -> Option<String> {
     use crate::config::NextEpisodeStrategy;
 
-    // Resolve library name from Jellyfin to match config rules.
-    // This is the slow part (~3s on first call). If the matched rule
-    // already has library_id set, we use that directly for the strategy.
-    let library_info = match jellyfin.get_item_library(current_item_id).await {
-        Ok(info) => info,
-        Err(_) => None,
+    // Try fast path-based matching first (no API call needed).
+    // Fall back to slow library-name matching via Ancestors API.
+    let resolved = if let Some(r) = config.next_episode.resolve_by_path(item_path) {
+        r
+    } else {
+        let library_info = jellyfin.get_item_library(current_item_id).await.ok().flatten();
+        let library_name = library_info.as_ref().map(|l| l.name.as_str()).unwrap_or("");
+        let mut r = config.next_episode.resolve_strategy(library_name);
+        // Use detected library_id if config rule doesn't have one
+        if r.library_id.is_none() {
+            r.library_id = library_info.map(|l| l.id);
+        }
+        r
     };
 
-    let library_name = library_info.as_ref().map(|l| l.name.as_str()).unwrap_or("");
-    let resolved = config.next_episode.resolve_strategy(library_name);
-
-    // Prefer library_id from config (no extra API call) over the one from detection
-    let library_id = resolved
-        .library_id
-        .as_deref()
-        .or_else(|| library_info.as_ref().map(|l| l.id.as_str()));
+    let library_id = resolved.library_id.as_deref();
 
     match resolved.strategy {
         NextEpisodeStrategy::NextUp => {
             strategy_next_up(jellyfin, series_id).await
         }
         NextEpisodeStrategy::RecentUnwatched => {
-            if let Some(lid) = library_id {
-                strategy_recent_unwatched(jellyfin, lid, current_item_id).await
-            } else {
-                strategy_next_up(jellyfin, series_id).await
-            }
+            let lid = library_id?;
+            strategy_recent_unwatched(jellyfin, lid, current_item_id).await
+        }
+        NextEpisodeStrategy::NextOlder => {
+            let lid = library_id?;
+            strategy_next_older(jellyfin, lid, current_item_id, item_date).await
         }
         NextEpisodeStrategy::SeriesOrRandom => {
-            if let Some(lid) = library_id {
-                strategy_series_or_random(jellyfin, current_item_id, lid).await
-            } else {
-                strategy_next_up(jellyfin, series_id).await
-            }
+            let lid = library_id?;
+            strategy_series_or_random(jellyfin, current_item_id, lid).await
         }
         NextEpisodeStrategy::RandomUnwatched => {
-            if let Some(lid) = library_id {
-                strategy_random_unwatched(jellyfin, lid, current_item_id).await
-            } else {
-                strategy_next_up(jellyfin, series_id).await
-            }
+            let lid = library_id?;
+            strategy_random_unwatched(jellyfin, lid, current_item_id).await
         }
     }
 }
@@ -242,16 +244,19 @@ async fn strategy_next_up(jellyfin: &JellyfinClient, series_id: Option<&str>) ->
     jellyfin.get_next_up(sid).await.ok().flatten()
 }
 
-/// Strategy: RecentUnwatched - most recently acquired unwatched item.
-/// Prefers items newer than current; falls back to most recent older item.
-async fn strategy_recent_unwatched(
+/// Strategy: NextOlder - next older unwatched item after the current one.
+/// Walks DOWN the timeline (by DateCreated) to the next unwatched item
+/// that's older than the current one. Wraps to newest if at the bottom.
+async fn strategy_next_older(
     jellyfin: &JellyfinClient,
     library_id: &str,
     current_item_id: &str,
+    current_date: Option<&str>,
 ) -> Option<String> {
-    // Get unwatched items sorted by DateCreated descending (newest first)
+    // Get unwatched items sorted by DateCreated descending (newest first).
+    // Items OLDER than current will appear after it in this list.
     let items = jellyfin
-        .get_unwatched_items(library_id, "DateCreated", "Descending", Some(current_item_id), 50)
+        .get_unwatched_items(library_id, "DateCreated", "Descending", Some(current_item_id), 200)
         .await
         .ok()?;
 
@@ -259,33 +264,34 @@ async fn strategy_recent_unwatched(
         return None;
     }
 
-    // Get current item's DateCreated for comparison
-    let current_date = {
-        let all_items = jellyfin
-            .get_unwatched_items(library_id, "DateCreated", "Descending", None, 200)
-            .await
-            .ok()?;
-        all_items
-            .iter()
-            .find(|i| i.id == current_item_id)
-            .and_then(|i| i.date_created.clone())
-    };
-
-    if let Some(ref current_dc) = current_date {
-        // Prefer items more recent than current
-        let newer: Vec<_> = items
-            .iter()
-            .filter(|i| i.date_created.as_deref() > Some(current_dc.as_str()))
-            .collect();
-
-        if let Some(item) = newer.last() {
-            // newest-first list, so .last() is the one closest to (but after) current
-            return Some(item.id.clone());
+    // If we have the current item's date, find the first item older than it
+    if let Some(current_dc) = current_date {
+        for item in &items {
+            if let Some(ref dc) = item.date_created {
+                if dc.as_str() < current_dc {
+                    return Some(item.id.clone());
+                }
+            }
         }
     }
 
-    // No newer items (or no date to compare) — just pick the first (most recent) unwatched
+    // No older items found (at bottom of timeline) — wrap to newest
     Some(items[0].id.clone())
+}
+
+/// Strategy: RecentUnwatched - jump to the newest unwatched item in the library.
+async fn strategy_recent_unwatched(
+    jellyfin: &JellyfinClient,
+    library_id: &str,
+    current_item_id: &str,
+) -> Option<String> {
+    // Get the single newest unwatched item (excluding current)
+    let items = jellyfin
+        .get_unwatched_items(library_id, "DateCreated", "Descending", Some(current_item_id), 1)
+        .await
+        .ok()?;
+
+    items.first().map(|i| i.id.clone())
 }
 
 /// Strategy: RandomUnwatched - random unwatched item from the library.
