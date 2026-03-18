@@ -491,17 +491,28 @@ impl JellyfinClient {
             .ok_or(JellyfinError::NoPlayingItem)?;
 
         let item_id = item.id.clone();
-        self.mark_watched(&item_id).await?;
+        let series_id = item.series_id.clone();
+        let session_id = session.id.clone();
 
-        // Re-fetch session to get updated queue
-        let session = self.require_mpv_session().await?;
+        // Capture remaining queue BEFORE marking watched.
+        // Marking watched can cause jellyfin-mpv-shim to clear the queue/session.
         let remaining = Self::get_remaining_queue_ids(&session, &item_id);
 
-        if remaining.is_empty() {
-            return Ok(());
+        self.mark_watched(&item_id).await?;
+
+        // Try queue first, fall back to NextUp for the series
+        if !remaining.is_empty() {
+            return self.play_items(&session_id, &remaining).await;
         }
 
-        self.play_items(&session.id, &remaining).await
+        // Queue empty — use NextUp API to find the next episode in the series
+        if let Some(sid) = series_id {
+            if let Ok(Some(next_id)) = self.get_next_up(&sid).await {
+                return self.play_item(&session_id, &next_id).await;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get the server URL.
