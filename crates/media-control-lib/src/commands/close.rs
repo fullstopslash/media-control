@@ -57,12 +57,11 @@ async fn close_window_gracefully(
     title: &str,
     clients: &[Client],
 ) -> Result<()> {
-    // MPV: tell the shim to stop and clear the Jellyfin session, then close the window
+    // MPV: tell the shim to stop and clear the Jellyfin session.
+    // The mpv window stays alive (idle) so the shim can reuse it for
+    // the next video. Closing the window would kill mpv entirely.
     if class == "mpv" {
         let _ = send_mpv_script_message("stop-and-clear").await;
-        ctx.hyprland
-            .dispatch(&format!("closewindow address:{addr}"))
-            .await?;
         return Ok(());
     }
 
