@@ -113,7 +113,10 @@ async fn send_mpv_command(payload: &str) -> Result<()> {
     }
 
     // No working socket found
-    Err(MediaControlError::WindowNotFound)
+    Err(MediaControlError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no mpv IPC socket found (tried $MPV_IPC_SOCKET, /tmp/mpvctl-jshim, /tmp/mpvctl0)",
+    )))
 }
 
 #[cfg(test)]

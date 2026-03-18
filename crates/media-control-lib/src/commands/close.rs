@@ -67,11 +67,8 @@ async fn close_window_gracefully(
         return Ok(());
     }
 
-    // Firefox Picture-in-Picture: cannot be closed programmatically
+    // Firefox Picture-in-Picture: cannot be closed programmatically.
     // PiP windows share PID with main Firefox, so killwindow closes entire Firefox.
-    // Remote debugging doesn't work reliably.
-    // Keyboard shortcuts don't work via Wayland key injection.
-    // User must close manually.
     if class == "firefox" && title.to_lowercase().contains("picture-in-picture") {
         return Err(MediaControlError::Config {
             kind: crate::error::ConfigErrorKind::ValidationError,
@@ -80,15 +77,7 @@ async fn close_window_gracefully(
         });
     }
 
-    // Jellyfin Media Player: use killwindow (separate process)
-    if class.to_lowercase().contains("jellyfin") {
-        ctx.hyprland
-            .dispatch(&format!("killwindow address:{addr}"))
-            .await?;
-        return Ok(());
-    }
-
-    // Default: use killwindow for other windows
+    // All other windows (Jellyfin, default): use killwindow
     ctx.hyprland
         .dispatch(&format!("killwindow address:{addr}"))
         .await?;

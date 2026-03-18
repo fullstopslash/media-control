@@ -264,6 +264,67 @@ fn find_previous_focus(
         .map(|c| c.address.clone())
 }
 
+/// Which avoidance strategy to apply.
+enum AvoidCase<'a> {
+    /// Single workspace, non-media focused: move media to primary position.
+    MoveToPrimary,
+    /// Single workspace, media focused (mouseover): toggle between primary/secondary.
+    MouseoverToggle { prev_window: &'a Client },
+    /// Multi-workspace, media focused with overlap: geometry-based move + restore focus.
+    MouseoverGeometry,
+    /// Multi-workspace, non-media focused with overlap: geometry-based move.
+    GeometryOverlap,
+    /// Non-media app is fullscreen: move all media out of the way.
+    FullscreenNonMedia,
+}
+
+/// Classify which avoidance case applies.
+fn classify_case<'a>(
+    focused: &FocusedWindow<'_>,
+    is_single_workspace: bool,
+    media_windows: &[MediaWindow],
+    clients: &'a [Client],
+    ctx: &CommandContext,
+) -> Option<AvoidCase<'a>> {
+    // Fullscreen media: never interfere
+    if focused.is_media && focused.fullscreen != 0 {
+        return None;
+    }
+
+    // No media windows to reposition
+    if media_windows.is_empty() {
+        return None;
+    }
+
+    // Single workspace cases
+    if is_single_workspace {
+        // Fullscreen non-media in single workspace: don't interfere
+        if focused.fullscreen != 0 && !focused.is_media {
+            return None;
+        }
+        if focused.is_media {
+            // Mouseover: find previous window to determine toggle positions
+            let prev_window = find_previous_focus(clients, focused.workspace_id, ctx)
+                .and_then(|addr| clients.iter().find(|c| c.address == addr));
+            return match prev_window {
+                Some(prev) => Some(AvoidCase::MouseoverToggle { prev_window: prev }),
+                None => None, // Empty workspace with only pinned media — don't interfere
+            };
+        }
+        return Some(AvoidCase::MoveToPrimary);
+    }
+
+    // Multi-workspace cases
+    if focused.is_media {
+        return Some(AvoidCase::MouseoverGeometry);
+    }
+    // Fullscreen non-media in multi-workspace: move media away
+    if focused.fullscreen != 0 {
+        return Some(AvoidCase::FullscreenNonMedia);
+    }
+    Some(AvoidCase::GeometryOverlap)
+}
+
 /// Smart window repositioning to avoid overlap.
 pub async fn avoid(ctx: &CommandContext) -> Result<()> {
     if should_suppress(u64::from(ctx.config.positioning.suppress_ms)).await {
@@ -278,12 +339,9 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     };
 
-    // Count other (non-media) windows on same workspace
-    // Single-workspace mode: <= 1 non-media windows (matching original script)
-    let other_windows_count = count_other_windows(&clients, focused.workspace_id, ctx);
-    let is_single_workspace = other_windows_count <= 1;
+    let other_count = count_other_windows(&clients, focused.workspace_id, ctx);
+    let is_single_workspace = other_count <= 1;
 
-    // Get media windows on focused monitor (non-fullscreen)
     let media_windows: Vec<MediaWindow> = ctx
         .window_matcher
         .find_media_windows(&clients, focused.monitor)
@@ -291,182 +349,140 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
         .filter(|w| w.fullscreen == 0)
         .collect();
 
-    tracing::debug!(
-        "avoid: focused={} is_media={} other_count={} is_single={} media_count={}",
-        focused.class, focused.is_media, other_windows_count, is_single_workspace, media_windows.len()
-    );
-
-    // Case 1: Single-workspace + non-media focused - move to PRIMARY position
-    // When any non-media window is focused, media should be at its primary position
-    if is_single_workspace && !focused.is_media {
-        tracing::debug!("avoid: Case 1 - single-workspace + non-media focused");
-        // Skip fullscreen non-media windows
-        if focused.fullscreen != 0 {
-            return Ok(());
-        }
-
-        if media_windows.is_empty() {
-            return Ok(());
-        }
-
-        // Get position pair based on focused window class and title
-        let pair = get_position_pair(ctx, focused.class, focused.title);
-        let tolerance = i32::from(ctx.config.positioning.position_tolerance);
-
-        // Move windows that are NOT at primary position
-        for window in &media_windows {
-            if !within_tolerance(window.x, pair.primary_x, tolerance)
-                || !within_tolerance(window.y, pair.primary_y, tolerance)
-            {
-                tracing::debug!("avoid: Case 1 moving to ({}, {})", pair.primary_x, pair.primary_y);
-                move_media_window(ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height)
-                    .await?;
-            }
-        }
-
+    let Some(case) = classify_case(&focused, is_single_workspace, &media_windows, &clients, ctx) else {
+        tracing::debug!("avoid: no action needed");
         return Ok(());
+    };
+
+    match case {
+        AvoidCase::MoveToPrimary => {
+            handle_move_to_primary(ctx, &focused, &media_windows).await
+        }
+        AvoidCase::MouseoverToggle { prev_window } => {
+            handle_mouseover_toggle(ctx, &focused, prev_window).await
+        }
+        AvoidCase::MouseoverGeometry => {
+            handle_mouseover_geometry(ctx, &focused, &clients).await
+        }
+        AvoidCase::GeometryOverlap => {
+            handle_geometry_overlap(ctx, &focused, &media_windows).await
+        }
+        AvoidCase::FullscreenNonMedia => {
+            handle_fullscreen_nonmedia(ctx, &focused, &media_windows).await
+        }
     }
+}
 
-    // Case 2: Single-workspace + media focused (mouseover) - toggle position
-    // When hovering over media, move it to the other configured position
-    if is_single_workspace && focused.is_media {
-        if focused.fullscreen != 0 {
-            return Ok(());
-        }
+/// Case 1: Move media windows to their primary configured position.
+async fn handle_move_to_primary(
+    ctx: &CommandContext,
+    focused: &FocusedWindow<'_>,
+    media_windows: &[MediaWindow],
+) -> Result<()> {
+    let pair = get_position_pair(ctx, focused.class, focused.title);
+    let tolerance = i32::from(ctx.config.positioning.position_tolerance);
 
-        // Find previous focus to get its class and title for position overrides
-        let prev_window = find_previous_focus(&clients, focused.workspace_id, ctx)
-            .and_then(|addr| clients.iter().find(|c| c.address == addr));
-
-        // If there's no previous window, we're likely on an empty workspace with only
-        // a pinned media window visible. Don't interfere with workspace switching.
-        if prev_window.is_none() {
-            tracing::debug!("avoid: Case 2 - no previous window, skipping to allow empty workspace");
-            return Ok(());
-        }
-        let prev_class = prev_window.map(|c| c.class.as_str()).unwrap_or("");
-        let prev_title = prev_window.map(|c| c.title.as_str()).unwrap_or("");
-
-        let pair = get_position_pair(ctx, prev_class, prev_title);
-        let tolerance = i32::from(ctx.config.positioning.position_tolerance);
-
-        // Toggle between primary and secondary positions:
-        // - If at primary → move to secondary
-        // - If at secondary (or elsewhere) → move to primary
-        let at_primary = within_tolerance(focused.x, pair.primary_x, tolerance)
-            && within_tolerance(focused.y, pair.primary_y, tolerance);
-
-        let (target_x, target_y) = if at_primary {
-            (pair.secondary_x, pair.secondary_y)
-        } else {
-            (pair.primary_x, pair.primary_y)
-        };
-
-        // Only move if not already at target
-        if !within_tolerance(focused.x, target_x, tolerance)
-            || !within_tolerance(focused.y, target_y, tolerance)
+    for window in media_windows {
+        if !within_tolerance(window.x, pair.primary_x, tolerance)
+            || !within_tolerance(window.y, pair.primary_y, tolerance)
         {
-            move_media_window(ctx, focused.address, target_x, target_y, pair.width, pair.height).await?;
+            tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
+            move_media_window(ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height)
+                .await?;
         }
+    }
+    Ok(())
+}
 
-        // Restore focus away from media window
-        // This is critical - if focus stays on media, subsequent mouseovers won't trigger events
-        // We know prev_window exists (we returned early above if it didn't)
-        let prev_addr = &prev_window.unwrap().address;
-        let _ = restore_focus(ctx, prev_addr).await;
+/// Case 2: Toggle media window between primary and secondary positions on mouseover.
+async fn handle_mouseover_toggle(
+    ctx: &CommandContext,
+    focused: &FocusedWindow<'_>,
+    prev_window: &Client,
+) -> Result<()> {
+    let pair = get_position_pair(ctx, &prev_window.class, &prev_window.title);
+    let tolerance = i32::from(ctx.config.positioning.position_tolerance);
 
-        return Ok(());
+    let at_primary = within_tolerance(focused.x, pair.primary_x, tolerance)
+        && within_tolerance(focused.y, pair.primary_y, tolerance);
+
+    let (target_x, target_y) = if at_primary {
+        (pair.secondary_x, pair.secondary_y)
+    } else {
+        (pair.primary_x, pair.primary_y)
+    };
+
+    if !within_tolerance(focused.x, target_x, tolerance)
+        || !within_tolerance(focused.y, target_y, tolerance)
+    {
+        move_media_window(ctx, focused.address, target_x, target_y, pair.width, pair.height).await?;
     }
 
-    // Case 3: Multi-workspace + media focused (mouseover) - use geometry-based avoidance
-    if focused.is_media {
-        if focused.fullscreen != 0 {
-            return Ok(());
-        }
+    // Restore focus so subsequent mouseovers trigger new events
+    let _ = restore_focus(ctx, &prev_window.address).await;
+    Ok(())
+}
 
-        // Only move if something overlaps the media window
-        let has_overlap = clients.iter().any(|c| {
-            c.address != focused.address
-                && c.workspace.id == focused.workspace_id
-                && c.mapped
-                && !c.hidden
-                && rectangles_overlap(
-                    focused.x,
-                    focused.y,
-                    focused.width,
-                    focused.height,
-                    c.at[0],
-                    c.at[1],
-                    c.size[0],
-                    c.size[1],
-                )
-        });
-
-        if !has_overlap {
-            return Ok(());
-        }
-
-        // Calculate target position (dynamic, based on geometry)
-        let (target_x, target_y) = calculate_target_position(
-            ctx,
-            focused.x,
-            focused.y,
-            focused.width,
-        );
-
-        move_media_window(ctx, focused.address, target_x, target_y, None, None).await?;
-
-        // Restore focus to previous window
-        if let Some(prev_addr) = find_previous_focus(&clients, focused.workspace_id, ctx) {
-            let _ = restore_focus(ctx, &prev_addr).await;
-        }
-
-        return Ok(());
-    }
-
-    // Case 3: Geometry-based overlap (multi-workspace)
-    if !is_single_workspace && !media_windows.is_empty() {
-        tracing::debug!("avoid: Case 3 - checking geometry overlap");
-        for window in &media_windows {
-            tracing::debug!(
-                "avoid: Case 3 - media({},{} {}x{}) vs focused({},{} {}x{})",
-                window.x, window.y, window.width, window.height,
-                focused.x, focused.y, focused.width, focused.height
-            );
-            // Check if media overlaps with the focused window
-            if rectangles_overlap(
-                window.x, window.y, window.width, window.height,
+/// Case 3: Geometry-based avoidance when media is focused in multi-workspace.
+async fn handle_mouseover_geometry(
+    ctx: &CommandContext,
+    focused: &FocusedWindow<'_>,
+    clients: &[Client],
+) -> Result<()> {
+    let has_overlap = clients.iter().any(|c| {
+        c.address != focused.address
+            && c.workspace.id == focused.workspace_id
+            && c.mapped
+            && !c.hidden
+            && rectangles_overlap(
                 focused.x, focused.y, focused.width, focused.height,
-            ) {
-                // Calculate target position based on focused window geometry
-                let (target_x, target_y) = calculate_target_position(
-                    ctx,
-                    window.x,
-                    window.y,
-                    focused.width,
-                );
-                tracing::debug!("avoid: Case 3 - OVERLAP! Moving to ({}, {})", target_x, target_y);
-                move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
-                return Ok(());
-            } else {
-                tracing::debug!("avoid: Case 3 - no overlap");
-            }
-        }
+                c.at[0], c.at[1], c.size[0], c.size[1],
+            )
+    });
+
+    if !has_overlap {
+        return Ok(());
     }
 
-    // Case 4: Fullscreen non-media app
-    if focused.fullscreen != 0 && !focused.is_media && !media_windows.is_empty() {
-        for window in &media_windows {
-            let (target_x, target_y) = calculate_target_position(
-                ctx,
-                window.x,
-                window.y,
-                focused.width,
-            );
+    let (target_x, target_y) = calculate_target_position(ctx, focused.x, focused.y, focused.width);
+    move_media_window(ctx, focused.address, target_x, target_y, None, None).await?;
+
+    if let Some(prev_addr) = find_previous_focus(clients, focused.workspace_id, ctx) {
+        let _ = restore_focus(ctx, &prev_addr).await;
+    }
+    Ok(())
+}
+
+/// Case 4: Non-media focused, geometry overlap in multi-workspace.
+async fn handle_geometry_overlap(
+    ctx: &CommandContext,
+    focused: &FocusedWindow<'_>,
+    media_windows: &[MediaWindow],
+) -> Result<()> {
+    for window in media_windows {
+        if rectangles_overlap(
+            window.x, window.y, window.width, window.height,
+            focused.x, focused.y, focused.width, focused.height,
+        ) {
+            let (target_x, target_y) = calculate_target_position(ctx, window.x, window.y, focused.width);
+            tracing::debug!("avoid: overlap detected, moving to ({}, {})", target_x, target_y);
             move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
+            return Ok(());
         }
     }
+    Ok(())
+}
 
+/// Case 5: Non-media app is fullscreen, move all media windows away.
+async fn handle_fullscreen_nonmedia(
+    ctx: &CommandContext,
+    focused: &FocusedWindow<'_>,
+    media_windows: &[MediaWindow],
+) -> Result<()> {
+    for window in media_windows {
+        let (target_x, target_y) = calculate_target_position(ctx, window.x, window.y, focused.width);
+        move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
+    }
     Ok(())
 }
 

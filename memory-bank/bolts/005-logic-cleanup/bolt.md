@@ -3,15 +3,24 @@ id: 005-logic-cleanup
 unit: 003-logic-cleanup
 intent: 001-test-and-refactor
 type: simple-construction-bolt
-status: planned
+status: complete
 stories:
   - 002-simplify-fullscreen-close
   - 003-error-consistency
 created: 2026-03-18T13:00:00Z
-started: null
-completed: null
+started: 2026-03-18T19:00:00Z
+completed: 2026-03-18T19:45:00Z
 current_stage: null
-stages_completed: []
+stages_completed:
+  - name: plan
+    completed: 2026-03-18T19:00:00Z
+    artifact: implementation-plan.md
+  - name: implement
+    completed: 2026-03-18T19:30:00Z
+    artifact: implementation-walkthrough.md
+  - name: test
+    completed: 2026-03-18T19:45:00Z
+    artifact: test-walkthrough.md
 
 requires_bolts: [003-test-coverage, 004-logic-cleanup]
 enables_bolts: []

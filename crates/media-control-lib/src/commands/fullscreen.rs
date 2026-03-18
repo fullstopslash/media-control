@@ -46,7 +46,7 @@ pub async fn fullscreen(ctx: &CommandContext) -> Result<()> {
     }
 
     if is_fullscreen {
-        exit_fullscreen_mode(ctx, &media, &clients).await
+        exit_fullscreen(ctx, &media, &clients).await
     } else {
         enter_fullscreen_mode(ctx, &media).await
     }
@@ -100,51 +100,17 @@ async fn enter_fullscreen_mode(ctx: &CommandContext, media: &MediaWindow) -> Res
     Ok(())
 }
 
-/// Exit fullscreen mode with pin restoration and focus restoration.
-async fn exit_fullscreen_mode(
+/// Exit fullscreen with retry logic, pin restoration, and focus restoration.
+async fn exit_fullscreen(
     ctx: &CommandContext,
     media: &MediaWindow,
     clients: &[Client],
 ) -> Result<()> {
-    // Determine if we should restore pin state
-    let should_restore_pin =
-        media.always_pin || media.pinned || is_pip_title(&media.title);
-
-    // Find previous focus window before exiting fullscreen
+    let addr = &media.address;
+    let should_restore_pin = media.always_pin || media.pinned || is_pip_title(&media.title);
     let previous_focus = ctx
         .window_matcher
-        .find_previous_focus(clients, &media.address, None);
-
-    exit_fullscreen(
-        ctx,
-        &media.address,
-        should_restore_pin,
-        media.pinned,
-        previous_focus,
-        clients,
-    )
-    .await
-}
-
-/// Exit fullscreen with retry logic and state restoration.
-///
-/// # Arguments
-///
-/// * `ctx` - Command context
-/// * `addr` - Window address
-/// * `should_restore_pin` - Whether to restore pin state after exiting fullscreen
-/// * `was_pinned` - Whether the window was pinned before entering fullscreen
-/// * `previous_focus` - Address of window to restore focus to
-/// * `_clients` - Current client list (unused, kept for API compatibility)
-#[allow(clippy::too_many_arguments)]
-async fn exit_fullscreen(
-    ctx: &CommandContext,
-    addr: &str,
-    should_restore_pin: bool,
-    was_pinned: bool,
-    previous_focus: Option<String>,
-    _clients: &[Client],
-) -> Result<()> {
+        .find_previous_focus(clients, addr, None);
     // Suppress avoider BEFORE starting - prevents repositioning during state changes
     let _ = suppress_avoider().await;
 
@@ -165,7 +131,7 @@ async fn exit_fullscreen(
         let fresh_clients = ctx.hyprland.get_clients().await?;
         let current_fs = fresh_clients
             .iter()
-            .find(|c| c.address == addr)
+            .find(|c| c.address == *addr)
             .map(|c| c.fullscreen)
             .unwrap_or(0);
 
@@ -207,12 +173,12 @@ async fn exit_fullscreen(
     let fresh_clients = ctx.hyprland.get_clients().await?;
 
     // Get the media window's current position for repositioning
-    let media_window = fresh_clients.iter().find(|c| c.address == addr);
+    let media_window = fresh_clients.iter().find(|c| c.address == *addr);
 
     // Restore pin if needed
     let current_pinned = media_window.map(|c| c.pinned).unwrap_or(false);
 
-    if (should_restore_pin || was_pinned) && !current_pinned {
+    if should_restore_pin && !current_pinned {
         ctx.hyprland
             .dispatch(&format!("pin address:{addr}"))
             .await
