@@ -238,6 +238,52 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
     Ok(())
 }
 
+/// Default mpv IPC socket path (jellyfin-mpv-shim).
+const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpvctl-jshim";
+
+/// Fallback mpv IPC socket path.
+const MPV_IPC_SOCKET_FALLBACK: &str = "/tmp/mpvctl0";
+
+/// Send a script-message to mpv via IPC socket.
+///
+/// Routes to handlers registered by jellyfin-mpv-shim. Tries multiple
+/// socket paths in order: `$MPV_IPC_SOCKET`, `/tmp/mpvctl-jshim`, `/tmp/mpvctl0`.
+pub async fn send_mpv_script_message(message: &str) -> Result<()> {
+    use std::path::Path;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    let payload = format!(r#"{{"command":["script-message","{message}"]}}"#);
+
+    let env_socket = std::env::var("MPV_IPC_SOCKET").ok();
+    let sockets = [
+        env_socket.as_deref(),
+        Some(MPV_IPC_SOCKET_DEFAULT),
+        Some(MPV_IPC_SOCKET_FALLBACK),
+    ];
+
+    for socket_path in sockets.into_iter().flatten() {
+        let path = Path::new(socket_path);
+        if !path.exists() {
+            continue;
+        }
+
+        match UnixStream::connect(path).await {
+            Ok(mut stream) => {
+                stream.write_all(payload.as_bytes()).await?;
+                stream.write_all(b"\n").await?;
+                return Ok(());
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Err(crate::error::MediaControlError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no mpv IPC socket found",
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

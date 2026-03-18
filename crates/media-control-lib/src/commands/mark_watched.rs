@@ -3,20 +3,9 @@
 //! Provides commands to mark the current item as watched, optionally
 //! stopping playback or advancing to the next item via the shim.
 
-use std::path::Path;
-
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
-
-use super::{get_media_window, CommandContext};
+use super::{get_media_window, send_mpv_script_message, CommandContext};
 use crate::error::{MediaControlError, Result};
 use crate::jellyfin::{JellyfinClient, JellyfinError};
-
-/// Default mpv IPC socket path (jellyfin-mpv-shim).
-const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpvctl-jshim";
-
-/// Fallback mpv IPC socket path.
-const MPV_IPC_SOCKET_FALLBACK: &str = "/tmp/mpvctl0";
 
 /// Convert a Jellyfin error to a MediaControlError.
 fn convert_jellyfin_error(e: JellyfinError) -> MediaControlError {
@@ -109,9 +98,8 @@ pub async fn mark_watched_and_stop(ctx: &CommandContext) -> Result<()> {
 
 /// Mark current item as watched and advance to next episode.
 ///
-/// Delegates to the jellyfin-mpv-shim fork by sending a `ctrl+n` keypress
-/// via mpv's IPC socket. The shim handles strategy resolution, Jellyfin API
-/// calls, and playback advancement natively.
+/// Delegates to the jellyfin-mpv-shim fork by sending a `mark-watched-next`
+/// script-message via mpv's IPC socket.
 ///
 /// # Example
 ///
@@ -135,45 +123,4 @@ pub async fn mark_watched_and_next(ctx: &CommandContext) -> Result<()> {
     }
 
     send_mpv_script_message("mark-watched-next").await
-}
-
-/// Send a script-message command to mpv via IPC socket.
-///
-/// Uses mpv's script-message mechanism which routes to handlers registered
-/// by jellyfin-mpv-shim (via python-mpv's register_message_handler).
-///
-/// Tries multiple socket paths in order:
-/// 1. `$MPV_IPC_SOCKET` environment variable (if set)
-/// 2. `/tmp/mpvctl-jshim` (jellyfin-mpv-shim default)
-/// 3. `/tmp/mpvctl0` (common fallback)
-async fn send_mpv_script_message(message: &str) -> Result<()> {
-    let payload = format!(r#"{{"command":["script-message","{message}"]}}"#);
-
-    let env_socket = std::env::var("MPV_IPC_SOCKET").ok();
-    let sockets = [
-        env_socket.as_deref(),
-        Some(MPV_IPC_SOCKET_DEFAULT),
-        Some(MPV_IPC_SOCKET_FALLBACK),
-    ];
-
-    for socket_path in sockets.into_iter().flatten() {
-        let path = Path::new(socket_path);
-        if !path.exists() {
-            continue;
-        }
-
-        match UnixStream::connect(path).await {
-            Ok(mut stream) => {
-                stream.write_all(payload.as_bytes()).await?;
-                stream.write_all(b"\n").await?;
-                return Ok(());
-            }
-            Err(_) => continue,
-        }
-    }
-
-    Err(MediaControlError::Io(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no mpv IPC socket found",
-    )))
 }

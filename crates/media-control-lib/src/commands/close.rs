@@ -5,10 +5,9 @@
 
 use tokio::process::Command;
 
-use super::CommandContext;
+use super::{send_mpv_script_message, CommandContext};
 use crate::error::Result;
 use crate::hyprland::Client;
-use crate::jellyfin::JellyfinClient;
 
 /// Close the media window gracefully with app-specific handling.
 ///
@@ -58,19 +57,9 @@ async fn close_window_gracefully(
     title: &str,
     clients: &[Client],
 ) -> Result<()> {
-    // MPV: ensure Jellyfin session ends cleanly, then stop playback
+    // MPV: tell the shim to stop and clear the Jellyfin session
     if class == "mpv" {
-        // Try to stop Jellyfin session first (best effort, ignore errors)
-        if let Ok(client) = JellyfinClient::from_default_credentials().await {
-            let _ = client.stop_mpv().await;
-        }
-
-        // Use playerctl to stop mpv (best effort)
-        let _ = Command::new("playerctl")
-            .args(["--player=mpv", "stop"])
-            .output()
-            .await;
-
+        let _ = send_mpv_script_message("stop-and-clear").await;
         return Ok(());
     }
 
