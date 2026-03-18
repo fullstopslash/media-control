@@ -16,10 +16,10 @@ Single new module `test_helpers.rs` behind `#[cfg(test)]`, plus minor additions 
 
 ### Completed Work
 
-- [x] `crates/media-control-lib/src/test_helpers.rs` - Mock server, command capture, test context builders, JSON helpers, test client/monitor constructors
-- [x] `crates/media-control-lib/src/hyprland.rs` - Made `with_socket_path` always available (removed `#[cfg(test)]`), added `Serialize` derive to `Client`, `Monitor`, `Workspace`
-- [x] `crates/media-control-lib/src/commands/mod.rs` - Added `CommandContext::for_test()` constructor
-- [x] `crates/media-control-lib/src/lib.rs` - Registered `test_helpers` module
+- [x] `crates/media-control-lib/src/test_helpers.rs` - Mock server, command capture, test context builders, JSON helpers, test client/monitor constructors <!-- tw:3d3fc6bc-cb48-428c-b5e6-2ac06d7c2b3d -->
+- [x] `crates/media-control-lib/src/hyprland.rs` - Made `with_socket_path` always available (removed `#[cfg(test)]`), added `Serialize` derive to `Client`, `Monitor`, `Workspace` <!-- tw:ee3dd4c2-f2b1-4332-8466-36a77ab95695 -->
+- [x] `crates/media-control-lib/src/commands/mod.rs` - Added `CommandContext::for_test()` constructor <!-- tw:ed62a4ca-77e8-40b2-b65a-ef5122ad3140 -->
+- [x] `crates/media-control-lib/src/lib.rs` - Registered `test_helpers` module <!-- tw:313b13a8-897a-4550-a081-380f0dd2126e -->
 
 ### Key Decisions
 

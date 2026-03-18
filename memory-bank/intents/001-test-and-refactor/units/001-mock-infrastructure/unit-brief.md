@@ -103,11 +103,11 @@ None - this is the foundation unit.
 ## Success Criteria
 
 ### Functional
-- [ ] Mock server responds to j/clients, j/activewindow, j/monitors with configured JSON
-- [ ] Mock server returns "ok" for dispatch/keyword commands
-- [ ] Mock server handles [[BATCH]] commands
-- [ ] Captured commands can be inspected after test
+- [ ] Mock server responds to j/clients, j/activewindow, j/monitors with configured JSON <!-- tw:6b4e4285-8b5b-4489-83ce-d94e74704c9b -->
+- [ ] Mock server returns "ok" for dispatch/keyword commands <!-- tw:26e4a302-1a97-44d5-80cc-f50b2cc7f8a8 -->
+- [ ] Mock server handles [[BATCH]] commands <!-- tw:61ff2e20-1edb-402a-b490-b792777555c2 -->
+- [ ] Captured commands can be inspected after test <!-- tw:26d899f2-3237-48bc-88c5-45d756f3514c -->
 
 ### Quality
-- [ ] All mock infrastructure has its own unit tests
-- [ ] No flaky tests from socket timing issues
+- [ ] All mock infrastructure has its own unit tests <!-- tw:b4fc811d-5b31-4a5f-8c8f-a1a31d4a8f12 -->
+- [ ] No flaky tests from socket timing issues <!-- tw:454690b9-9fc6-4fe7-a1ed-43973cb649ed -->

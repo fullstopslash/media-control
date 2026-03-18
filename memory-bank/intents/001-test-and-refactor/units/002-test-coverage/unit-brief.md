@@ -97,12 +97,12 @@ Write comprehensive end-to-end tests for every command, edge case tests for boun
 ## Success Criteria
 
 ### Functional
-- [ ] Every command has at least one happy-path E2E test
-- [ ] Every command handles "no media window" gracefully
-- [ ] All 4 avoid cases have dedicated tests
-- [ ] Fullscreen enter/exit/retry/pin-restore all tested
-- [ ] Edge cases from FR-3 all covered
+- [ ] Every command has at least one happy-path E2E test <!-- tw:925ad826-5a9e-4aad-9b6f-8a1eaab6823f -->
+- [ ] Every command handles "no media window" gracefully <!-- tw:82b669c0-fa20-40f0-9e7e-4dcb5c9e9340 -->
+- [ ] All 4 avoid cases have dedicated tests <!-- tw:0b63ae15-095c-4cae-9138-d276ab229554 -->
+- [ ] Fullscreen enter/exit/retry/pin-restore all tested <!-- tw:8c39540d-40e3-4fc0-93ec-467805c02ec6 -->
+- [ ] Edge cases from FR-3 all covered <!-- tw:b567f052-7346-4d1a-91c5-e6c278d91854 -->
 
 ### Quality
-- [ ] All new tests pass reliably (no flakes in 10 consecutive runs)
-- [ ] Existing 118 tests still pass
+- [ ] All new tests pass reliably (no flakes in 10 consecutive runs) <!-- tw:1cbaa1d5-e6af-466a-964e-f1c2367ec848 -->
+- [ ] Existing 118 tests still pass <!-- tw:6b9e46b4-dc09-4c51-a349-256f91ccfca4 -->

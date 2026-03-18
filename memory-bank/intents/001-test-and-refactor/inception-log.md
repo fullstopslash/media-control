@@ -58,12 +58,12 @@ status: complete
 ## Ready for Construction
 
 **Checklist**:
-- [x] All requirements documented
-- [x] System context defined
-- [x] Units decomposed
-- [x] Stories created for all units
-- [x] Bolts planned
-- [x] Human review complete
+- [x] All requirements documented <!-- tw:8cf00c70-e104-4930-a3e4-4428c17000e1 -->
+- [x] System context defined <!-- tw:1b2d92ae-3c62-4cf4-b80d-a77f9e33b3c4 -->
+- [x] Units decomposed <!-- tw:ed992d3c-9a84-491a-9729-72ed31d7b737 -->
+- [x] Stories created for all units <!-- tw:c256caba-1815-416d-aea2-7fa7d906c8b5 -->
+- [x] Bolts planned <!-- tw:1f81bc2f-cdaa-4c9f-b20d-5289b1cc4c7c -->
+- [x] Human review complete <!-- tw:1d376d49-1764-4187-bf8b-3d7dd24c43fb -->
 
 ## Next Steps
 

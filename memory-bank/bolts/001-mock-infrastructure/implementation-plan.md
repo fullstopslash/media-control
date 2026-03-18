@@ -54,10 +54,10 @@ MockHyprland {
 - Reuse existing `make_client` / `make_client_full` for constructing test data
 
 ### Acceptance Criteria
-- [ ] MockHyprland starts, accepts connections, returns configured responses
-- [ ] Commands are captured in order and inspectable
-- [ ] HyprlandClient works with mock socket (get_clients, dispatch, batch, keyword all work)
-- [ ] CommandContext::for_test builds a working context with mock client
-- [ ] Mock handles concurrent connections (batch uses a single connection, but multiple sequential commands each open a new one)
-- [ ] No flaky tests from socket timing
-- [ ] Mock cleans up temp socket on drop
+- [ ] MockHyprland starts, accepts connections, returns configured responses <!-- tw:522b3163-7c1b-4d08-8dc2-1d827e4dd229 -->
+- [ ] Commands are captured in order and inspectable <!-- tw:d4e7bdad-0272-4c15-b962-fb399998bfb2 -->
+- [ ] HyprlandClient works with mock socket (get_clients, dispatch, batch, keyword all work) <!-- tw:71c9890e-89bf-42cc-96f3-6bfb077147c5 -->
+- [ ] builds a working context with mock client <!-- tw:678227a4-6873-4577-a08e-18614214db89 -->
+- [ ] Mock handles concurrent connections (batch uses a single connection, but multiple sequential commands each open a new one) <!-- tw:daf916b8-1fe2-40d1-b75f-e93317f97dbf -->
+- [ ] No flaky tests from socket timing <!-- tw:b04d18b0-ac9c-4667-90e7-f96f17f2d502 -->
+- [ ] Mock cleans up temp socket on drop <!-- tw:48c42f1f-ed36-4c72-93c9-c6aa2c4b20f4 -->

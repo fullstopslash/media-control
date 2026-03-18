@@ -33,10 +33,10 @@ Complete test coverage for move, pin, close, focus commands, cross-cutting edge 
 **Daemon debounce**: Extract debounce logic test - verify events within window coalesce, events after window trigger new avoid. This is a unit test of the timing logic, not the full event loop.
 
 ### Acceptance Criteria
-- [ ] All 4 move directions tested
-- [ ] Pin toggle on/off tested
-- [ ] Close: mpv, jellyfin, PiP, default paths tested
-- [ ] Focus: found and not-found tested
-- [ ] Config edge cases: resolve_position(0), negative, unknown
-- [ ] Window matching: multiple same-priority, pinned_only
-- [ ] No flaky tests
+- [ ] All 4 move directions tested <!-- tw:b394d3d1-4bc4-46cd-a844-adb1e9b0d8c5 -->
+- [ ] Pin toggle on/off tested <!-- tw:77c6ad6f-62b7-4eba-813c-a9b13cba815f -->
+- [ ] Close: mpv, jellyfin, PiP, default paths tested <!-- tw:f155f9b0-a2a4-4aab-b203-80d59aaf3a4c -->
+- [ ] Focus: found and not-found tested <!-- tw:7cb9b6e9-0d6a-46f9-b723-d0b8871bfa92 -->
+- [ ] Config edge cases: resolve_position(0), negative, unknown <!-- tw:66185a08-79c6-4a68-9ebe-d72b50de6321 -->
+- [ ] Window matching: multiple same-priority, pinned_only <!-- tw:d2e1f623-92e4-4d56-b8d2-118bf9cf4b00 -->
+- [ ] No flaky tests <!-- tw:e0186bd3-f864-4fdb-b62b-c47e72429bd9 -->

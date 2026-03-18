@@ -51,9 +51,9 @@ Config types, strategy enum, rule matching, and integration with mark-watched-an
 
 ## Stages
 
-- [ ] **1. Plan**: Design config format, strategy trait, dispatch flow
-- [ ] **2. Implement**: Config types, rule matching, integration point
-- [ ] **3. Verify**: Config parsing tests, dispatch logic tests
+- [ ] **1. Plan**: Design config format, strategy trait, dispatch flow <!-- tw:d73e7455-09ee-4d4e-8a6b-a0ddbd8eddb8 -->
+- [ ] **2. Implement**: Config types, rule matching, integration point <!-- tw:f18e6d2f-ffdc-4a13-bdb7-f56b36c39036 -->
+- [ ] **3. Verify**: Config parsing tests, dispatch logic tests <!-- tw:8c556f80-e92b-40d8-a29b-87b388dd64f6 -->
 
 ## Dependencies
 

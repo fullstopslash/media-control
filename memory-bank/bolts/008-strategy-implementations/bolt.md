@@ -46,9 +46,9 @@ Implement all 4 strategies: next-up, recent-unwatched, series-or-random, random-
 
 ## Stages
 
-- [ ] **1. Plan**: Design each strategy's logic flow
-- [ ] **2. Implement**: All 4 strategies + end-to-end test with real Jellyfin
-- [ ] **3. Verify**: Unit tests, manual test with each library type
+- [ ] **1. Plan**: Design each strategy's logic flow <!-- tw:c7224e07-de26-4368-8e38-6a2da7bbc851 -->
+- [ ] **2. Implement**: All 4 strategies + end-to-end test with real Jellyfin <!-- tw:cd238719-d38b-4818-9736-aa6825a7b005 -->
+- [ ] **3. Verify**: Unit tests, manual test with each library type <!-- tw:5e81ffba-89bd-4e4c-aa95-9168ef07d69d -->
 
 ## Dependencies
 

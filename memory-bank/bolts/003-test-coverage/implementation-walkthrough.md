@@ -12,11 +12,11 @@ Added 23 new tests across move_window (5), pin (4), close (5), focus (2), and co
 
 ### Completed Work
 
-- [x] `crates/media-control-lib/src/commands/move_window.rs` - 5 E2E tests (4 directions + no-op)
-- [x] `crates/media-control-lib/src/commands/pin.rs` - 4 E2E tests (toggle on, toggle off, fullscreen guard, no-op)
-- [x] `crates/media-control-lib/src/commands/close.rs` - 5 E2E tests (jellyfin killwindow, PiP error, mpv no-kill, default killwindow, no-op)
-- [x] `crates/media-control-lib/src/commands/focus.rs` - 2 E2E tests (found + not found)
-- [x] `crates/media-control-lib/src/config.rs` - 7 edge case tests (resolve_position boundaries, override matching combinations)
+- [x] `crates/media-control-lib/src/commands/move_window.rs` - 5 E2E tests (4 directions + no-op) <!-- tw:2e59e293-2059-455a-b4ba-189ae09971da -->
+- [x] `crates/media-control-lib/src/commands/pin.rs` - 4 E2E tests (toggle on, toggle off, fullscreen guard, no-op) <!-- tw:e9112355-407c-4153-95af-50fdbdfffa33 -->
+- [x] `crates/media-control-lib/src/commands/close.rs` - 5 E2E tests (jellyfin killwindow, PiP error, mpv no-kill, default killwindow, no-op) <!-- tw:09853ab2-4340-4e63-9edb-5e56a80a7dbe -->
+- [x] `crates/media-control-lib/src/commands/focus.rs` - 2 E2E tests (found + not found) <!-- tw:0aaf6d9d-dfcb-43ef-bd2a-18b08c70aedd -->
+- [x] `crates/media-control-lib/src/config.rs` - 7 edge case tests (resolve_position boundaries, override matching combinations) <!-- tw:1802fdc2-588c-4870-baf3-9c56ecebc640 -->
 
 ### Key Decisions
 

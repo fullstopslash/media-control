@@ -12,7 +12,7 @@ Restructured the avoid command from a 200-line sequential if/return chain into a
 
 ### Completed Work
 
-- [x] `crates/media-control-lib/src/commands/avoid.rs` - Rewrote `avoid()` function with `AvoidCase` enum and `classify_case()` dispatcher
+- [x] `crates/media-control-lib/src/commands/avoid.rs` - Rewrote `avoid()` function with `AvoidCase` enum and `classify_case()` dispatcher <!-- tw:b176214c-7283-4252-83ff-2a5e5da65215 -->
 
 ### Key Decisions
 

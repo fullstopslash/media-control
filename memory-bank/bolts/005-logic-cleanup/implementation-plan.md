@@ -30,9 +30,9 @@ Simplify exit_fullscreen, deduplicate close's killwindow branches, and fix the s
 - No changes needed
 
 ### Acceptance Criteria
-- [ ] `_clients` parameter removed from exit_fullscreen
-- [ ] `#[allow(clippy::too_many_arguments)]` removed
-- [ ] exit_fullscreen_mode simplified (fewer parameter unpacking)
-- [ ] close has single killwindow path for non-mpv/non-PiP
-- [ ] chapter.rs uses semantically correct error for missing socket
-- [ ] All 173 tests pass
+- [ ] `_clients` parameter removed from exit_fullscreen <!-- tw:20b2e0fd-6837-40fa-8d60-cea865622b0f -->
+- [ ] `#[allow(clippy::too_many_arguments)]` removed <!-- tw:a64f5c1a-86b3-4352-a540-e367f84e4469 -->
+- [ ] exit_fullscreen_mode simplified (fewer parameter unpacking) <!-- tw:2c332b0d-8775-4fe5-8c12-415627895bd0 -->
+- [ ] close has single killwindow path for non-mpv/non-PiP <!-- tw:33bc82f6-ff7f-4525-93d2-001688e7e530 -->
+- [ ] chapter.rs uses semantically correct error for missing socket <!-- tw:4bf752f0-0706-4586-b4c4-f47eb11b12c6 -->
+- [ ] All 173 tests pass <!-- tw:5202ed92-4823-4836-a631-69bb404d5c8a -->

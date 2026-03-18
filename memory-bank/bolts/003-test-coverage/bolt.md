@@ -58,9 +58,9 @@ Complete the test coverage for all remaining commands and edge cases. These test
 
 ## Stages
 
-- [ ] **1. Plan**: List test scenarios per command
-- [ ] **2. Implement**: Write tests
-- [ ] **3. Verify**: All tests pass, no flakes
+- [ ] **1. Plan**: List test scenarios per command <!-- tw:69facbb1-8ec1-41c5-befc-20e1c14a9afa -->
+- [ ] **2. Implement**: Write tests <!-- tw:e3eee0de-4745-4805-a217-685eab6652dd -->
+- [ ] **3. Verify**: All tests pass, no flakes <!-- tw:34085a00-6699-4c4e-94c2-51ed026da8d7 -->
 
 ## Dependencies
 
@@ -72,7 +72,7 @@ Complete the test coverage for all remaining commands and edge cases. These test
 
 ## Success Criteria
 
-- [ ] Move, pin, close, focus all have E2E tests
-- [ ] Window matching, config, and suppress edge cases covered
-- [ ] Daemon debounce logic tested
-- [ ] No flaky tests
+- [ ] Move, pin, close, focus all have E2E tests <!-- tw:806eb7e1-931f-4bf8-9b67-716b969a819f -->
+- [ ] Window matching, config, and suppress edge cases covered <!-- tw:d9d64dc1-6e3a-45eb-a74f-399c62f43f45 -->
+- [ ] Daemon debounce logic tested <!-- tw:b2051975-28cc-4c79-9f19-b7f439c3ef26 -->
+- [ ] No flaky tests <!-- tw:47368f15-0fb0-4865-8586-12b9a2f0313a -->

@@ -16,9 +16,9 @@ Tests are co-located in each command's `mod tests` block. Mock infrastructure en
 
 ### Completed Work
 
-- [x] `crates/media-control-lib/src/test_helpers.rs` - Enhanced with `set_response_sequence()` and `consume_response()` for retry simulation
-- [x] `crates/media-control-lib/src/commands/avoid.rs` - 11 new E2E tests + 2 suppress logic tests
-- [x] `crates/media-control-lib/src/commands/fullscreen.rs` - 6 new E2E tests
+- [x] `crates/media-control-lib/src/test_helpers.rs` - Enhanced with `set_response_sequence()` and `consume_response()` for retry simulation <!-- tw:191c42c4-4ee5-4a32-af60-ee33fcdb182f -->
+- [x] `crates/media-control-lib/src/commands/avoid.rs` - 11 new E2E tests + 2 suppress logic tests <!-- tw:1a89e8a3-a9aa-4dc8-80ab-2b87f8f49200 -->
+- [x] `crates/media-control-lib/src/commands/fullscreen.rs` - 6 new E2E tests <!-- tw:4ce0cfda-6327-4ff1-a51d-7333415e6474 -->
 
 ### Key Decisions
 

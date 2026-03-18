@@ -54,9 +54,9 @@ Restructure avoid.rs to reduce nesting, extract shared patterns, and make the 4 
 
 ## Stages
 
-- [ ] **1. Plan**: Design cleaner structure (enum-based case dispatch?)
-- [ ] **2. Implement**: Refactor avoid.rs
-- [ ] **3. Verify**: All avoid tests pass, existing tests pass
+- [ ] **1. Plan**: Design cleaner structure (enum-based case dispatch?) <!-- tw:21d5187e-82ff-438c-854e-d3600f91bbc9 -->
+- [ ] **2. Implement**: Refactor avoid.rs <!-- tw:e7c22c79-e06d-4071-9843-9c231c01fb91 -->
+- [ ] **3. Verify**: All avoid tests pass, existing tests pass <!-- tw:810f7681-0b31-4717-95ab-b0bcaa08869d -->
 
 ## Dependencies
 
@@ -68,7 +68,7 @@ Restructure avoid.rs to reduce nesting, extract shared patterns, and make the 4 
 
 ## Success Criteria
 
-- [ ] All avoid E2E tests pass
-- [ ] No function exceeds 4 nesting levels
-- [ ] Duplicate "Case 3" comment resolved
-- [ ] Shared patterns extracted
+- [ ] All avoid E2E tests pass <!-- tw:030fe7b9-89d3-46a5-bcfa-cb815541c9ba -->
+- [ ] No function exceeds 4 nesting levels <!-- tw:7a7e6f5c-8454-48ac-bdc2-304603318f2d -->
+- [ ] Duplicate "Case 3" comment resolved <!-- tw:dcffd37b-e848-41fc-8f0a-e5eb794f34c6 -->
+- [ ] Shared patterns extracted <!-- tw:764a6ac1-1955-4ebb-8382-e4a4ffde8bab -->

@@ -56,9 +56,9 @@ Cover the highest-risk command logic with comprehensive tests. These are the com
 
 ## Stages
 
-- [ ] **1. Plan**: Design test scenarios for each avoidance case and fullscreen state
-- [ ] **2. Implement**: Write E2E tests using mock infrastructure
-- [ ] **3. Verify**: All tests pass, no flakes
+- [ ] **1. Plan**: Design test scenarios for each avoidance case and fullscreen state <!-- tw:af50d467-ce33-4be0-9b99-2087542288bb -->
+- [ ] **2. Implement**: Write E2E tests using mock infrastructure <!-- tw:5292b57d-418f-436a-b8d2-399ab441f56f -->
+- [ ] **3. Verify**: All tests pass, no flakes <!-- tw:3659c601-23e5-4bac-a9e6-6bba80c0189a -->
 
 ## Dependencies
 
@@ -70,7 +70,7 @@ Cover the highest-risk command logic with comprehensive tests. These are the com
 
 ## Success Criteria
 
-- [ ] All 4 avoid cases tested end-to-end
-- [ ] Fullscreen enter/exit/retry/pin-restore tested
-- [ ] Edge cases from FR-3 covered for avoid and fullscreen
-- [ ] No flaky tests
+- [ ] All 4 avoid cases tested end-to-end <!-- tw:4b40fc2f-ad86-4988-bff3-cdb961910579 -->
+- [ ] Fullscreen enter/exit/retry/pin-restore tested <!-- tw:0046f10f-1331-4ca4-8645-8d47d78247d9 -->
+- [ ] Edge cases from FR-3 covered for avoid and fullscreen <!-- tw:52020f04-e627-4894-8c0b-932ae64e9f7b -->
+- [ ] No flaky tests <!-- tw:c50ba0c0-45a7-462a-9e0d-29c368837462 -->

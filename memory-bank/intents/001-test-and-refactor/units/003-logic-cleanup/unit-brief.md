@@ -96,11 +96,11 @@ None - this is the final unit.
 ## Success Criteria
 
 ### Functional
-- [ ] All 118+ existing tests pass
-- [ ] All new E2E tests from unit 002 pass
-- [ ] No behavioral regressions
+- [ ] All 118+ existing tests pass <!-- tw:d8d63948-8326-4928-a21d-eddebfbd9c65 -->
+- [ ] All new E2E tests from unit 002 pass <!-- tw:f2015fb9-4e43-4ce9-92b0-b80157a07470 -->
+- [ ] No behavioral regressions <!-- tw:3c1dae72-1a4e-47d6-86ed-c86576a74af3 -->
 
 ### Maintainability
-- [ ] No function exceeds 4 levels of nesting
-- [ ] No duplicated blocks >5 lines across commands
-- [ ] Consistent error conversion pattern everywhere
+- [ ] No function exceeds 4 levels of nesting <!-- tw:dc36dc3f-13ed-47a0-8375-6d821a6813fe -->
+- [ ] No duplicated blocks >5 lines across commands <!-- tw:74f7ecb3-5bac-44f4-8cfa-1c4e66637040 -->
+- [ ] Consistent error conversion pattern everywhere <!-- tw:10274f3f-e3dc-4ab6-b42f-22ef6363c511 -->

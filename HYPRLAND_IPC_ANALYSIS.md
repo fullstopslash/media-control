@@ -220,18 +220,18 @@ pub struct HyprlandClient {
 ## Action Items
 
 ### Immediate
-- [x] Document current implementation
-- [x] Research hyprwire/hyprtools availability
-- [x] Evaluate hyprland-rs as alternative
-- [ ] Bookmark hyprland-rs GitHub for updates
-- [ ] Subscribe to Hyprland release notes
+- [x] Document current implementation <!-- tw:f6a03205-dcee-4d6c-802b-b9ec5fc075e5 -->
+- [x] Research hyprwire/hyprtools availability <!-- tw:78b4a798-9886-4574-9b47-5044c659b108 -->
+- [x] Evaluate hyprland-rs as alternative <!-- tw:b493c5d6-42d4-4a09-a8f8-46a8035d4e3c -->
+- [ ] Bookmark hyprland-rs GitHub for updates <!-- tw:aedc249f-aa30-443e-8ae0-ba1483016963 -->
+- [ ] Subscribe to Hyprland release notes <!-- tw:3aceaa2f-f291-4b7b-9459-944ecd457809 -->
 
 ### Future Considerations
-- [ ] Create spike branch with hyprland-rs
-- [ ] Benchmark performance comparison
-- [ ] Assess code reduction potential
-- [ ] Monitor hyprland-rs 0.4 stable release
-- [ ] Re-evaluate decision in 6 months
+- [ ] Create spike branch with hyprland-rs <!-- tw:4bcb70e6-f0df-4795-b687-8931a3e2fbbc -->
+- [ ] Benchmark performance comparison <!-- tw:2f566d9d-ed43-4911-bf41-6144607b9fbd -->
+- [ ] Assess code reduction potential <!-- tw:5d57b57c-42c0-4745-9915-b77ee6f0fde2 -->
+- [ ] Monitor hyprland-rs 0.4 stable release <!-- tw:a69fd760-fb2c-422d-a482-ec9bb4d2c58f -->
+- [ ] Re-evaluate decision in 6 months <!-- tw:6f21e87e-176f-454b-b8f7-58eaedeac83e -->
 
 ---
 

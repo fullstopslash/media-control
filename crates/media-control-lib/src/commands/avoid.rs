@@ -349,6 +349,11 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
         .filter(|w| w.fullscreen == 0)
         .collect();
 
+    tracing::debug!(
+        "avoid: focused={} is_media={} fullscreen={} single_ws={} media_count={}",
+        focused.class, focused.is_media, focused.fullscreen, is_single_workspace, media_windows.len()
+    );
+
     let Some(case) = classify_case(&focused, is_single_workspace, &media_windows, &clients, ctx) else {
         tracing::debug!("avoid: no action needed");
         return Ok(());
@@ -356,18 +361,23 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
 
     match case {
         AvoidCase::MoveToPrimary => {
+            tracing::debug!("avoid: case=MoveToPrimary");
             handle_move_to_primary(ctx, &focused, &media_windows).await
         }
         AvoidCase::MouseoverToggle { prev_window } => {
+            tracing::debug!("avoid: case=MouseoverToggle");
             handle_mouseover_toggle(ctx, &focused, prev_window).await
         }
         AvoidCase::MouseoverGeometry => {
+            tracing::debug!("avoid: case=MouseoverGeometry");
             handle_mouseover_geometry(ctx, &focused, &clients).await
         }
         AvoidCase::GeometryOverlap => {
+            tracing::debug!("avoid: case=GeometryOverlap");
             handle_geometry_overlap(ctx, &focused, &media_windows).await
         }
         AvoidCase::FullscreenNonMedia => {
+            tracing::debug!("avoid: case=FullscreenNonMedia");
             handle_fullscreen_nonmedia(ctx, &focused, &media_windows).await
         }
     }

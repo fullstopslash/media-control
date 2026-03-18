@@ -15,9 +15,9 @@ created: 2026-03-18T16:15:00Z
 
 ### Test Files
 
-- [x] `crates/media-control-lib/src/commands/avoid.rs` - 15 tests (4 existing + 11 new E2E + 2 suppress)
-- [x] `crates/media-control-lib/src/commands/fullscreen.rs` - 10 tests (4 existing + 6 new E2E)
-- [x] `crates/media-control-lib/src/test_helpers.rs` - 13 tests (enhanced with sequence support)
+- [x] `crates/media-control-lib/src/commands/avoid.rs` - 15 tests (4 existing + 11 new E2E + 2 suppress) <!-- tw:ebab4630-e93d-4ca3-b414-5f637ebef537 -->
+- [x] `crates/media-control-lib/src/commands/fullscreen.rs` - 10 tests (4 existing + 6 new E2E) <!-- tw:86a11cd2-8624-4f34-b746-6eb578b37748 -->
+- [x] `crates/media-control-lib/src/test_helpers.rs` - 13 tests (enhanced with sequence support) <!-- tw:ba5c548c-40f0-4f9d-b661-3c14a43707d5 -->
 
 ### Avoid E2E Tests
 

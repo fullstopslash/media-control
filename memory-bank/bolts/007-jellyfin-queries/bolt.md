@@ -49,9 +49,9 @@ New JellyfinClient methods: library detection via Ancestors, filtered item queri
 
 ## Stages
 
-- [ ] **1. Plan**: Design API methods and response types
-- [ ] **2. Implement**: JellyfinClient methods, response structs
-- [ ] **3. Verify**: Deserialization tests with sample JSON
+- [ ] **1. Plan**: Design API methods and response types <!-- tw:7fab500c-25cc-48e3-978b-d5da035ddaca -->
+- [ ] **2. Implement**: JellyfinClient methods, response structs <!-- tw:de62685d-4b8c-4123-9f6e-111696a8aee3 -->
+- [ ] **3. Verify**: Deserialization tests with sample JSON <!-- tw:9a870199-03bc-46bb-9d7d-9c96fe8d8dab -->
 
 ## Dependencies
 

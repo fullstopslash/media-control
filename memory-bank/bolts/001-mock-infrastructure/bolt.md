@@ -58,9 +58,9 @@ Provide the foundation that all E2E tests depend on. After this bolt, any comman
 
 ## Stages
 
-- [ ] **1. Plan**: Design mock server API and test helper interfaces
-- [ ] **2. Implement**: Build mock server, capture, and test context
-- [ ] **3. Verify**: Test the mock infrastructure itself
+- [ ] **1. Plan**: Design mock server API and test helper interfaces <!-- tw:8559f29d-8c72-4318-b852-254c86258bf9 -->
+- [ ] **2. Implement**: Build mock server, capture, and test context <!-- tw:7f529fbe-c017-41b0-a127-0eb2eab6deb4 -->
+- [ ] **3. Verify**: Test the mock infrastructure itself <!-- tw:5b4e27cf-1d85-46e0-a1cd-8d3b7194d293 -->
 
 ## Dependencies
 
@@ -73,7 +73,7 @@ Provide the foundation that all E2E tests depend on. After this bolt, any comman
 
 ## Success Criteria
 
-- [ ] Mock server responds to all Hyprland command types
-- [ ] Commands are captured and assertable
-- [ ] CommandContext can be built for any test scenario
-- [ ] Mock infrastructure has its own tests
+- [ ] Mock server responds to all Hyprland command types <!-- tw:2a58ca5b-0bea-489d-b979-b14e8969d521 -->
+- [ ] Commands are captured and assertable <!-- tw:253a5017-b749-419a-b304-2a7f5b718a28 -->
+- [ ] CommandContext can be built for any test scenario <!-- tw:7eac8030-2e17-4f2a-b2ee-e5d16595688d -->
+- [ ] Mock infrastructure has its own tests <!-- tw:197d1042-5f67-427e-9aab-c4ad06cf4905 -->

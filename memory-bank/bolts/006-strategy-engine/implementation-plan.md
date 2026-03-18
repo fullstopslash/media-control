@@ -72,9 +72,9 @@ This means we need to split `jellyfin.mark_watched_and_next()` into separate con
 - Strategy resolution moves to commands/mark_watched.rs
 
 ### Acceptance Criteria
-- [ ] Config parses `[[next_episode.rules]]` with strategy enum
-- [ ] Default config has no rules (empty vec)
-- [ ] `resolve_strategy()` matches first matching rule, falls back to NextUp
-- [ ] Case-insensitive library name matching
-- [ ] mark_watched_and_next uses strategy dispatch instead of hardcoded NextUp
-- [ ] All existing tests pass
+- [ ] Config parses `[[next_episode.rules]]` with strategy enum <!-- tw:e4507d5c-d676-4df8-a7c1-796066bc2524 -->
+- [ ] Default config has no rules (empty vec) <!-- tw:585029c1-faaa-46d1-9d99-9bd0fe3760cb -->
+- [ ] `resolve_strategy()` matches first matching rule, falls back to NextUp <!-- tw:e66cd78d-a21e-4eab-ba63-2b2b4bfe8ba8 -->
+- [ ] Case-insensitive library name matching <!-- tw:8cf641d6-e439-494e-8fc2-52f1dc1633db -->
+- [ ] mark_watched_and_next uses strategy dispatch instead of hardcoded NextUp <!-- tw:5c858e8b-cb7d-449e-ae4c-f78dda5a563e -->
+- [ ] All existing tests pass <!-- tw:3f198cd9-67e6-4346-87b1-669368ebf4fa -->

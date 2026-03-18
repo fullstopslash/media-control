@@ -52,8 +52,8 @@ Each case becomes a separate async function. The main `avoid()` function:
 - **Keep**: `calculate_target_position()`, `move_media_window()`, `get_position_pair()`, `should_suppress()`, `within_tolerance()`, `rectangles_overlap()` - these are clean already
 
 ### Acceptance Criteria
-- [ ] All 15 avoid tests pass
-- [ ] No function exceeds 4 nesting levels
-- [ ] Each case is clearly named and separated
-- [ ] No duplicate case labels
-- [ ] Fullscreen guard handled once in classification
+- [ ] All 15 avoid tests pass <!-- tw:1411535f-69bd-4c39-a57f-d84a94f9f714 -->
+- [ ] No function exceeds 4 nesting levels <!-- tw:77c2bf62-cee9-422c-ae62-12d032eafdb9 -->
+- [ ] Each case is clearly named and separated <!-- tw:e6368adf-fdd8-4ac0-a9e8-c7ca7319c0aa -->
+- [ ] No duplicate case labels <!-- tw:49873d3a-7941-4bf2-9856-99297869d175 -->
+- [ ] Fullscreen guard handled once in classification <!-- tw:c7bc571e-c012-4194-8fb7-06ad4ca4dd5e -->

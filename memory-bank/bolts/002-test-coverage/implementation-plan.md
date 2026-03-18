@@ -70,8 +70,8 @@ Wait - `#[cfg(test)]` items in the lib crate are NOT visible to integration test
 8. **PiP title triggers pin restore**: "Picture-in-Picture" title → pin restored on exit
 
 ### Acceptance Criteria
-- [ ] All avoid cases (1-4) have at least one E2E test
-- [ ] All avoid edge cases tested
-- [ ] Fullscreen enter/exit/retry/auto-pin/PiP all tested
-- [ ] No tests depend on env var state from other tests
-- [ ] No flaky tests
+- [ ] All avoid cases (1-4) have at least one E2E test <!-- tw:0243a4f2-e5bd-4d06-bc6d-34c4cac30cec -->
+- [ ] All avoid edge cases tested <!-- tw:fa198d3b-9ecf-4eb1-b3db-14d2733517e9 -->
+- [ ] Fullscreen enter/exit/retry/auto-pin/PiP all tested <!-- tw:d519a51a-b584-4c2e-960c-08eaa2fd5362 -->
+- [ ] No tests depend on env var state from other tests <!-- tw:b55bb0ca-2bd1-4101-a00b-c2231d4c9d1a -->
+- [ ] No flaky tests <!-- tw:b40a841f-c3fd-4b6d-b5ad-dc585aaaec5c -->
