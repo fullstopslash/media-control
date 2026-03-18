@@ -108,6 +108,102 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    // Integration tests would require mocking HyprlandClient
-    // Unit tests for the logic are covered by the window module tests
+    use super::*;
+    use crate::test_helpers::*;
+
+    #[tokio::test]
+    async fn pin_toggle_on_unpinned_unfloated() {
+        let mock = MockHyprland::start().await;
+
+        // mpv is not floating, not pinned
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", false, false,
+                0, 1, 0, 1, [100, 100], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        pin_and_float(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should float + pin + position
+        let has_float = cmds.iter().any(|c| c.contains("togglefloating"));
+        let has_pin = cmds.iter().any(|c| c.contains("dispatch pin"));
+        let has_resize = cmds.iter().any(|c| c.contains("resizewindowpixel"));
+        assert!(has_float, "should toggle floating: {cmds:?}");
+        assert!(has_pin, "should pin: {cmds:?}");
+        assert!(has_resize, "should position: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn pin_toggle_off_pinned_floating() {
+        let mock = MockHyprland::start().await;
+
+        // mpv is floating + pinned → toggle off
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        pin_and_float(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should unpin + unfloat in a batch
+        let batch = cmds.iter().find(|c| c.contains("dispatch pin"));
+        assert!(batch.is_some(), "should unpin: {cmds:?}");
+        let batch = batch.unwrap();
+        assert!(batch.contains("togglefloating"), "should also unfloat: {batch}");
+        // Should NOT have resize (no positioning when toggling off)
+        let has_resize = cmds.iter().any(|c| c.contains("resizewindowpixel"));
+        assert!(!has_resize, "should not position when toggling off: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn pin_fullscreen_is_noop() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xmpv", "mpv", "video.mp4", false, false,
+            2, 1, 0, 0, [0, 0], [1920, 1080], // fullscreen
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        pin_and_float(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should only fetch clients, no dispatches
+        assert_eq!(cmds.len(), 1, "should only fetch clients for fullscreen: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn pin_no_media_window_is_noop() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xfirefox", "firefox", "Browser", false, false,
+            0, 1, 0, 0, [0, 0], [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        pin_and_float(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        assert_eq!(cmds.len(), 1, "should only fetch clients: {cmds:?}");
+    }
 }

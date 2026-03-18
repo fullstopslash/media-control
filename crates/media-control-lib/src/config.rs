@@ -644,4 +644,88 @@ wide_window_threshold = 75
         assert_eq!(config.positioning.workspace_switch_timeout, 2);
         assert_eq!(config.positioning.default_x, "x_right");
     }
+
+    // --- Edge case tests ---
+
+    #[test]
+    fn resolve_position_zero() {
+        let config = Config::default();
+        assert_eq!(config.resolve_position("0"), Some(0));
+    }
+
+    #[test]
+    fn resolve_position_negative() {
+        let config = Config::default();
+        assert_eq!(config.resolve_position("-100"), Some(-100));
+    }
+
+    #[test]
+    fn resolve_position_large_value() {
+        let config = Config::default();
+        assert_eq!(config.resolve_position("99999"), Some(99999));
+    }
+
+    #[test]
+    fn resolve_position_unknown_name() {
+        let config = Config::default();
+        assert_eq!(config.resolve_position("nonexistent"), None);
+    }
+
+    #[test]
+    fn resolve_position_empty_string() {
+        let config = Config::default();
+        assert_eq!(config.resolve_position(""), None);
+    }
+
+    #[test]
+    fn get_override_class_and_title_both_must_match() {
+        let config_str = r#"
+[[positioning.overrides]]
+focused_class = "kitty"
+focused_title = "(?i)special"
+pref_x = "x_left"
+"#;
+        let config: Config = toml::from_str(config_str).expect("parse");
+
+        // Both match
+        let result = config.positioning.get_override("kitty", "Special Terminal");
+        assert!(result.is_some(), "should match when both class and title match");
+
+        // Class matches, title doesn't
+        let result = config.positioning.get_override("kitty", "Regular Terminal");
+        assert!(result.is_none(), "should not match when title doesn't match");
+
+        // Title matches, class doesn't
+        let result = config.positioning.get_override("firefox", "Special Page");
+        assert!(result.is_none(), "should not match when class doesn't match");
+    }
+
+    #[test]
+    fn get_override_class_only_matches_any_title() {
+        let config_str = r#"
+[[positioning.overrides]]
+focused_class = "firefox"
+pref_x = "x_left"
+"#;
+        let config: Config = toml::from_str(config_str).expect("parse");
+
+        let result = config.positioning.get_override("firefox", "any title here");
+        assert!(result.is_some(), "class-only override should match any title");
+
+        let result = config.positioning.get_override("firefox", "");
+        assert!(result.is_some(), "class-only override should match empty title");
+    }
+
+    #[test]
+    fn get_override_title_only_matches_any_class() {
+        let config_str = r#"
+[[positioning.overrides]]
+focused_title = "(?i)special"
+pref_x = "x_left"
+"#;
+        let config: Config = toml::from_str(config_str).expect("parse");
+
+        let result = config.positioning.get_override("anything", "Special Window");
+        assert!(result.is_some(), "title-only override should match any class");
+    }
 }

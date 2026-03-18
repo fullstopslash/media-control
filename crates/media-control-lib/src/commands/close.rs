@@ -98,6 +98,8 @@ async fn close_window_gracefully(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_helpers::*;
+
     #[test]
     fn firefox_pip_detection_case_insensitive() {
         // Test that we correctly detect PiP windows regardless of case
@@ -157,5 +159,106 @@ mod tests {
                 "Incorrectly detected PiP for title: {title}"
             );
         }
+    }
+
+    // --- E2E tests ---
+
+    use super::*;
+
+    #[tokio::test]
+    async fn close_jellyfin_dispatches_killwindow() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xjelly", "com.github.iwalton3.jellyfin-media-player", "Jellyfin", true, true,
+            0, 1, 0, 0, [0, 0], [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        close(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_kill = cmds.iter().any(|c| c.contains("killwindow"));
+        assert!(has_kill, "should dispatch killwindow for jellyfin: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn close_firefox_pip_returns_error() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xpip", "firefox", "Picture-in-Picture", true, true,
+            0, 1, 0, 0, [1272, 712], [320, 180],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        let result = close(&ctx).await;
+        assert!(result.is_err(), "should return error for Firefox PiP");
+    }
+
+    #[tokio::test]
+    async fn close_mpv_does_not_killwindow() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xmpv", "mpv", "video.mp4", true, true,
+            0, 1, 0, 0, [1272, 712], [640, 360],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        // This will try playerctl/jellyfin (both fail gracefully), but should NOT killwindow
+        close(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_kill = cmds.iter().any(|c| c.contains("killwindow"));
+        assert!(!has_kill, "should NOT killwindow for mpv (uses playerctl): {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn close_default_dispatches_killwindow() {
+        let mock = MockHyprland::start().await;
+
+        // Some other media window class
+        let clients = vec![make_test_client_full(
+            "0xvlc", "vlc", "movie.mkv", true, true,
+            0, 1, 0, 0, [1272, 712], [640, 360],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+
+        // Need vlc in patterns for it to be found as media window
+        let mut config = crate::config::Config::default();
+        config.patterns.push(crate::config::Pattern {
+            key: "class".to_string(),
+            value: "vlc".to_string(),
+            pinned_only: false,
+            always_pin: false,
+        });
+        let ctx = mock.context(config);
+
+        close(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_kill = cmds.iter().any(|c| c.contains("killwindow"));
+        assert!(has_kill, "should dispatch killwindow for default class: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn close_no_media_window_is_noop() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xfirefox", "firefox", "Browser", false, false,
+            0, 1, 0, 0, [0, 0], [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        close(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        assert_eq!(cmds.len(), 1, "should only fetch clients: {cmds:?}");
     }
 }

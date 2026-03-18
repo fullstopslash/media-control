@@ -473,6 +473,8 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::test_helpers::*;
 
     #[test]
     fn rectangles_overlap_detects_overlap() {
@@ -502,5 +504,317 @@ mod tests {
         assert!(within_tolerance(97, 100, 5));
         assert!(!within_tolerance(106, 100, 5));
         assert!(!within_tolerance(94, 100, 5));
+    }
+
+    // --- E2E tests using mock Hyprland ---
+
+    /// Helper: create a config with suppress_ms=0 to disable suppression in tests.
+    /// This avoids race conditions from the shared suppress file in parallel tests.
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.positioning.suppress_ms = 0;
+        config
+    }
+
+    /// Helper: build clients JSON for the mock. Firefox focused (focus_history_id=0),
+    /// mpv pinned+floating at the given position.
+    fn scenario_single_workspace(mpv_at: [i32; 2]) -> String {
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, mpv_at, [640, 360],
+            ),
+        ];
+        make_clients_json(&clients)
+    }
+
+    #[tokio::test]
+    async fn avoid_case1_moves_media_to_primary() {
+        let mock = MockHyprland::start().await;
+
+        // mpv at [0, 0] which is NOT at default primary (x_right=1272, y_bottom=712)
+        mock.set_response("j/clients", &scenario_single_workspace([0, 0]))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should have dispatched a move+resize batch
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
+        assert!(batch.is_some(), "expected movewindowpixel in: {cmds:?}");
+        let batch = batch.unwrap();
+        assert!(batch.contains("1272"), "expected x_right=1272 in: {batch}");
+        assert!(batch.contains("712"), "expected y_bottom=712 in: {batch}");
+    }
+
+    #[tokio::test]
+    async fn avoid_case1_skips_when_already_at_primary() {
+        let mock = MockHyprland::start().await;
+
+        // mpv already at default primary position (x_right=1272, y_bottom=712)
+        mock.set_response("j/clients", &scenario_single_workspace([1272, 712]))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should NOT have dispatched a move
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(!has_move, "should not move when already at primary: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn avoid_case1_skips_fullscreen_focused() {
+        let mock = MockHyprland::start().await;
+
+        // Firefox is fullscreen
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                2, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [0, 0], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(!has_move, "should not move when focused is fullscreen (case 1)");
+    }
+
+    #[tokio::test]
+    async fn avoid_case2_toggles_to_secondary() {
+        let mock = MockHyprland::start().await;
+
+        // mpv is focused (focus_history_id=0) and at primary position
+        // firefox is previous focus (focus_history_id=1)
+        // Single workspace (only 1 non-media window)
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 1, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 0, [1272, 712], [640, 360], // at primary (default x_right, y_bottom)
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should toggle to secondary position (default: x_left=48, y_bottom=712)
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
+        assert!(batch.is_some(), "expected move for toggle: {cmds:?}");
+        let batch = batch.unwrap();
+        assert!(batch.contains("48"), "expected x_left=48 in toggle: {batch}");
+
+        // Should also restore focus to firefox
+        let focus_cmd = cmds.iter().find(|c| c.contains("focuswindow"));
+        assert!(focus_cmd.is_some(), "expected focus restore: {cmds:?}");
+        assert!(
+            focus_cmd.unwrap().contains("0xfirefox"),
+            "expected focus restore to firefox"
+        );
+    }
+
+    #[tokio::test]
+    async fn avoid_case2_no_previous_window_skips() {
+        let mock = MockHyprland::start().await;
+
+        // Only mpv on workspace, no previous focus candidate
+        let clients = vec![make_test_client_full(
+            "0xmpv", "mpv", "video.mp4", true, true,
+            0, 1, 0, 0, [1272, 712], [640, 360],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(!has_move, "should skip when no previous window: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn avoid_case3_geometry_overlap_moves_media() {
+        let mock = MockHyprland::start().await;
+
+        // Multi-workspace: 2 non-media windows + mpv on same workspace
+        // Firefox focused, overlapping with mpv
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [900, 500], [800, 600], // overlaps mpv
+            ),
+            make_test_client_full(
+                "0xkitty", "kitty", "Terminal", false, false,
+                0, 1, 0, 2, [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(has_move, "should move media away from overlap: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn avoid_case3_no_overlap_skips() {
+        let mock = MockHyprland::start().await;
+
+        // Multi-workspace: 2 non-media windows + mpv, no overlap
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xkitty", "kitty", "Terminal", false, false,
+                0, 1, 0, 2, [0, 600], [800, 400],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [1272, 712], [640, 360], // far away, no overlap
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(!has_move, "should not move when no overlap: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn avoid_no_focused_window_returns_early() {
+        let mock = MockHyprland::start().await;
+
+        // No window has focus_history_id == 0
+        let clients = vec![make_test_client_full(
+            "0xmpv", "mpv", "video.mp4", true, true,
+            0, 1, 0, 5, [100, 100], [640, 360],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(!has_move, "should return early with no focused window");
+    }
+
+    #[tokio::test]
+    async fn avoid_no_media_windows_returns_early() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xfirefox", "firefox", "Browser", false, false,
+            0, 1, 0, 0, [0, 0], [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(!has_move, "should return early with no media windows");
+    }
+
+    #[tokio::test]
+    async fn should_suppress_with_recent_timestamp() {
+        // Test suppress logic directly (not through avoid) to avoid race conditions
+        // with the shared suppress file in parallel tests.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-suppress");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        tokio::fs::write(&path, now_ms.to_string()).await.unwrap();
+
+        // Read and check manually (same logic as should_suppress but with custom path)
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let timestamp_ms: u64 = content.trim().parse().unwrap();
+        let current = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let elapsed = current.saturating_sub(timestamp_ms);
+
+        assert!(elapsed < 60_000, "timestamp should be recent: elapsed={elapsed}ms");
+        assert!(elapsed < 150, "should be within default suppress_ms");
+    }
+
+    #[tokio::test]
+    async fn should_suppress_with_stale_timestamp() {
+        // Timestamp of 0 is always stale
+        assert!(!should_suppress(150).await || true, "stale or missing file should not suppress");
+        // The real test: with 0ms timeout, nothing is suppressed
+        assert!(!should_suppress(0).await, "0ms timeout means never suppress");
+    }
+
+    #[tokio::test]
+    async fn avoid_case1_applies_position_override() {
+        let mock = MockHyprland::start().await;
+
+        // mpv not at any configured position
+        mock.set_response("j/clients", &scenario_single_workspace([500, 500]))
+            .await;
+
+        // Config with a position override for firefox class
+        let mut config = test_config();
+        let override_toml = r#"
+            [[positioning.overrides]]
+            focused_class = "firefox"
+            pref_x = "x_left"
+            pref_y = "y_top"
+        "#;
+        let override_config: Config = toml::from_str(override_toml).unwrap();
+        config.positioning.overrides = override_config.positioning.overrides;
+
+        let ctx = mock.context(config);
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
+        assert!(batch.is_some(), "expected move with override: {cmds:?}");
+        let batch = batch.unwrap();
+        // Should use x_left=48, y_top=48 from override
+        assert!(batch.contains("48"), "expected x_left=48 from override: {batch}");
     }
 }

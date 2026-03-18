@@ -265,4 +265,95 @@ mod tests {
         assert_ne!(Direction::Left, Direction::Right);
         assert_ne!(Direction::Up, Direction::Down);
     }
+
+    // --- E2E tests ---
+
+    use crate::test_helpers::*;
+
+    fn mpv_at(x: i32, y: i32) -> String {
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [x, y], [640, 360],
+            ),
+        ];
+        make_clients_json(&clients)
+    }
+
+    #[tokio::test]
+    async fn move_left_dispatches_correct_position() {
+        let mock = MockHyprland::start().await;
+        mock.set_response("j/clients", &mpv_at(1272, 712)).await;
+        let ctx = mock.default_context();
+
+        move_window(&ctx, Direction::Left).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+        // x_left=48, keep current y=712
+        assert!(batch.contains("exact 48 712"), "expected x_left=48, y=712: {batch}");
+        assert!(batch.contains("resizewindowpixel"), "should also resize");
+    }
+
+    #[tokio::test]
+    async fn move_right_dispatches_correct_position() {
+        let mock = MockHyprland::start().await;
+        mock.set_response("j/clients", &mpv_at(48, 712)).await;
+        let ctx = mock.default_context();
+
+        move_window(&ctx, Direction::Right).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+        // x_right=1272, keep current y=712
+        assert!(batch.contains("exact 1272 712"), "expected x_right=1272, y=712: {batch}");
+    }
+
+    #[tokio::test]
+    async fn move_up_dispatches_correct_position() {
+        let mock = MockHyprland::start().await;
+        mock.set_response("j/clients", &mpv_at(1272, 712)).await;
+        let ctx = mock.default_context();
+
+        move_window(&ctx, Direction::Up).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+        // keep current x=1272, y_top=48
+        assert!(batch.contains("exact 1272 48"), "expected x=1272, y_top=48: {batch}");
+    }
+
+    #[tokio::test]
+    async fn move_down_dispatches_correct_position() {
+        let mock = MockHyprland::start().await;
+        mock.set_response("j/clients", &mpv_at(1272, 48)).await;
+        let ctx = mock.default_context();
+
+        move_window(&ctx, Direction::Down).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+        // keep current x=1272, y_bottom=712
+        assert!(batch.contains("exact 1272 712"), "expected x=1272, y_bottom=712: {batch}");
+    }
+
+    #[tokio::test]
+    async fn move_no_media_window_is_noop() {
+        let mock = MockHyprland::start().await;
+        let clients = vec![make_test_client_full(
+            "0xfirefox", "firefox", "Browser", false, false,
+            0, 1, 0, 0, [0, 0], [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        move_window(&ctx, Direction::Left).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        assert!(!cmds.iter().any(|c| c.contains("movewindowpixel")), "should not move: {cmds:?}");
+    }
 }

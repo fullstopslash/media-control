@@ -302,6 +302,14 @@ fn find_valid_focus_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::*;
+
+    /// Config with suppress_ms=0 to disable suppression in tests.
+    fn test_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.positioning.suppress_ms = 0;
+        config
+    }
 
     #[test]
     fn pip_title_detection() {
@@ -458,5 +466,210 @@ mod tests {
         // Only the media window exists
         let result = find_valid_focus_target(&clients, "0x1", "0x999");
         assert!(result.is_none());
+    }
+
+    // --- E2E tests using mock Hyprland ---
+
+    #[tokio::test]
+    async fn fullscreen_enter_unpinned() {
+        let mock = MockHyprland::start().await;
+
+        // mpv is floating, not pinned, not fullscreen
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", false, true,
+                0, 1, 0, 1, [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should batch: focus + fullscreen (no unpin since not pinned)
+        let batch = cmds.iter().find(|c| c.contains("fullscreen"));
+        assert!(batch.is_some(), "expected fullscreen dispatch: {cmds:?}");
+        let batch = batch.unwrap();
+        assert!(batch.contains("focuswindow"), "should focus before fullscreen");
+        // Should NOT contain pin toggle
+        assert!(!batch.contains("dispatch pin"), "should not unpin when not pinned: {batch}");
+    }
+
+    #[tokio::test]
+    async fn fullscreen_enter_pinned_unpins_first() {
+        let mock = MockHyprland::start().await;
+
+        // mpv is pinned + floating
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("fullscreen"));
+        assert!(batch.is_some(), "expected fullscreen: {cmds:?}");
+        let batch = batch.unwrap();
+        // Should contain pin toggle (unpin before fullscreen)
+        assert!(batch.contains("dispatch pin"), "should unpin before fullscreen: {batch}");
+    }
+
+    #[tokio::test]
+    async fn fullscreen_exit_restores_pin() {
+        let mock = MockHyprland::start().await;
+
+        // mpv is fullscreen, was pinned (pinned=true even though fullscreen)
+        // After exit_fullscreen, the mock returns it as non-fullscreen, non-pinned
+        let clients_fullscreen = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 1, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                2, 1, 0, 0, [0, 0], [1920, 1080], // fullscreen=2, pinned=true
+            ),
+        ];
+        let clients_exited = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 1, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", false, true,
+                0, 1, 0, 0, [1272, 712], [640, 360], // fullscreen=0, pinned=false
+            ),
+        ];
+
+        // First call returns fullscreen, subsequent calls return exited
+        mock.set_response_sequence(
+            "j/clients",
+            vec![
+                make_clients_json(&clients_fullscreen),
+                make_clients_json(&clients_exited),
+            ],
+        )
+        .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should dispatch pin to restore it
+        let has_pin = cmds.iter().any(|c| c.contains("dispatch pin address:0xmpv") && !c.contains("fullscreen"));
+        assert!(has_pin, "should restore pin after exit: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn fullscreen_no_media_window_is_noop() {
+        let mock = MockHyprland::start().await;
+
+        // No media windows
+        let clients = vec![make_test_client_full(
+            "0xfirefox", "firefox", "Browser", false, false,
+            0, 1, 0, 0, [0, 0], [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Only j/clients fetch, no dispatches
+        assert_eq!(cmds.len(), 1, "should only fetch clients: {cmds:?}");
+        assert_eq!(cmds[0], "j/clients");
+    }
+
+    #[tokio::test]
+    async fn fullscreen_auto_pin_when_always_pin_set() {
+        let mock = MockHyprland::start().await;
+
+        // PiP window: always_pin=true in default config for "Picture-in-Picture" title
+        // Window is floating but NOT pinned
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xpip", "firefox", "Picture-in-Picture", false, true,
+                0, 1, 0, 1, [1272, 712], [320, 180],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should pin instead of fullscreening (auto-pin behavior)
+        let has_pin = cmds.iter().any(|c| c.contains("dispatch pin"));
+        assert!(has_pin, "should auto-pin PiP window: {cmds:?}");
+        let has_fullscreen = cmds.iter().any(|c| c.contains("fullscreen"));
+        assert!(!has_fullscreen, "should NOT fullscreen when auto-pinning: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn fullscreen_exit_restores_focus_to_previous() {
+        let mock = MockHyprland::start().await;
+
+        // mpv fullscreen, firefox was previous focus
+        let clients_fullscreen = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 1, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", false, true,
+                2, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+        ];
+        let clients_exited = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 1, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", false, true,
+                0, 1, 0, 0, [1272, 712], [640, 360],
+            ),
+        ];
+
+        mock.set_response_sequence(
+            "j/clients",
+            vec![
+                make_clients_json(&clients_fullscreen),
+                make_clients_json(&clients_exited),
+            ],
+        )
+        .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // Should restore focus to firefox
+        let has_focus_restore = cmds.iter().any(|c| {
+            c.contains("focuswindow address:0xfirefox") && c.contains("no_warps")
+        });
+        assert!(has_focus_restore, "should restore focus to firefox: {cmds:?}");
     }
 }

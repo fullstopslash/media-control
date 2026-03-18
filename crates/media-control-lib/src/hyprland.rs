@@ -23,7 +23,7 @@
 //! # }
 //! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -56,14 +56,14 @@ pub enum HyprlandError {
 pub type Result<T> = std::result::Result<T, HyprlandError>;
 
 /// Workspace data embedded in Client and Monitor.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Workspace {
     pub id: i32,
     pub name: String,
 }
 
 /// Window/client data from Hyprland's `j/clients` command.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
     pub address: String,
@@ -85,7 +85,7 @@ pub struct Client {
 }
 
 /// Monitor data from Hyprland's `j/monitors` command.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Monitor {
     pub id: i32,
@@ -126,8 +126,9 @@ impl HyprlandClient {
         Ok(Self { socket_path })
     }
 
-    /// Create a client with a custom socket path (for testing).
-    #[cfg(test)]
+    /// Create a client with a custom socket path.
+    ///
+    /// Useful for testing with a mock server or connecting to a non-standard socket.
     pub fn with_socket_path(socket_path: PathBuf) -> Self {
         Self { socket_path }
     }

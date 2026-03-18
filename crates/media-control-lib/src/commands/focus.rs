@@ -101,9 +101,46 @@ pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> 
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn focus_module_compiles() {
-        // Basic compilation test - actual functionality requires Hyprland
-        assert!(true);
+    use super::*;
+    use crate::test_helpers::*;
+
+    #[tokio::test]
+    async fn focus_existing_media_window() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [1920, 1080],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        let result = focus_or_launch(&ctx, None).await.unwrap();
+        assert!(result, "should return true when media window found");
+
+        let cmds = mock.captured_commands().await;
+        let has_focus = cmds.iter().any(|c| c.contains("focuswindow address:0xmpv"));
+        assert!(has_focus, "should dispatch focuswindow: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn focus_no_media_returns_false() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xfirefox", "firefox", "Browser", false, false,
+            0, 1, 0, 0, [0, 0], [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        let ctx = mock.default_context();
+
+        let result = focus_or_launch(&ctx, None).await.unwrap();
+        assert!(!result, "should return false when no media window");
     }
 }

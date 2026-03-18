@@ -9,3 +9,6 @@ pub mod error;
 pub mod hyprland;
 pub mod jellyfin;
 pub mod window;
+
+#[cfg(test)]
+pub mod test_helpers;
