@@ -134,17 +134,20 @@ pub async fn mark_watched_and_next(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     }
 
-    send_mpv_keypress("ctrl+n").await
+    send_mpv_script_message("mark-watched-next").await
 }
 
-/// Send a keypress command to mpv via IPC socket.
+/// Send a script-message command to mpv via IPC socket.
+///
+/// Uses mpv's script-message mechanism which routes to handlers registered
+/// by jellyfin-mpv-shim (via python-mpv's register_message_handler).
 ///
 /// Tries multiple socket paths in order:
 /// 1. `$MPV_IPC_SOCKET` environment variable (if set)
 /// 2. `/tmp/mpvctl-jshim` (jellyfin-mpv-shim default)
 /// 3. `/tmp/mpvctl0` (common fallback)
-async fn send_mpv_keypress(key: &str) -> Result<()> {
-    let payload = format!(r#"{{"command":["keypress","{key}"]}}"#);
+async fn send_mpv_script_message(message: &str) -> Result<()> {
+    let payload = format!(r#"{{"command":["script-message","{message}"]}}"#);
 
     let env_socket = std::env::var("MPV_IPC_SOCKET").ok();
     let sockets = [
