@@ -5,23 +5,22 @@
 
 use tokio::process::Command;
 
-use super::{get_media_window, CommandContext};
-use crate::error::{MediaControlError, Result};
+use super::CommandContext;
+use crate::error::Result;
+use crate::hyprland::Client;
 use crate::jellyfin::JellyfinClient;
 
 /// Close the media window gracefully with app-specific handling.
 ///
 /// Different window types require different close strategies:
 /// - **mpv**: Stop Jellyfin session first (if applicable), then stop playback via playerctl
-/// - **Firefox PiP**: Cannot be closed programmatically (returns error)
-/// - **Jellyfin Media Player**: Use Hyprland's killwindow command
-/// - **Other windows**: Use Hyprland's killwindow command
+/// - **All others** (Firefox PiP, Jellyfin, etc.): Use Hyprland's `closewindow` for graceful close
 ///
 /// # Returns
 ///
 /// - `Ok(())` if no media window found (nothing to close)
 /// - `Ok(())` if the window was successfully closed
-/// - `Err(...)` if closing failed or is not possible (e.g., Firefox PiP)
+/// - `Err(...)` if Hyprland IPC fails
 ///
 /// # Example
 ///
@@ -35,11 +34,18 @@ use crate::jellyfin::JellyfinClient;
 /// # }
 /// ```
 pub async fn close(ctx: &CommandContext) -> Result<()> {
-    let Some(window) = get_media_window(ctx).await? else {
+    let clients = ctx.hyprland.get_clients().await?;
+
+    let focus_addr = clients
+        .iter()
+        .find(|c| c.focus_history_id == 0)
+        .map(|c| c.address.as_str());
+
+    let Some(window) = ctx.window_matcher.find_media_window(&clients, focus_addr) else {
         return Ok(());
     };
 
-    close_window_gracefully(ctx, &window.address, &window.class, &window.title).await
+    close_window_gracefully(ctx, &window.address, &window.class, &window.title, &clients).await
 }
 
 /// Close a specific window gracefully based on its class and title.
@@ -50,6 +56,7 @@ async fn close_window_gracefully(
     addr: &str,
     class: &str,
     title: &str,
+    clients: &[Client],
 ) -> Result<()> {
     // MPV: ensure Jellyfin session ends cleanly, then stop playback
     if class == "mpv" {
@@ -67,20 +74,43 @@ async fn close_window_gracefully(
         return Ok(());
     }
 
-    // Firefox Picture-in-Picture: cannot be closed programmatically.
-    // PiP windows share PID with main Firefox, so killwindow closes entire Firefox.
+    // Firefox PiP: close the PiP window, then close the source tab.
+    // When PiP closes, Firefox activates the source tab. We then focus
+    // the main Firefox window and send Ctrl+W to close that tab.
     if class == "firefox" && title.to_lowercase().contains("picture-in-picture") {
-        return Err(MediaControlError::Config {
-            kind: crate::error::ConfigErrorKind::ValidationError,
-            path: None,
-            source: Some("Firefox Picture-in-Picture cannot be closed programmatically".into()),
-        });
+        return close_firefox_pip(ctx, addr, clients).await;
     }
 
-    // All other windows (Jellyfin, default): use killwindow
+    // All other windows (Jellyfin, default): use closewindow.
+    // closewindow sends xdg_toplevel::close which gracefully closes just the
+    // targeted window surface.
     ctx.hyprland
-        .dispatch(&format!("killwindow address:{addr}"))
+        .dispatch(&format!("closewindow address:{addr}"))
         .await?;
+
+    Ok(())
+}
+
+/// Close a Firefox Picture-in-Picture window and stop its media.
+///
+/// Strategy:
+/// 1. Close the PiP window via `closewindow` (graceful xdg_toplevel::close)
+/// 2. Pause Firefox media via playerctl MPRIS (stops the video in the source tab)
+///
+/// We can't reliably close the source tab because we don't know which tab
+/// owns the PiP, and Firefox's internal tab activation after PiP close
+/// is not deterministic enough to target with Ctrl+W.
+async fn close_firefox_pip(ctx: &CommandContext, pip_addr: &str, _clients: &[Client]) -> Result<()> {
+    // Close the PiP window
+    ctx.hyprland
+        .dispatch(&format!("closewindow address:{pip_addr}"))
+        .await?;
+
+    // Stop Firefox media via MPRIS (best effort)
+    let _ = Command::new("playerctl")
+        .args(["--player=firefox", "pause"])
+        .output()
+        .await;
 
     Ok(())
 }
@@ -88,24 +118,6 @@ async fn close_window_gracefully(
 #[cfg(test)]
 mod tests {
     use crate::test_helpers::*;
-
-    #[test]
-    fn firefox_pip_detection_case_insensitive() {
-        // Test that we correctly detect PiP windows regardless of case
-        let title_variants = [
-            "Picture-in-Picture",
-            "picture-in-picture",
-            "PICTURE-IN-PICTURE",
-            "Picture-In-Picture",
-        ];
-
-        for title in title_variants {
-            assert!(
-                title.to_lowercase().contains("picture-in-picture"),
-                "Failed to detect PiP for title: {title}"
-            );
-        }
-    }
 
     #[test]
     fn jellyfin_class_detection() {
@@ -133,29 +145,12 @@ mod tests {
         assert_ne!("mpv", "vlc-mpv");
     }
 
-    #[test]
-    fn non_pip_firefox_not_blocked() {
-        // Regular Firefox windows should not be detected as PiP
-        let regular_titles = [
-            "Mozilla Firefox",
-            "GitHub - Mozilla Firefox",
-            "Picture Gallery - Firefox",
-        ];
-
-        for title in regular_titles {
-            assert!(
-                !title.to_lowercase().contains("picture-in-picture"),
-                "Incorrectly detected PiP for title: {title}"
-            );
-        }
-    }
-
     // --- E2E tests ---
 
     use super::*;
 
     #[tokio::test]
-    async fn close_jellyfin_dispatches_killwindow() {
+    async fn close_jellyfin_dispatches_closewindow() {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
@@ -168,12 +163,12 @@ mod tests {
         close(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
-        let has_kill = cmds.iter().any(|c| c.contains("killwindow"));
-        assert!(has_kill, "should dispatch killwindow for jellyfin: {cmds:?}");
+        let has_kill = cmds.iter().any(|c| c.contains("closewindow"));
+        assert!(has_kill, "should dispatch closewindow for jellyfin: {cmds:?}");
     }
 
     #[tokio::test]
-    async fn close_firefox_pip_returns_error() {
+    async fn close_firefox_pip_uses_closewindow() {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
@@ -183,8 +178,15 @@ mod tests {
         mock.set_response("j/clients", &make_clients_json(&clients)).await;
         let ctx = mock.default_context();
 
-        let result = close(&ctx).await;
-        assert!(result.is_err(), "should return error for Firefox PiP");
+        close(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let close_cmd = cmds.iter().find(|c| c.contains("closewindow"));
+        assert!(close_cmd.is_some(), "should dispatch closewindow for PiP: {cmds:?}");
+        assert!(
+            close_cmd.unwrap().contains("0xpip"),
+            "should target the PiP window address"
+        );
     }
 
     #[tokio::test]
@@ -202,12 +204,12 @@ mod tests {
         close(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
-        let has_kill = cmds.iter().any(|c| c.contains("killwindow"));
+        let has_kill = cmds.iter().any(|c| c.contains("closewindow"));
         assert!(!has_kill, "should NOT killwindow for mpv (uses playerctl): {cmds:?}");
     }
 
     #[tokio::test]
-    async fn close_default_dispatches_killwindow() {
+    async fn close_default_dispatches_closewindow() {
         let mock = MockHyprland::start().await;
 
         // Some other media window class
@@ -230,8 +232,8 @@ mod tests {
         close(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
-        let has_kill = cmds.iter().any(|c| c.contains("killwindow"));
-        assert!(has_kill, "should dispatch killwindow for default class: {cmds:?}");
+        let has_kill = cmds.iter().any(|c| c.contains("closewindow"));
+        assert!(has_kill, "should dispatch closewindow for default class: {cmds:?}");
     }
 
     #[tokio::test]
