@@ -94,6 +94,22 @@ pub struct Session {
     /// Queue of items for playback
     #[serde(default)]
     pub now_playing_queue: Vec<QueueItem>,
+
+    /// Full item details for the queue (used as fallback when NowPlayingItem is absent)
+    #[serde(default)]
+    pub now_playing_queue_full_items: Vec<NowPlayingItem>,
+}
+
+impl Session {
+    /// Get the currently playing item, falling back to the first queue full item.
+    ///
+    /// Some Jellyfin clients (like jellyfin-mpv-shim) don't always populate
+    /// `NowPlayingItem` but do populate `NowPlayingQueueFullItems`.
+    pub fn current_item(&self) -> Option<&NowPlayingItem> {
+        self.now_playing_item
+            .as_ref()
+            .or_else(|| self.now_playing_queue_full_items.first())
+    }
 }
 
 /// Information about the currently playing item.
@@ -152,6 +168,55 @@ struct NextUpResponse {
 #[serde(rename_all = "PascalCase")]
 struct NextUpItem {
     id: String,
+}
+
+/// An ancestor item from the `/Items/{id}/Ancestors` API.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AncestorItem {
+    id: String,
+    name: String,
+    #[serde(rename = "Type")]
+    item_type: String,
+    #[serde(default)]
+    collection_type: Option<String>,
+}
+
+/// Information about a Jellyfin library.
+#[derive(Debug, Clone)]
+pub struct LibraryInfo {
+    /// Library ID.
+    pub id: String,
+    /// Library display name (e.g., "Shows", "Pinchtube", "Movies").
+    pub name: String,
+    /// Collection type (e.g., "tvshows", "movies", "musicvideos").
+    pub collection_type: Option<String>,
+}
+
+/// Response from Items endpoints.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ItemsResponse {
+    items: Vec<ItemSummary>,
+}
+
+/// Summary of a Jellyfin item (used in filtered queries).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemSummary {
+    /// Item ID.
+    pub id: String,
+    /// Item name.
+    pub name: String,
+    /// When the item was added to the library.
+    pub date_created: Option<String>,
+    /// Index within a season/collection.
+    pub index_number: Option<i32>,
+    /// Production year.
+    pub production_year: Option<i32>,
+    /// Item type (Episode, Movie, etc.).
+    #[serde(rename = "Type")]
+    pub item_type: Option<String>,
 }
 
 /// Playback info response for getting media source details.
@@ -309,6 +374,10 @@ impl JellyfinClient {
         let sessions = self.fetch_sessions().await?;
 
         let session = sessions.into_iter().find(|s| {
+            // Exclude our own sessions (media-control)
+            if s.client == "media-control" {
+                return false;
+            }
             s.device_id == self.device_id
                 || s.client.to_lowercase().contains("mpv")
                 || s.client.to_lowercase().contains("jellyfin mpv shim")
@@ -359,7 +428,7 @@ impl JellyfinClient {
     pub async fn mark_current_watched(&self) -> Result<()> {
         let session = self.require_mpv_session().await?;
         let item = session
-            .now_playing_item
+            .current_item()
             .ok_or(JellyfinError::NoPlayingItem)?;
         self.mark_watched(&item.id).await
     }
@@ -368,10 +437,11 @@ impl JellyfinClient {
     pub async fn mark_watched_and_stop(&self) -> Result<()> {
         let session = self.require_mpv_session().await?;
         let item = session
-            .now_playing_item
+            .current_item()
             .ok_or(JellyfinError::NoPlayingItem)?;
+        let item_id = item.id.clone();
 
-        self.mark_watched(&item.id).await?;
+        self.mark_watched(&item_id).await?;
         self.stop(&session.id).await
     }
 
@@ -392,11 +462,16 @@ impl JellyfinClient {
 
     /// Start playing an item in a session.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails.
+    /// Uses the `/Sessions/{id}/Playing` endpoint with query parameters,
+    /// which is what jellyfin-mpv-shim responds to (as opposed to the
+    /// `/Sessions/{id}/Command/Play` JSON body endpoint).
     pub async fn play_item(&self, session_id: &str, item_id: &str) -> Result<()> {
-        self.play_items(session_id, &[item_id.to_string()]).await
+        let url = format!(
+            "{}/Sessions/{}/Playing?PlayCommand=PlayNow&ItemIds={}",
+            self.server_url, session_id, item_id
+        );
+        self.client.post(&url).send().await?;
+        Ok(())
     }
 
     /// Start playing multiple items in a session.
@@ -451,7 +526,7 @@ impl JellyfinClient {
     }
 
     /// Get remaining queue item IDs after the current item.
-    fn get_remaining_queue_ids(session: &Session, current_item_id: &str) -> Vec<String> {
+    pub fn get_remaining_queue_ids(session: &Session, current_item_id: &str) -> Vec<String> {
         let queue = &session.now_playing_queue;
 
         let current_idx = queue.iter().position(|item| item.id == current_item_id);
@@ -468,8 +543,7 @@ impl JellyfinClient {
     pub async fn next(&self) -> Result<()> {
         let session = self.require_mpv_session().await?;
         let current_id = session
-            .now_playing_item
-            .as_ref()
+            .current_item()
             .ok_or(JellyfinError::NoPlayingItem)?
             .id
             .clone();
@@ -486,8 +560,7 @@ impl JellyfinClient {
     pub async fn mark_watched_and_next(&self) -> Result<()> {
         let session = self.require_mpv_session().await?;
         let item = session
-            .now_playing_item
-            .as_ref()
+            .current_item()
             .ok_or(JellyfinError::NoPlayingItem)?;
 
         let item_id = item.id.clone();
@@ -513,6 +586,76 @@ impl JellyfinClient {
         }
 
         Ok(())
+    }
+
+    /// Fetch raw ancestor data as JSON values.
+    ///
+    /// Used by strategy code that needs to check for BoxSet ancestors.
+    pub async fn fetch_ancestors_raw(&self, item_id: &str) -> Result<Vec<serde_json::Value>> {
+        let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
+        let ancestors = self.client.get(&url).send().await?.json().await?;
+        Ok(ancestors)
+    }
+
+    /// Get the library that an item belongs to via the Ancestors API.
+    pub async fn get_item_library(&self, item_id: &str) -> Result<Option<LibraryInfo>> {
+        let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
+        let ancestors: Vec<AncestorItem> = self.client.get(&url).send().await?.json().await?;
+
+        Ok(ancestors.into_iter().find_map(|a| {
+            if a.item_type == "CollectionFolder" {
+                Some(LibraryInfo {
+                    id: a.id,
+                    name: a.name,
+                    collection_type: a.collection_type,
+                })
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// Get unwatched items from a library with configurable sort.
+    ///
+    /// # Arguments
+    ///
+    /// * `library_id` - Parent library ID to search within
+    /// * `sort_by` - Sort field (e.g., "DateCreated", "Random", "SortName")
+    /// * `sort_order` - Sort direction ("Descending" or "Ascending")
+    /// * `exclude_id` - Optional item ID to exclude from results
+    /// * `limit` - Maximum number of items to return
+    pub async fn get_unwatched_items(
+        &self,
+        library_id: &str,
+        sort_by: &str,
+        sort_order: &str,
+        exclude_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ItemSummary>> {
+        let mut url = format!(
+            "{}/Users/{}/Items?ParentId={}&IsPlayed=false&Recursive=true&SortBy={}&SortOrder={}&Limit={}&Fields=DateCreated,ProductionYear&IncludeItemTypes=Episode,Movie,MusicVideo,Video",
+            self.server_url, self.user_id, library_id, sort_by, sort_order, limit
+        );
+
+        if let Some(exc) = exclude_id {
+            url.push_str(&format!("&ExcludeItemIds={}", exc));
+        }
+
+        let response: ItemsResponse = self.client.get(&url).send().await?.json().await?;
+        Ok(response.items)
+    }
+
+    /// Get items in a collection (box set).
+    ///
+    /// Returns items sorted by their index/production year within the collection.
+    pub async fn get_collection_items(&self, collection_id: &str) -> Result<Vec<ItemSummary>> {
+        let url = format!(
+            "{}/Users/{}/Items?ParentId={}&SortBy=SortName,ProductionYear&SortOrder=Ascending&Fields=DateCreated,ProductionYear",
+            self.server_url, self.user_id, collection_id
+        );
+
+        let response: ItemsResponse = self.client.get(&url).send().await?.json().await?;
+        Ok(response.items)
     }
 
     /// Get the server URL.
@@ -648,6 +791,7 @@ mod tests {
                 QueueItem { id: "c".to_string() },
                 QueueItem { id: "d".to_string() },
             ],
+            now_playing_queue_full_items: Vec::new(),
         };
 
         // Current is first item
@@ -726,5 +870,64 @@ mod tests {
         assert_eq!(response.media_sources[0].id, "media-source-456");
         assert_eq!(response.media_sources[0].default_audio_stream_index, Some(1));
         assert_eq!(response.media_sources[0].default_subtitle_stream_index, Some(2));
+    }
+
+    #[test]
+    fn test_ancestor_item_parsing() {
+        let json = r#"[
+            {"Id": "lib1", "Name": "Shows", "Type": "CollectionFolder", "CollectionType": "tvshows"},
+            {"Id": "season1", "Name": "Season 1", "Type": "Season"},
+            {"Id": "series1", "Name": "My Show", "Type": "Series"}
+        ]"#;
+
+        let ancestors: Vec<AncestorItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(ancestors.len(), 3);
+
+        let library = ancestors.iter().find(|a| a.item_type == "CollectionFolder");
+        assert!(library.is_some());
+        assert_eq!(library.unwrap().name, "Shows");
+        assert_eq!(library.unwrap().collection_type.as_deref(), Some("tvshows"));
+    }
+
+    #[test]
+    fn test_items_response_parsing() {
+        let json = r#"{
+            "Items": [
+                {
+                    "Id": "item1",
+                    "Name": "Episode 1",
+                    "DateCreated": "2026-03-15T10:00:00Z",
+                    "IndexNumber": 1,
+                    "ProductionYear": 2026,
+                    "Type": "Episode"
+                },
+                {
+                    "Id": "item2",
+                    "Name": "Episode 2",
+                    "DateCreated": "2026-03-16T10:00:00Z",
+                    "IndexNumber": 2,
+                    "ProductionYear": 2026,
+                    "Type": "Episode"
+                }
+            ]
+        }"#;
+
+        let response: ItemsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.items.len(), 2);
+        assert_eq!(response.items[0].id, "item1");
+        assert_eq!(response.items[0].name, "Episode 1");
+        assert_eq!(response.items[0].index_number, Some(1));
+        assert_eq!(response.items[1].date_created.as_deref(), Some("2026-03-16T10:00:00Z"));
+    }
+
+    #[test]
+    fn test_items_response_minimal() {
+        // Items with minimal fields (no optional fields)
+        let json = r#"{"Items": [{"Id": "x", "Name": "Minimal"}]}"#;
+        let response: ItemsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].id, "x");
+        assert!(response.items[0].date_created.is_none());
+        assert!(response.items[0].index_number.is_none());
     }
 }
