@@ -74,9 +74,6 @@ pub struct Config {
 
     /// Avoidance behavior settings.
     pub positioning: Positioning,
-
-    /// Next episode strategy configuration.
-    pub next_episode: NextEpisodeConfig,
 }
 
 impl Config {
@@ -168,7 +165,6 @@ impl Default for Config {
             ],
             positions: Positions::default(),
             positioning: Positioning::default(),
-            next_episode: NextEpisodeConfig::default(),
         }
     }
 }
@@ -404,109 +400,6 @@ impl PositionOverride {
             true
         } else {
             self.title_regex().map(|re| re.is_match(title)).unwrap_or(false)
-        }
-    }
-}
-
-/// Configuration for next-episode strategy selection.
-///
-/// Rules are evaluated in order; the first matching rule wins.
-/// A rule with no `library` field acts as a default/fallback.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct NextEpisodeConfig {
-    /// Per-library strategy rules, evaluated in order.
-    pub rules: Vec<NextEpisodeRule>,
-}
-
-impl Default for NextEpisodeConfig {
-    fn default() -> Self {
-        Self { rules: Vec::new() }
-    }
-}
-
-/// A rule mapping a library to a next-episode strategy.
-///
-/// Rules can match by `library` name (requires API call) or `path_contains`
-/// (matches against the item's file path, no API call needed).
-#[derive(Debug, Clone, Deserialize)]
-pub struct NextEpisodeRule {
-    /// Library name to match (case-insensitive). Requires Ancestors API call.
-    pub library: Option<String>,
-
-    /// Jellyfin library ID for strategy queries.
-    pub library_id: Option<String>,
-
-    /// Match if the item's file path contains this string (case-insensitive).
-    /// Faster than library name matching since it uses session data directly.
-    pub path_contains: Option<String>,
-
-    /// Strategy to use for this library.
-    pub strategy: NextEpisodeStrategy,
-}
-
-/// Strategy for selecting the next episode after mark-watched.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum NextEpisodeStrategy {
-    /// Use Jellyfin's NextUp API (next unwatched episode in series).
-    NextUp,
-    /// Most recently acquired unwatched item in the library (jump to newest).
-    RecentUnwatched,
-    /// Next older unwatched item after the current one (walk down the timeline).
-    NextOlder,
-    /// Next in box set/collection if applicable, otherwise random unwatched.
-    SeriesOrRandom,
-    /// Random unwatched item from the library.
-    RandomUnwatched,
-}
-
-/// Result of strategy resolution: which strategy to use and the library ID if known.
-#[derive(Debug)]
-pub struct ResolvedStrategy {
-    pub strategy: NextEpisodeStrategy,
-    pub library_id: Option<String>,
-}
-
-impl NextEpisodeConfig {
-    /// Find the strategy for an item, trying path-based matching first (fast),
-    /// then library name matching (requires API call), then default.
-    ///
-    /// Rules are matched in order. First matching rule wins.
-    pub fn resolve_by_path(&self, item_path: Option<&str>) -> Option<ResolvedStrategy> {
-        let path = item_path?;
-        let path_lower = path.to_lowercase();
-
-        for rule in &self.rules {
-            if let Some(ref pattern) = rule.path_contains {
-                if path_lower.contains(&pattern.to_lowercase()) {
-                    return Some(ResolvedStrategy {
-                        strategy: rule.strategy,
-                        library_id: rule.library_id.clone(),
-                    });
-                }
-            }
-        }
-        None
-    }
-
-    /// Find the strategy by library name. Falls back to default rule.
-    pub fn resolve_strategy(&self, library_name: &str) -> ResolvedStrategy {
-        for rule in &self.rules {
-            let matched = match &rule.library {
-                Some(name) => name.eq_ignore_ascii_case(library_name),
-                None => true, // default/fallback
-            };
-            if matched {
-                return ResolvedStrategy {
-                    strategy: rule.strategy,
-                    library_id: rule.library_id.clone(),
-                };
-            }
-        }
-        ResolvedStrategy {
-            strategy: NextEpisodeStrategy::NextUp,
-            library_id: None,
         }
     }
 }
@@ -834,97 +727,5 @@ pref_x = "x_left"
 
         let result = config.positioning.get_override("anything", "Special Window");
         assert!(result.is_some(), "title-only override should match any class");
-    }
-
-    // --- Next episode config tests ---
-
-    #[test]
-    fn parse_next_episode_rules() {
-        let config_str = r#"
-[[next_episode.rules]]
-library = "Shows"
-strategy = "next-up"
-
-[[next_episode.rules]]
-library = "Pinchtube"
-strategy = "recent-unwatched"
-
-[[next_episode.rules]]
-library = "Movies"
-strategy = "series-or-random"
-
-[[next_episode.rules]]
-strategy = "random-unwatched"
-"#;
-        let config: Config = toml::from_str(config_str).expect("parse");
-
-        assert_eq!(config.next_episode.rules.len(), 4);
-        assert_eq!(config.next_episode.rules[0].library.as_deref(), Some("Shows"));
-        assert_eq!(config.next_episode.rules[0].strategy, NextEpisodeStrategy::NextUp);
-        assert_eq!(config.next_episode.rules[1].strategy, NextEpisodeStrategy::RecentUnwatched);
-        assert_eq!(config.next_episode.rules[2].strategy, NextEpisodeStrategy::SeriesOrRandom);
-        assert_eq!(config.next_episode.rules[3].library, None);
-        assert_eq!(config.next_episode.rules[3].strategy, NextEpisodeStrategy::RandomUnwatched);
-    }
-
-    #[test]
-    fn resolve_strategy_matches_first_rule() {
-        let config_str = r#"
-[[next_episode.rules]]
-library = "Shows"
-strategy = "next-up"
-
-[[next_episode.rules]]
-library = "Pinchtube"
-strategy = "recent-unwatched"
-
-[[next_episode.rules]]
-strategy = "random-unwatched"
-"#;
-        let config: Config = toml::from_str(config_str).expect("parse");
-
-        assert_eq!(config.next_episode.resolve_strategy("Shows").strategy, NextEpisodeStrategy::NextUp);
-        assert_eq!(config.next_episode.resolve_strategy("Pinchtube").strategy, NextEpisodeStrategy::RecentUnwatched);
-    }
-
-    #[test]
-    fn resolve_strategy_case_insensitive() {
-        let config_str = r#"
-[[next_episode.rules]]
-library = "Shows"
-strategy = "next-up"
-"#;
-        let config: Config = toml::from_str(config_str).expect("parse");
-
-        assert_eq!(config.next_episode.resolve_strategy("shows").strategy, NextEpisodeStrategy::NextUp);
-        assert_eq!(config.next_episode.resolve_strategy("SHOWS").strategy, NextEpisodeStrategy::NextUp);
-    }
-
-    #[test]
-    fn resolve_strategy_uses_default_rule() {
-        let config_str = r#"
-[[next_episode.rules]]
-library = "Shows"
-strategy = "next-up"
-
-[[next_episode.rules]]
-strategy = "random-unwatched"
-"#;
-        let config: Config = toml::from_str(config_str).expect("parse");
-
-        // "Movies" doesn't match "Shows", so hits the default rule
-        assert_eq!(config.next_episode.resolve_strategy("Movies").strategy, NextEpisodeStrategy::RandomUnwatched);
-    }
-
-    #[test]
-    fn resolve_strategy_no_rules_defaults_to_next_up() {
-        let config: Config = toml::from_str("").expect("parse");
-        assert_eq!(config.next_episode.resolve_strategy("anything").strategy, NextEpisodeStrategy::NextUp);
-    }
-
-    #[test]
-    fn empty_next_episode_config_defaults() {
-        let config = Config::default();
-        assert!(config.next_episode.rules.is_empty());
     }
 }
