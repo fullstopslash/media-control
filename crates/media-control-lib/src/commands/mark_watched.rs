@@ -1,28 +1,14 @@
 //! Jellyfin integration for marking items as watched.
 //!
-//! Provides commands to mark the current item as watched, optionally
-//! stopping playback or advancing to the next item via the shim.
+//! All commands delegate to the jellyfin-mpv-shim fork via mpv IPC.
+//! The shim handles Jellyfin API calls, strategy resolution, and playback natively.
 
 use super::{get_media_window, send_mpv_script_message, CommandContext};
-use crate::error::{MediaControlError, Result};
-use crate::jellyfin::{JellyfinClient, JellyfinError};
+use crate::error::Result;
 
-/// Convert a Jellyfin error to a MediaControlError.
-fn convert_jellyfin_error(e: JellyfinError) -> MediaControlError {
-    match e {
-        JellyfinError::CredentialsNotFound(_) | JellyfinError::InvalidCredentials(_) => {
-            MediaControlError::jellyfin_credentials()
-        }
-        JellyfinError::NoMpvSession => MediaControlError::jellyfin_session_not_found(),
-        JellyfinError::NoPlayingItem => MediaControlError::jellyfin_session_not_found(),
-        JellyfinError::Http(e) => MediaControlError::jellyfin_api(e),
-        JellyfinError::CredentialsParsing(e) => MediaControlError::jellyfin_api(e),
-        JellyfinError::HostnameError => MediaControlError::jellyfin_api("hostname lookup failed"),
-        JellyfinError::Io(e) => MediaControlError::Io(e),
-    }
-}
-
-/// Mark the current Jellyfin session item as watched.
+/// Mark the current item as watched.
+///
+/// Delegates to the shim via IPC `mark-watched` script-message.
 ///
 /// # Example
 ///
@@ -45,15 +31,7 @@ pub async fn mark_watched(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     }
 
-    let jellyfin = JellyfinClient::from_default_credentials()
-        .await
-        .map_err(convert_jellyfin_error)?;
-    jellyfin
-        .mark_current_watched()
-        .await
-        .map_err(convert_jellyfin_error)?;
-
-    Ok(())
+    send_mpv_script_message("mark-watched").await
 }
 
 /// Mark current item as watched and stop playback.
@@ -79,27 +57,14 @@ pub async fn mark_watched_and_stop(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     }
 
-    let jellyfin = JellyfinClient::from_default_credentials()
-        .await
-        .map_err(convert_jellyfin_error)?;
-    jellyfin
-        .mark_watched_and_stop()
-        .await
-        .map_err(convert_jellyfin_error)?;
-
-    // Also try playerctl stop (best effort, ignore errors)
-    let _ = tokio::process::Command::new("playerctl")
-        .args(["--player=mpv", "stop"])
-        .output()
-        .await;
-
-    Ok(())
+    let _ = send_mpv_script_message("mark-watched").await;
+    send_mpv_script_message("stop-and-clear").await
 }
 
 /// Mark current item as watched and advance to next episode.
 ///
-/// Delegates to the jellyfin-mpv-shim fork by sending a `mark-watched-next`
-/// script-message via mpv's IPC socket.
+/// Delegates to the shim via IPC `mark-watched-next` script-message.
+/// The shim handles per-library strategy resolution natively.
 ///
 /// # Example
 ///
@@ -123,4 +88,32 @@ pub async fn mark_watched_and_next(ctx: &CommandContext) -> Result<()> {
     }
 
     send_mpv_script_message("mark-watched-next").await
+}
+
+/// Skip to next item via per-library strategy (no mark watched).
+pub async fn skip_next(ctx: &CommandContext) -> Result<()> {
+    let media = match get_media_window(ctx).await? {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+
+    if media.class != "mpv" {
+        return Ok(());
+    }
+
+    send_mpv_script_message("skip-next").await
+}
+
+/// Skip to previous item (no mark watched).
+pub async fn skip_prev(ctx: &CommandContext) -> Result<()> {
+    let media = match get_media_window(ctx).await? {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+
+    if media.class != "mpv" {
+        return Ok(());
+    }
+
+    send_mpv_script_message("skip-prev").await
 }

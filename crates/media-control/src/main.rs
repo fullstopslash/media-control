@@ -89,6 +89,12 @@ enum Commands {
     /// Mark watched and advance queue
     MarkWatchedAndNext,
 
+    /// Skip to next item via strategy (no mark watched)
+    SkipNext,
+
+    /// Skip to previous item (no mark watched)
+    SkipPrev,
+
     /// Navigate chapters in mpv
     Chapter {
         /// Direction: next or prev
@@ -162,6 +168,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::MarkWatchedAndNext => {
             commands::mark_watched::mark_watched_and_next(&ctx).await?;
+        }
+        Commands::SkipNext => {
+            commands::mark_watched::skip_next(&ctx).await?;
+        }
+        Commands::SkipPrev => {
+            commands::mark_watched::skip_prev(&ctx).await?;
         }
         Commands::Chapter { direction } => {
             let dir = match direction.as_str() {
