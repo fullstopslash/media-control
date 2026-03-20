@@ -208,6 +208,7 @@ struct FocusedWindow<'a> {
     y: i32,
     width: i32,
     height: i32,
+    floating: bool,
     monitor: i32,
     workspace_id: i32,
     fullscreen: u8,
@@ -227,6 +228,7 @@ impl<'a> FocusedWindow<'a> {
             y: focused.at[1],
             width: focused.size[0],
             height: focused.size[1],
+            floating: focused.floating,
             monitor: focused.monitor,
             workspace_id: focused.workspace.id,
             fullscreen: focused.fullscreen,
@@ -386,8 +388,9 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
 
 /// Case 1: Move media windows to their primary configured position.
 ///
-/// If the media window is already at primary but overlaps the focused window,
-/// move to secondary position instead.
+/// If the focused window is floating and overlaps primary, move to secondary instead.
+/// Tiled/maximized windows always overlap the pinned media window — that's expected,
+/// so we only dodge floating windows.
 async fn handle_move_to_primary(
     ctx: &CommandContext,
     focused: &FocusedWindow<'_>,
@@ -400,41 +403,47 @@ async fn handle_move_to_primary(
         let at_primary = within_tolerance(window.x, pair.primary_x, tolerance)
             && within_tolerance(window.y, pair.primary_y, tolerance);
 
-        if at_primary {
-            // Already at primary — check if we overlap the focused window
-            let overlaps = rectangles_overlap(
-                window.x, window.y, window.width, window.height,
-                focused.x, focused.y, focused.width, focused.height,
-            );
-            if overlaps {
-                tracing::debug!(
-                    "avoid: at primary but overlapping focused, moving to secondary ({}, {})",
-                    pair.secondary_x, pair.secondary_y
+        // Only check overlap with floating windows — tiled windows always overlap
+        // the pinned media window and that's by design.
+        if focused.floating {
+            if at_primary {
+                let overlaps = rectangles_overlap(
+                    window.x, window.y, window.width, window.height,
+                    focused.x, focused.y, focused.width, focused.height,
                 );
-                move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
-                    .await?;
-            }
-        } else {
-            // Not at primary — check if primary would overlap the focused window
-            let media_w = pair.width.unwrap_or(ctx.config.positions.width);
-            let media_h = pair.height.unwrap_or(ctx.config.positions.height);
-            let primary_overlaps = rectangles_overlap(
-                pair.primary_x, pair.primary_y, media_w, media_h,
-                focused.x, focused.y, focused.width, focused.height,
-            );
-
-            if primary_overlaps {
-                tracing::debug!(
-                    "avoid: primary would overlap focused, moving to secondary ({}, {})",
-                    pair.secondary_x, pair.secondary_y
-                );
-                move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
-                    .await?;
+                if overlaps {
+                    tracing::debug!(
+                        "avoid: at primary but overlapping floating focused, moving to secondary ({}, {})",
+                        pair.secondary_x, pair.secondary_y
+                    );
+                    move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
+                        .await?;
+                    continue;
+                }
             } else {
-                tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
-                move_media_window(ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height)
-                    .await?;
+                let media_w = pair.width.unwrap_or(ctx.config.positions.width);
+                let media_h = pair.height.unwrap_or(ctx.config.positions.height);
+                let primary_overlaps = rectangles_overlap(
+                    pair.primary_x, pair.primary_y, media_w, media_h,
+                    focused.x, focused.y, focused.width, focused.height,
+                );
+                if primary_overlaps {
+                    tracing::debug!(
+                        "avoid: primary would overlap floating focused, moving to secondary ({}, {})",
+                        pair.secondary_x, pair.secondary_y
+                    );
+                    move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
+                        .await?;
+                    continue;
+                }
             }
+        }
+
+        // Default: move to primary (or stay if already there)
+        if !at_primary {
+            tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
+            move_media_window(ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height)
+                .await?;
         }
     }
     Ok(())
@@ -691,10 +700,10 @@ mod tests {
     async fn avoid_case1_moves_to_secondary_when_primary_overlaps() {
         let mock = MockHyprland::start().await;
 
-        // mpv at primary (1272, 712), firefox focused and overlapping that position
+        // mpv at primary (1272, 712), floating firefox focused and overlapping that position
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
+                "0xfirefox", "firefox", "Browser", false, true, // floating!
                 0, 1, 0, 0, [900, 500], [1020, 580], // overlaps primary position
             ),
             make_test_client_full(
@@ -720,10 +729,10 @@ mod tests {
     async fn avoid_case1_uses_secondary_when_primary_would_overlap() {
         let mock = MockHyprland::start().await;
 
-        // mpv at some random position, firefox overlaps the primary position
+        // mpv at some random position, floating firefox overlaps the primary position
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
+                "0xfirefox", "firefox", "Browser", false, true, // floating!
                 0, 1, 0, 0, [900, 500], [1020, 580], // overlaps primary (1272, 712)
             ),
             make_test_client_full(
