@@ -323,6 +323,7 @@ mod tests {
                 class: "firefox".to_string(),
                 title: "Browser".to_string(),
                 focus_history_id: 1,
+                pid: 0,
             },
             Client {
                 address: "0x2".to_string(),
@@ -341,6 +342,7 @@ mod tests {
                 class: "kitty".to_string(),
                 title: "Terminal".to_string(),
                 focus_history_id: 0,
+                pid: 0,
             },
             Client {
                 address: "0x3".to_string(),
@@ -359,6 +361,7 @@ mod tests {
                 class: "mpv".to_string(),
                 title: "video.mp4".to_string(),
                 focus_history_id: 2,
+                pid: 0,
             },
         ];
 
@@ -393,6 +396,7 @@ mod tests {
                 class: "firefox".to_string(),
                 title: "Browser".to_string(),
                 focus_history_id: 1,
+                pid: 0,
             },
             Client {
                 address: "0x2".to_string(),
@@ -411,6 +415,7 @@ mod tests {
                 class: "kitty".to_string(),
                 title: "Terminal".to_string(),
                 focus_history_id: 0,
+                pid: 0,
             },
         ];
 
@@ -440,6 +445,7 @@ mod tests {
             class: "mpv".to_string(),
             title: "video.mp4".to_string(),
             focus_history_id: 0,
+                pid: 0,
         }];
 
         // Only the media window exists

@@ -648,6 +648,7 @@ mod tests {
                 class: "firefox".to_string(),
                 title: "Browser".to_string(),
                 focus_history_id: 0, // Firefox is currently focused
+                pid: 0,
             },
             Client {
                 address: "0x2".to_string(),
@@ -666,6 +667,7 @@ mod tests {
                 class: "mpv".to_string(),
                 title: "video.mp4".to_string(),
                 focus_history_id: 1,
+                pid: 0,
             },
         ];
 

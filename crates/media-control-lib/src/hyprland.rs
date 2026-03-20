@@ -79,6 +79,8 @@ pub struct Client {
     #[serde(default)]
     pub fullscreen: u8,
     pub monitor: i32,
+    #[serde(default)]
+    pub pid: i32,
     pub class: String,
     pub title: String,
     #[serde(rename = "focusHistoryID")]

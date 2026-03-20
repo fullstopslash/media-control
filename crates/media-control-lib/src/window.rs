@@ -124,6 +124,8 @@ pub struct MediaWindow {
     pub priority: u8,
     /// Focus history ID from Hyprland (lower = more recently focused).
     pub focus_history_id: i32,
+    /// Process ID of the window.
+    pub pid: i32,
 }
 
 impl MediaWindow {
@@ -144,6 +146,7 @@ impl MediaWindow {
             workspace_id: client.workspace.id,
             always_pin: match_result.always_pin,
             priority,
+            pid: client.pid,
             focus_history_id: client.focus_history_id,
         }
     }
@@ -374,6 +377,7 @@ mod tests {
             class: class.to_string(),
             title: title.to_string(),
             focus_history_id: 0,
+                pid: 0,
         }
     }
 
@@ -402,6 +406,7 @@ mod tests {
             pinned,
             fullscreen,
             monitor,
+            pid: 0,
             class: class.to_string(),
             title: title.to_string(),
             focus_history_id,
