@@ -162,6 +162,7 @@ async fn fifo_listener(tx: mpsc::Sender<()>) {
 }
 
 /// Run the event loop, listening to Hyprland socket2 events and FIFO triggers.
+#[allow(unused_assignments)] // avoid_in_progress guard is defensive; select! arms don't interleave
 async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
     // Load config and create context once (reused for all avoid triggers)
     let config = Config::load().unwrap_or_default();
@@ -171,7 +172,9 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = get_socket2_path()?;
     info!("Connecting to Hyprland socket at {:?}", socket_path);
 
-    let stream = UnixStream::connect(&socket_path).await?;
+    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path))
+        .await
+        .map_err(|_| format!("Timed out connecting to Hyprland socket at {socket_path:?}"))??;
     let reader = BufReader::new(stream);
     let mut lines = reader.lines();
 
@@ -181,12 +184,13 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
     // Channel for FIFO triggers
     let (fifo_tx, mut fifo_rx) = mpsc::channel::<()>(16);
 
-    // Spawn FIFO listener task
-    tokio::spawn(fifo_listener(fifo_tx));
+    // Spawn FIFO listener task (supervised via JoinHandle)
+    let mut fifo_handle = tokio::spawn(fifo_listener(fifo_tx));
 
     // Debounce state
     let mut last_avoid_time = Instant::now();
     let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
+    let mut avoid_in_progress = false;
 
     info!("Event loop started, listening for Hyprland events and FIFO triggers");
 
@@ -202,9 +206,11 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
                         // Events that trigger avoidance
                         match event {
                             "workspace" | "activewindow" | "movewindow" | "openwindow" | "closewindow" | "swapwindow" => {
-                                if last_avoid_time.elapsed() >= debounce_duration {
+                                if !avoid_in_progress && last_avoid_time.elapsed() >= debounce_duration {
+                                    avoid_in_progress = true;
                                     trigger_avoid(&ctx).await;
                                     last_avoid_time = Instant::now();
+                                    avoid_in_progress = false;
                                 }
                             }
                             _ => {}
@@ -223,11 +229,22 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
 
             // Handle FIFO triggers (for togglesplit etc.)
             Some(()) = fifo_rx.recv() => {
-                if last_avoid_time.elapsed() >= debounce_duration {
+                if !avoid_in_progress && last_avoid_time.elapsed() >= debounce_duration {
                     debug!("Processing FIFO trigger");
+                    avoid_in_progress = true;
                     trigger_avoid(&ctx).await;
                     last_avoid_time = Instant::now();
+                    avoid_in_progress = false;
                 }
+            }
+
+            // Supervise FIFO listener: log and break if it exits unexpectedly
+            result = &mut fifo_handle => {
+                match result {
+                    Ok(()) => warn!("FIFO listener exited unexpectedly"),
+                    Err(e) => error!("FIFO listener panicked: {}", e),
+                }
+                break;
             }
         }
     }
@@ -247,10 +264,17 @@ async fn run_foreground() -> ExitCode {
     }
 
     // Run event loop with graceful shutdown
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+
     let result = tokio::select! {
         result = run_event_loop() => result,
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down");
+            Ok(())
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down");
             Ok(())
         }
     };

@@ -6,6 +6,30 @@ use thiserror::Error;
 /// Result type alias using [`MediaControlError`].
 pub type Result<T> = std::result::Result<T, MediaControlError>;
 
+/// Specific kinds of mpv IPC errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpvIpcErrorKind {
+    /// No valid mpv IPC socket found.
+    NoSocket,
+    /// Connection or write timed out.
+    Timeout,
+    /// Connection failed on all socket paths.
+    ConnectionFailed,
+    /// mpv returned an error response.
+    ResponseError,
+}
+
+impl std::fmt::Display for MpvIpcErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSocket => write!(f, "no mpv IPC socket found"),
+            Self::Timeout => write!(f, "connection timed out"),
+            Self::ConnectionFailed => write!(f, "connection failed"),
+            Self::ResponseError => write!(f, "mpv returned an error"),
+        }
+    }
+}
+
 /// Errors that can occur during media control operations.
 #[derive(Debug, Error)]
 pub enum MediaControlError {
@@ -37,6 +61,13 @@ pub enum MediaControlError {
     /// No matching media window found.
     #[error("no media window found matching pattern")]
     WindowNotFound,
+
+    /// mpv IPC communication error.
+    #[error("mpv IPC error: {kind}")]
+    MpvIpc {
+        kind: MpvIpcErrorKind,
+        message: String,
+    },
 
     /// General I/O error.
     #[error("I/O error")]
@@ -236,6 +267,22 @@ impl MediaControlError {
             source: None,
         }
     }
+
+    /// Create an mpv IPC no-socket error.
+    pub fn mpv_no_socket() -> Self {
+        Self::MpvIpc {
+            kind: MpvIpcErrorKind::NoSocket,
+            message: "no mpv IPC socket found (tried $MPV_IPC_SOCKET, /tmp/mpvctl-jshim, /tmp/mpvctl0)".into(),
+        }
+    }
+
+    /// Create an mpv IPC connection failed error.
+    pub fn mpv_connection_failed(msg: impl Into<String>) -> Self {
+        Self::MpvIpc {
+            kind: MpvIpcErrorKind::ConnectionFailed,
+            message: msg.into(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +348,23 @@ mod tests {
     fn window_not_found_displays_correctly() {
         let err = MediaControlError::WindowNotFound;
         assert!(err.to_string().contains("no media window"));
+    }
+
+    #[test]
+    fn mpv_ipc_errors_display_correctly() {
+        let err = MediaControlError::mpv_no_socket();
+        assert!(err.to_string().contains("no mpv IPC socket found"));
+
+        let err = MediaControlError::mpv_connection_failed("test failure");
+        assert!(err.to_string().contains("connection failed"));
+    }
+
+    #[test]
+    fn mpv_ipc_error_kind_display() {
+        assert_eq!(MpvIpcErrorKind::NoSocket.to_string(), "no mpv IPC socket found");
+        assert_eq!(MpvIpcErrorKind::Timeout.to_string(), "connection timed out");
+        assert_eq!(MpvIpcErrorKind::ConnectionFailed.to_string(), "connection failed");
+        assert_eq!(MpvIpcErrorKind::ResponseError.to_string(), "mpv returned an error");
     }
 
     #[test]

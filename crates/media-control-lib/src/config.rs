@@ -74,6 +74,18 @@ pub struct Config {
 
     /// Avoidance behavior settings.
     pub positioning: Positioning,
+
+    /// Play subcommand settings.
+    #[serde(default)]
+    pub play: PlayConfig,
+}
+
+/// Play subcommand settings.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PlayConfig {
+    /// Jellyfin library ID for Pinchflat content.
+    /// Required when using `media-control play recent-pinchflat`.
+    pub pinchflat_library_id: Option<String>,
 }
 
 impl Config {
@@ -165,6 +177,7 @@ impl Default for Config {
             ],
             positions: Positions::default(),
             positioning: Positioning::default(),
+            play: PlayConfig::default(),
         }
     }
 }

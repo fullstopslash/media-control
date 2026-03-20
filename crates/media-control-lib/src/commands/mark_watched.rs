@@ -57,7 +57,7 @@ pub async fn mark_watched_and_stop(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     }
 
-    let _ = send_mpv_script_message("mark-watched").await;
+    send_mpv_script_message("mark-watched").await?;
     send_mpv_script_message("stop-and-clear").await
 }
 

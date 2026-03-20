@@ -169,9 +169,20 @@ impl WindowMatcher {
         let compiled = patterns
             .iter()
             .filter_map(|p| {
-                let key = PatternKey::from_str(&p.key)?;
-                // Compile regex, returning None on invalid patterns (filtered out)
-                let regex = Regex::new(&p.value).ok()?;
+                let Some(key) = PatternKey::from_str(&p.key) else {
+                    eprintln!("media-control: unknown pattern key {:?}, skipping", p.key);
+                    return None;
+                };
+                let regex = match Regex::new(&p.value) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "media-control: invalid regex {:?}: {e}, skipping",
+                            p.value
+                        );
+                        return None;
+                    }
+                };
                 Some(CompiledPattern {
                     key,
                     regex,
@@ -236,7 +247,7 @@ impl WindowMatcher {
         let mut focused_match: Option<(&Client, MatchResult)> = None;
         let mut any_match: Option<(&Client, MatchResult)> = None;
 
-        for client in clients {
+        for client in clients.iter().filter(|c| c.mapped && !c.hidden) {
             if let Some(match_result) = self.matches(client) {
                 // Priority 1: Pinned
                 if client.pinned && pinned_match.is_none() {
@@ -280,6 +291,7 @@ impl WindowMatcher {
         let mut windows: Vec<_> = clients
             .iter()
             .filter(|c| c.monitor == monitor)
+            .filter(|c| c.mapped && !c.hidden)
             .filter_map(|client| {
                 let match_result = self.matches(client)?;
                 let priority = if client.pinned { 1 } else { 3 };
@@ -288,10 +300,15 @@ impl WindowMatcher {
             .collect();
 
         // Sort by priority, then by focus history (lower ID = more recent)
+        // focus_history_id -1 means never focused; sort those last
         windows.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then_with(|| a.focus_history_id.cmp(&b.focus_history_id))
+            a.priority.cmp(&b.priority).then_with(|| {
+                match (a.focus_history_id < 0, b.focus_history_id < 0) {
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => a.focus_history_id.cmp(&b.focus_history_id),
+                }
+            })
         });
 
         windows

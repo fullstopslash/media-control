@@ -6,6 +6,7 @@
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Errors that can occur when interacting with Jellyfin.
@@ -201,6 +202,22 @@ pub struct LibraryInfo {
     pub collection_type: Option<String>,
 }
 
+/// Detailed item response (for resume position etc.).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ItemDetail {
+    #[allow(dead_code)]
+    id: String,
+    user_data: Option<ItemUserData>,
+}
+
+/// User-specific data for an item (playback position, played status, etc.).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ItemUserData {
+    playback_position_ticks: i64,
+}
+
 /// Response from Items endpoints.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -344,6 +361,8 @@ impl JellyfinClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .build()?;
 
         Ok(Self {
@@ -369,7 +388,7 @@ impl JellyfinClient {
     /// Returns an error if the HTTP request fails.
     pub async fn fetch_sessions(&self) -> Result<Vec<Session>> {
         let url = format!("{}/Sessions", self.server_url);
-        let sessions = self.client.get(&url).send().await?.json().await?;
+        let sessions = self.client.get(&url).send().await?.error_for_status()?.json().await?;
         Ok(sessions)
     }
 
@@ -408,7 +427,7 @@ impl JellyfinClient {
     /// Returns an error if the HTTP request fails.
     pub async fn stop(&self, session_id: &str) -> Result<()> {
         let url = format!("{}/Sessions/{}/Playing/Stop", self.server_url, session_id);
-        self.client.post(&url).send().await?;
+        self.client.post(&url).send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -428,7 +447,7 @@ impl JellyfinClient {
             "{}/Users/{}/PlayedItems/{}",
             self.server_url, self.user_id, item_id
         );
-        self.client.post(&url).send().await?;
+        self.client.post(&url).send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -464,8 +483,60 @@ impl JellyfinClient {
             self.server_url, series_id, self.user_id
         );
 
-        let response: NextUpResponse = self.client.get(&url).send().await?.json().await?;
+        let response: NextUpResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
         Ok(response.items.into_iter().next().map(|item| item.id))
+    }
+
+    /// Get the global next-up item across all shows.
+    ///
+    /// Unlike `get_next_up()` which is per-series, this returns the first
+    /// NextUp item across all shows.
+    pub async fn get_global_next_up(&self) -> Result<Option<String>> {
+        let url = format!(
+            "{}/Shows/NextUp?UserId={}&Limit=1",
+            self.server_url, self.user_id
+        );
+
+        let response: NextUpResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        Ok(response.items.into_iter().next().map(|item| item.id))
+    }
+
+    /// Get the resume position (in ticks) for an item.
+    ///
+    /// Returns 0 if the item has never been played or has no resume position.
+    pub async fn get_item_resume_ticks(&self, item_id: &str) -> Result<i64> {
+        let url = format!(
+            "{}/Users/{}/Items/{}",
+            self.server_url, self.user_id, item_id
+        );
+
+        let response: ItemDetail = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        Ok(response
+            .user_data
+            .map(|ud| ud.playback_position_ticks)
+            .unwrap_or(0))
+    }
+
+    /// Start playing an item in a session with optional resume position.
+    ///
+    /// Like `play_item()` but appends `StartPositionTicks` when non-zero.
+    pub async fn play_item_with_resume(
+        &self,
+        session_id: &str,
+        item_id: &str,
+        start_ticks: i64,
+    ) -> Result<()> {
+        let mut url = format!(
+            "{}/Sessions/{}/Playing?PlayCommand=PlayNow&ItemIds={}",
+            self.server_url, session_id, item_id
+        );
+
+        if start_ticks > 0 {
+            url.push_str(&format!("&StartPositionTicks={start_ticks}"));
+        }
+
+        self.client.post(&url).send().await?.error_for_status()?;
+        Ok(())
     }
 
     /// Start playing an item in a session.
@@ -478,7 +549,7 @@ impl JellyfinClient {
             "{}/Sessions/{}/Playing?PlayCommand=PlayNow&ItemIds={}",
             self.server_url, session_id, item_id
         );
-        self.client.post(&url).send().await?;
+        self.client.post(&url).send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -510,7 +581,7 @@ impl JellyfinClient {
         };
 
         let url = format!("{}/Sessions/{}/Command/Play", self.server_url, session_id);
-        self.client.post(&url).json(&command).send().await?;
+        self.client.post(&url).json(&command).send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -601,14 +672,14 @@ impl JellyfinClient {
     /// Used by strategy code that needs to check for BoxSet ancestors.
     pub async fn fetch_ancestors_raw(&self, item_id: &str) -> Result<Vec<serde_json::Value>> {
         let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
-        let ancestors = self.client.get(&url).send().await?.json().await?;
+        let ancestors = self.client.get(&url).send().await?.error_for_status()?.json().await?;
         Ok(ancestors)
     }
 
     /// Get the library that an item belongs to via the Ancestors API.
     pub async fn get_item_library(&self, item_id: &str) -> Result<Option<LibraryInfo>> {
         let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
-        let ancestors: Vec<AncestorItem> = self.client.get(&url).send().await?.json().await?;
+        let ancestors: Vec<AncestorItem> = self.client.get(&url).send().await?.error_for_status()?.json().await?;
 
         Ok(ancestors.into_iter().find_map(|a| {
             if a.item_type == "CollectionFolder" {
@@ -649,7 +720,7 @@ impl JellyfinClient {
             url.push_str(&format!("&ExcludeItemIds={}", exc));
         }
 
-        let response: ItemsResponse = self.client.get(&url).send().await?.json().await?;
+        let response: ItemsResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
         Ok(response.items)
     }
 
@@ -662,7 +733,7 @@ impl JellyfinClient {
             self.server_url, self.user_id, collection_id
         );
 
-        let response: ItemsResponse = self.client.get(&url).send().await?.json().await?;
+        let response: ItemsResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
         Ok(response.items)
     }
 
@@ -937,5 +1008,38 @@ mod tests {
         assert_eq!(response.items[0].id, "x");
         assert!(response.items[0].date_created.is_none());
         assert!(response.items[0].index_number.is_none());
+    }
+
+    #[test]
+    fn test_item_detail_with_resume_ticks() {
+        let json = r#"{
+            "Id": "abc123",
+            "UserData": {
+                "PlaybackPositionTicks": 54321000000
+            }
+        }"#;
+        let detail: ItemDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.id, "abc123");
+        assert_eq!(detail.user_data.unwrap().playback_position_ticks, 54321000000);
+    }
+
+    #[test]
+    fn test_item_detail_without_user_data() {
+        let json = r#"{"Id": "def456"}"#;
+        let detail: ItemDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.id, "def456");
+        assert!(detail.user_data.is_none());
+    }
+
+    #[test]
+    fn test_item_detail_with_zero_ticks() {
+        let json = r#"{
+            "Id": "ghi789",
+            "UserData": {
+                "PlaybackPositionTicks": 0
+            }
+        }"#;
+        let detail: ItemDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.user_data.unwrap().playback_position_ticks, 0);
     }
 }

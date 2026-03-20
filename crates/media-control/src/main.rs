@@ -101,6 +101,19 @@ enum Commands {
         direction: String,
     },
 
+    /// Play a Jellyfin item (next-up, recent-pinchflat, or item ID)
+    Play {
+        /// What to play: next-up, recent-pinchflat, or a Jellyfin item ID
+        target: String,
+    },
+
+    /// Show current playback status
+    Status {
+        /// Output as JSON (for waybar/scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -109,7 +122,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     let cli = Cli::parse();
 
     // Handle completions early (no config needed)
@@ -120,7 +133,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "media-control",
             &mut std::io::stdout(),
         );
-        return Ok(());
+        return;
+    }
+
+    // Handle status early (no config/context needed — just mpv IPC)
+    if let Commands::Status { json } = cli.command {
+        match commands::status::status(json).await {
+            Ok(true) => return,
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("media-control: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Setup logging (off by default, enabled with -v)
@@ -130,10 +155,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
+    if let Err(e) = run(cli).await {
+        eprintln!("media-control: {e}");
+        // Fire-and-forget desktop notification
+        let _ = std::process::Command::new("notify-send")
+            .args(["-u", "critical", "media-control", &format!("{e}")])
+            .spawn();
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Load config (use override path if provided)
     let config = match &cli.config {
         Some(path) => Config::load_from_path(path)?,
-        None => Config::load()?,
+        None => Config::load().unwrap_or_else(|e| {
+            tracing::debug!("Config load failed ({e}), using defaults");
+            Config::default()
+        }),
     };
 
     let ctx = CommandContext::with_config(config)?;
@@ -183,6 +222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             commands::chapter::chapter(&ctx, dir).await?;
         }
+        Commands::Play { target } => {
+            commands::play::play(&ctx, &target).await?;
+        }
+        Commands::Status { .. } => unreachable!(), // handled before config loading
         Commands::Completions { .. } => unreachable!(),
     }
 

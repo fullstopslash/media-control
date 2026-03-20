@@ -26,6 +26,7 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -140,7 +141,22 @@ impl HyprlandClient {
     /// 1. Connect to Unix socket
     /// 2. Write command bytes
     /// 3. Read response (may be empty, "ok", or JSON)
+    ///
+    /// Times out after 2 seconds if Hyprland is unresponsive.
     pub async fn command(&self, cmd: &str) -> Result<String> {
+        const TIMEOUT: Duration = Duration::from_secs(2);
+
+        tokio::time::timeout(TIMEOUT, self.command_inner(cmd))
+            .await
+            .map_err(|_| {
+                HyprlandError::ConnectionFailed(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Hyprland IPC timed out after 2s",
+                ))
+            })?
+    }
+
+    async fn command_inner(&self, cmd: &str) -> Result<String> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(HyprlandError::ConnectionFailed)?;

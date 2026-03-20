@@ -167,10 +167,11 @@ async fn move_media_window(
             &format!("dispatch movewindowpixel exact {x} {y},address:{addr}"),
             &format!("dispatch resizewindowpixel exact {w} {h},address:{addr}"),
         ])
-        .await
-        .ok();
+        .await?;
 
-    suppress_avoider().await.ok();
+    if let Err(e) = suppress_avoider().await {
+        eprintln!("media-control: failed to suppress avoider: {e}");
+    }
     Ok(())
 }
 
@@ -384,6 +385,9 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
 }
 
 /// Case 1: Move media windows to their primary configured position.
+///
+/// If the media window is already at primary but overlaps the focused window,
+/// move to secondary position instead.
 async fn handle_move_to_primary(
     ctx: &CommandContext,
     focused: &FocusedWindow<'_>,
@@ -393,12 +397,44 @@ async fn handle_move_to_primary(
     let tolerance = i32::from(ctx.config.positioning.position_tolerance);
 
     for window in media_windows {
-        if !within_tolerance(window.x, pair.primary_x, tolerance)
-            || !within_tolerance(window.y, pair.primary_y, tolerance)
-        {
-            tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
-            move_media_window(ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height)
-                .await?;
+        let at_primary = within_tolerance(window.x, pair.primary_x, tolerance)
+            && within_tolerance(window.y, pair.primary_y, tolerance);
+
+        if at_primary {
+            // Already at primary — check if we overlap the focused window
+            let overlaps = rectangles_overlap(
+                window.x, window.y, window.width, window.height,
+                focused.x, focused.y, focused.width, focused.height,
+            );
+            if overlaps {
+                tracing::debug!(
+                    "avoid: at primary but overlapping focused, moving to secondary ({}, {})",
+                    pair.secondary_x, pair.secondary_y
+                );
+                move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
+                    .await?;
+            }
+        } else {
+            // Not at primary — check if primary would overlap the focused window
+            let media_w = pair.width.unwrap_or(ctx.config.positions.width);
+            let media_h = pair.height.unwrap_or(ctx.config.positions.height);
+            let primary_overlaps = rectangles_overlap(
+                pair.primary_x, pair.primary_y, media_w, media_h,
+                focused.x, focused.y, focused.width, focused.height,
+            );
+
+            if primary_overlaps {
+                tracing::debug!(
+                    "avoid: primary would overlap focused, moving to secondary ({}, {})",
+                    pair.secondary_x, pair.secondary_y
+                );
+                move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
+                    .await?;
+            } else {
+                tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
+                move_media_window(ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height)
+                    .await?;
+            }
         }
     }
     Ok(())
@@ -429,7 +465,9 @@ async fn handle_mouseover_toggle(
     }
 
     // Restore focus so subsequent mouseovers trigger new events
-    let _ = restore_focus(ctx, &prev_window.address).await;
+    if let Err(e) = restore_focus(ctx, &prev_window.address).await {
+        eprintln!("media-control: failed to restore focus: {e}");
+    }
     Ok(())
 }
 
@@ -477,8 +515,10 @@ async fn handle_mouseover_geometry(
 
     move_media_window(ctx, focused.address, target_x, target_y, None, None).await?;
 
-    if let Some(prev_addr) = find_previous_focus(clients, focused.workspace_id, ctx) {
-        let _ = restore_focus(ctx, &prev_addr).await;
+    if let Some(prev_addr) = find_previous_focus(clients, focused.workspace_id, ctx)
+        && let Err(e) = restore_focus(ctx, &prev_addr).await
+    {
+        eprintln!("media-control: failed to restore focus: {e}");
     }
     Ok(())
 }
@@ -596,15 +636,24 @@ mod tests {
     async fn avoid_case1_moves_media_to_primary() {
         let mock = MockHyprland::start().await;
 
-        // mpv at [0, 0] which is NOT at default primary (x_right=1272, y_bottom=712)
-        mock.set_response("j/clients", &scenario_single_workspace([0, 0]))
+        // mpv at [0, 0], firefox at [0, 400] with small size (doesn't overlap primary)
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 400], [800, 300],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [0, 0], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
             .await;
 
         let ctx = mock.context(test_config());
         avoid(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
-        // Should have dispatched a move+resize batch
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
         assert!(batch.is_some(), "expected movewindowpixel in: {cmds:?}");
         let batch = batch.unwrap();
@@ -613,20 +662,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn avoid_case1_skips_when_already_at_primary() {
+    async fn avoid_case1_skips_when_already_at_primary_no_overlap() {
         let mock = MockHyprland::start().await;
 
-        // mpv already at default primary position (x_right=1272, y_bottom=712)
-        mock.set_response("j/clients", &scenario_single_workspace([1272, 712]))
+        // mpv at primary, firefox small and not overlapping primary
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
             .await;
 
         let ctx = mock.context(test_config());
         avoid(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
-        // Should NOT have dispatched a move
         let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
-        assert!(!has_move, "should not move when already at primary: {cmds:?}");
+        assert!(!has_move, "should not move when at primary with no overlap: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn avoid_case1_moves_to_secondary_when_primary_overlaps() {
+        let mock = MockHyprland::start().await;
+
+        // mpv at primary (1272, 712), firefox focused and overlapping that position
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [900, 500], [1020, 580], // overlaps primary position
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [1272, 712], [640, 360], // at primary
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
+        assert!(batch.is_some(), "should move when primary overlaps focused: {cmds:?}");
+        let batch = batch.unwrap();
+        // Should move to secondary (x_left=48) instead of staying at primary
+        assert!(batch.contains("48"), "expected secondary x_left=48: {batch}");
+    }
+
+    #[tokio::test]
+    async fn avoid_case1_uses_secondary_when_primary_would_overlap() {
+        let mock = MockHyprland::start().await;
+
+        // mpv at some random position, firefox overlaps the primary position
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser", false, false,
+                0, 1, 0, 0, [900, 500], [1020, 580], // overlaps primary (1272, 712)
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4", true, true,
+                0, 1, 0, 1, [500, 300], [640, 360], // not at primary
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
+        assert!(batch.is_some(), "should move to secondary: {cmds:?}");
+        let batch = batch.unwrap();
+        assert!(batch.contains("48"), "expected secondary x_left=48: {batch}");
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@
 
 use tokio::process::Command;
 
+use super::fullscreen::is_pip_title;
 use super::{send_mpv_script_message, CommandContext};
 use crate::error::Result;
 use crate::hyprland::Client;
@@ -61,14 +62,14 @@ async fn close_window_gracefully(
     // The mpv window stays alive (idle) so the shim can reuse it for
     // the next video. Closing the window would kill mpv entirely.
     if class == "mpv" {
-        let _ = send_mpv_script_message("stop-and-clear").await;
+        send_mpv_script_message("stop-and-clear").await?;
         return Ok(());
     }
 
     // Firefox PiP: close the PiP window, then close the source tab.
     // When PiP closes, Firefox activates the source tab. We then focus
     // the main Firefox window and send Ctrl+W to close that tab.
-    if class == "firefox" && title.to_lowercase().contains("picture-in-picture") {
+    if class == "firefox" && is_pip_title(title) {
         return close_firefox_pip(ctx, addr, clients).await;
     }
 
