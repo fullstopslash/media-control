@@ -5,7 +5,7 @@
 //! - `recent-pinchflat`: Most recent unwatched video from Pinchflat library
 //! - `<item-id>`: Direct Jellyfin item ID
 
-use super::{send_mpv_script_message_with_args, CommandContext};
+use super::{send_mpv_script_message, send_mpv_script_message_with_args, CommandContext};
 use crate::jellyfin::JellyfinClient;
 
 /// What to play.
@@ -35,12 +35,14 @@ pub async fn play(ctx: &CommandContext, target_str: &str) -> std::result::Result
     let target = PlayTarget::parse(target_str);
     let jf = JellyfinClient::from_default_credentials().await?;
 
+    // NextUp: delegate entirely to the shim's merged queue (includes movies + series)
+    if matches!(target, PlayTarget::NextUp) {
+        send_mpv_script_message("play-next-up").await?;
+        return Ok(());
+    }
+
     // Step 1: Resolve item ID
     let item_id = match &target {
-        PlayTarget::NextUp => jf
-            .get_global_next_up()
-            .await?
-            .ok_or("No next-up item found")?,
         PlayTarget::RecentPinchflat => {
             let lib_id = ctx
                 .config
@@ -58,13 +60,11 @@ pub async fn play(ctx: &CommandContext, target_str: &str) -> std::result::Result
                 .ok_or("No unwatched Pinchflat videos found")?
         }
         PlayTarget::ItemId(id) => id.clone(),
+        PlayTarget::NextUp => unreachable!(),
     };
 
     // Step 2: Send IPC play-source hint (non-fatal)
-    let source = match &target {
-        PlayTarget::NextUp => "nextup",
-        _ => "strategy",
-    };
+    let source = "strategy";
     if let Err(e) = send_mpv_script_message_with_args("set-play-source", &[source]).await {
         eprintln!("media-control: IPC hint failed (non-fatal): {e}");
     }

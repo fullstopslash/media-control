@@ -95,6 +95,9 @@ enum Commands {
     /// Skip to previous item (no mark watched)
     SkipPrev,
 
+    /// Tag current item as "keep" (prevents auto-deletion)
+    Keep,
+
     /// Navigate chapters in mpv
     Chapter {
         /// Direction: next or prev
@@ -213,6 +216,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::SkipPrev => {
             commands::mark_watched::skip_prev(&ctx).await?;
+        }
+        Commands::Keep => {
+            commands::keep::keep(&ctx).await?;
         }
         Commands::Chapter { direction } => {
             let dir = match direction.as_str() {

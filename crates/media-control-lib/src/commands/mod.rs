@@ -24,6 +24,7 @@ pub mod chapter;
 pub mod close;
 pub mod focus;
 pub mod fullscreen;
+pub mod keep;
 pub mod mark_watched;
 pub mod move_window;
 pub mod pin;
