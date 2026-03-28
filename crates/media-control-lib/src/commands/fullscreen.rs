@@ -246,7 +246,7 @@ async fn exit_fullscreen(
         eprintln!("media-control: failed to clear suppression: {e}");
     }
     if let Err(e) = super::avoid::avoid(ctx).await {
-        eprintln!("media-control: failed to run avoid after fullscreen exit: {e}");
+        tracing::debug!("avoid after fullscreen exit failed (non-fatal): {e}");
     }
 
     Ok(())

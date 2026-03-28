@@ -145,17 +145,37 @@ impl HyprlandClient {
     /// 3. Read response (may be empty, "ok", or JSON)
     ///
     /// Times out after 2 seconds if Hyprland is unresponsive.
+    /// Retries once after 50ms on connection failure (covers transient
+    /// socket busy during compositor transitions like fullscreen toggle).
     pub async fn command(&self, cmd: &str) -> Result<String> {
         const TIMEOUT: Duration = Duration::from_secs(2);
 
-        tokio::time::timeout(TIMEOUT, self.command_inner(cmd))
+        let result = tokio::time::timeout(TIMEOUT, self.command_inner(cmd))
             .await
             .map_err(|_| {
                 HyprlandError::ConnectionFailed(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "Hyprland IPC timed out after 2s",
                 ))
-            })?
+            })?;
+
+        match result {
+            Ok(resp) => Ok(resp),
+            Err(HyprlandError::ConnectionFailed(_)) => {
+                // Retry once after brief pause — Hyprland socket can refuse
+                // connections during compositor transitions
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::timeout(TIMEOUT, self.command_inner(cmd))
+                    .await
+                    .map_err(|_| {
+                        HyprlandError::ConnectionFailed(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Hyprland IPC timed out after 2s (retry)",
+                        ))
+                    })?
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn command_inner(&self, cmd: &str) -> Result<String> {
