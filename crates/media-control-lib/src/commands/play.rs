@@ -5,7 +5,7 @@
 //! - `recent-pinchflat`: Most recent unwatched video from Pinchflat library
 //! - `<item-id>`: Direct Jellyfin item ID
 
-use super::{send_mpv_script_message, send_mpv_script_message_with_args, CommandContext};
+use super::{query_shim, send_mpv_script_message, send_mpv_script_message_with_args, CommandContext};
 use crate::jellyfin::JellyfinClient;
 
 /// What to play.
@@ -44,20 +44,40 @@ pub async fn play(ctx: &CommandContext, target_str: &str) -> std::result::Result
     // Step 1: Resolve item ID
     let item_id = match &target {
         PlayTarget::RecentPinchflat => {
-            let lib_id = ctx
-                .config
-                .play
-                .pinchflat_library_id
-                .as_ref()
-                .ok_or("No pinchflat_library_id in config.toml [play] section")?;
-            let items = jf
-                .get_unwatched_items(lib_id, "DateCreated", "Descending", None, 1)
-                .await?;
-            items
-                .into_iter()
-                .next()
-                .map(|item| item.id)
-                .ok_or("No unwatched Pinchflat videos found")?
+            // Try query socket first (sub-ms), fall back to Jellyfin HTTP API
+            let from_query = query_shim(&serde_json::json!({
+                "type": "items",
+                "item_type": "episode",
+                "filter": "unwatched",
+                "sort": "date_created_desc",
+                "store": "jellyfin",
+                "limit": 1,
+                "format": "json"
+            }))
+            .await
+            .and_then(|resp| serde_json::from_str::<Vec<serde_json::Value>>(&resp).ok())
+            .and_then(|items| items.into_iter().next())
+            .and_then(|item| item.get("id").and_then(|v| v.as_str()).map(String::from));
+
+            if let Some(id) = from_query {
+                id
+            } else {
+                // Fallback to HTTP API
+                let lib_id = ctx
+                    .config
+                    .play
+                    .pinchflat_library_id
+                    .as_ref()
+                    .ok_or("No pinchflat_library_id in config.toml [play] section")?;
+                let items = jf
+                    .get_unwatched_items(lib_id, "DateCreated", "Descending", None, 1)
+                    .await?;
+                items
+                    .into_iter()
+                    .next()
+                    .map(|item| item.id)
+                    .ok_or("No unwatched Pinchflat videos found")?
+            }
         }
         PlayTarget::ItemId(id) => id.clone(),
         PlayTarget::NextUp => unreachable!(),

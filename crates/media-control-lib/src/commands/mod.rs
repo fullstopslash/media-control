@@ -268,6 +268,45 @@ const SOCKET_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// Delay between retry attempts.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Shim query socket path for cached lookups.
+const SHIM_QUERY_SOCKET: &str = "/tmp/mpv-shim-query.sock";
+
+/// Query the shim's query socket with a JSON request.
+///
+/// Returns the raw response string, or None if the socket is unavailable.
+/// Single attempt, no retry — designed for fast cached lookups.
+pub async fn query_shim(request: &serde_json::Value) -> Option<String> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::path::Path;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::time::timeout;
+
+    let path = Path::new(SHIM_QUERY_SOCKET);
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {}
+        _ => return None,
+    }
+
+    let payload = request.to_string();
+    let result = timeout(SOCKET_CONNECT_TIMEOUT, async {
+        let mut stream = UnixStream::connect(path).await?;
+        stream.write_all(payload.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        stream.shutdown().await?;
+
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await?;
+        Ok::<_, std::io::Error>(buf)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(buf)) if !buf.is_empty() => Some(buf),
+        _ => None,
+    }
+}
+
 /// Get the ordered list of mpv IPC socket paths to try.
 fn mpv_socket_paths() -> Vec<String> {
     let mut paths = Vec::with_capacity(3);
