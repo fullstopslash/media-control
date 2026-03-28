@@ -20,8 +20,8 @@ implemented: true
 ## Acceptance Criteria
 
 - [ ] **Given** windows with focus_history_id [0, 2, -1], **When** find_media_windows sorts, **Then** order is [0, 2, -1] <!-- tw:ddcf42e7-d8a4-4bdb-a196-169e575101bc -->
-- [ ] **Given** all windows have focus_history_id -1, **When** find_media_windows sorts, **Then** they remain in stable order <!-- tw:0fb2704a-1ee7-4c64-b2ef-ca498e215045 -->
-- [ ] **Given** windows with focus_history_id [1, -1, 0], **When** find_media_windows sorts (same priority), **Then** order is [0, 1, -1] <!-- tw:32ff9950-ecfe-43e5-8c6c-0ced5ae3690d -->
+- [-] **Given** all windows have focus_history_id -1, **When** find_media_windows sorts, **Then** they remain in stable order <!-- tw:0fb2704a-1ee7-4c64-b2ef-ca498e215045 -->
+- [-] **Given** windows with focus_history_id [1, -1, 0], **When** find_media_windows sorts (same priority), **Then** order is [0, 1, -1] <!-- tw:32ff9950-ecfe-43e5-8c6c-0ced5ae3690d -->
 
 ## Technical Notes
 

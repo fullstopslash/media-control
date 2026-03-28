@@ -88,10 +88,10 @@ Add match arm: `Commands::Play { target } => commands::play::play(&ctx, &target)
 
 ### Acceptance Criteria
 
-- [ ] `media-control play next-up` resolves and plays first NextUp item <!-- tw:4f24f9d3-6927-44db-882e-868177984ad6 -->
-- [ ] `media-control play recent-pinchflat` resolves and plays most recent unwatched <!-- tw:d046547d-0297-4177-97fc-2cd499513d0e -->
-- [ ] `media-control play <item-id>` plays specific item directly <!-- tw:75da3f55-22b3-48d0-bd9e-3e40820848f6 -->
-- [ ] Playback resumes from last position (StartPositionTicks) <!-- tw:f57eb161-0987-4029-8f93-9691ecb8281f -->
-- [ ] IPC hint sent before PlayNow (non-fatal on failure) <!-- tw:2a6412b3-1533-4ae0-a5ba-0972e309d80d -->
-- [ ] Errors produce stderr + notify-send <!-- tw:b2f3a06a-f0e1-4688-8fc8-2d6521339475 -->
-- [ ] `cargo clippy` and `cargo test` pass <!-- tw:8e28d697-fff2-473d-ac85-2e4badbebba2 -->
+- [-] `media-control play next-up` resolves and plays first NextUp item <!-- tw:4f24f9d3-6927-44db-882e-868177984ad6 -->
+- [-] `media-control play recent-pinchflat` resolves and plays most recent unwatched <!-- tw:d046547d-0297-4177-97fc-2cd499513d0e -->
+- [-] `media-control play <item-id>` plays specific item directly <!-- tw:75da3f55-22b3-48d0-bd9e-3e40820848f6 -->
+- [-] Playback resumes from last position (StartPositionTicks) <!-- tw:f57eb161-0987-4029-8f93-9691ecb8281f -->
+- [-] IPC hint sent before PlayNow (non-fatal on failure) <!-- tw:2a6412b3-1533-4ae0-a5ba-0972e309d80d -->
+- [-] Errors produce stderr + notify-send <!-- tw:b2f3a06a-f0e1-4688-8fc8-2d6521339475 -->
+- [-] `cargo clippy` and `cargo test` pass <!-- tw:8e28d697-fff2-473d-ac85-2e4badbebba2 -->

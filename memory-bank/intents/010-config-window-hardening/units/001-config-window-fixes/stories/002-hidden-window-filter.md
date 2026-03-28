@@ -20,8 +20,8 @@ implemented: true
 ## Acceptance Criteria
 
 - [ ] **Given** a hidden mpv window (hidden=true), **When** find_media_window runs, **Then** it is not returned <!-- tw:df24d077-1d03-428d-939d-c10f2c3a92e1 -->
-- [ ] **Given** an unmapped mpv window (mapped=false), **When** find_media_window runs, **Then** it is not returned <!-- tw:d5acf1ce-9d86-42fd-9d49-0dc7f5502627 -->
-- [ ] **Given** only hidden/unmapped media windows, **When** find_media_window runs, **Then** it returns None <!-- tw:74246833-904b-4ff6-acbb-7ee556cdd69c -->
+- [-] **Given** an unmapped mpv window (mapped=false), **When** find_media_window runs, **Then** it is not returned <!-- tw:d5acf1ce-9d86-42fd-9d49-0dc7f5502627 -->
+- [-] **Given** only hidden/unmapped media windows, **When** find_media_window runs, **Then** it returns None <!-- tw:74246833-904b-4ff6-acbb-7ee556cdd69c -->
 
 ## Technical Notes
 

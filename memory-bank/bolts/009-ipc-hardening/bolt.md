@@ -60,9 +60,9 @@ Transform unreliable, silent-failure IPC into robust command delivery with sub-s
 
 ## Stages
 
-- [ ] **1. Plan**: Implementation plan → implementation-plan.md <!-- tw:96894118-0b7f-4f1a-bfbd-63364ff61ddd -->
-- [ ] **2. Implement**: Code changes → modified source files <!-- tw:e9b724b8-6533-44b5-afde-ef749de80611 -->
-- [ ] **3. Test**: Verification → test-walkthrough.md <!-- tw:0c0a2aa1-ca0b-40b7-9a3b-e2eadde93e25 -->
+- [-] **1. Plan**: Implementation plan → implementation-plan.md <!-- tw:96894118-0b7f-4f1a-bfbd-63364ff61ddd -->
+- [-] **2. Implement**: Code changes → modified source files <!-- tw:e9b724b8-6533-44b5-afde-ef749de80611 -->
+- [-] **3. Test**: Verification → test-walkthrough.md <!-- tw:0c0a2aa1-ca0b-40b7-9a3b-e2eadde93e25 -->
 
 ## Dependencies
 
@@ -74,11 +74,11 @@ Transform unreliable, silent-failure IPC into robust command delivery with sub-s
 
 ## Success Criteria
 
-- [ ] All 5 stories implemented <!-- tw:a3e1a33e-c985-4f92-90d3-55d390b722ee -->
-- [ ] All acceptance criteria met <!-- tw:03ed8527-c207-48a5-afd6-edf2e50fcdee -->
-- [ ] No silent IPC failures <!-- tw:12a5d095-7f74-4e8f-ab5b-ad1195c7374e -->
-- [ ] Happy path < 200ms, retry path < 800ms <!-- tw:067863d6-b17b-4a6b-831e-8c8ce13fa426 -->
-- [ ] Desktop notification on error <!-- tw:673fff98-8b5a-45ae-aa52-513ce41a7570 -->
+- [-] All 5 stories implemented <!-- tw:a3e1a33e-c985-4f92-90d3-55d390b722ee -->
+- [-] All acceptance criteria met <!-- tw:03ed8527-c207-48a5-afd6-edf2e50fcdee -->
+- [-] No silent IPC failures <!-- tw:12a5d095-7f74-4e8f-ab5b-ad1195c7374e -->
+- [-] Happy path < 200ms, retry path < 800ms <!-- tw:067863d6-b17b-4a6b-831e-8c8ce13fa426 -->
+- [-] Desktop notification on error <!-- tw:673fff98-8b5a-45ae-aa52-513ce41a7570 -->
 
 ## Notes
 

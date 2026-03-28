@@ -128,16 +128,16 @@ Harden the IPC command delivery path from media-control to mpv so that commands 
 ## Success Criteria
 
 ### Functional
-- [ ] Non-socket paths are skipped with warning <!-- tw:7e02af09-6ed8-42d7-8c18-63c57d019947 -->
-- [ ] Dead sockets timeout within 500ms <!-- tw:ebda85d1-47c3-4653-aeea-ac4b384ccaa5 -->
-- [ ] mpv IPC response is read and validated <!-- tw:f9dc0be1-ec45-4bf8-82f2-4f1e475760e1 -->
-- [ ] Commands during mpv respawn succeed on retry <!-- tw:5ee360b5-a371-478f-b547-fed6c33340e9 -->
-- [ ] All failures produce stderr output + desktop notification <!-- tw:0f7dfc73-8790-452e-9596-706677aa1dca -->
+- [-] Non-socket paths are skipped with warning <!-- tw:7e02af09-6ed8-42d7-8c18-63c57d019947 -->
+- [-] Dead sockets timeout within 500ms <!-- tw:ebda85d1-47c3-4653-aeea-ac4b384ccaa5 -->
+- [-] mpv IPC response is read and validated <!-- tw:f9dc0be1-ec45-4bf8-82f2-4f1e475760e1 -->
+- [-] Commands during mpv respawn succeed on retry <!-- tw:5ee360b5-a371-478f-b547-fed6c33340e9 -->
+- [-] All failures produce stderr output + desktop notification <!-- tw:0f7dfc73-8790-452e-9596-706677aa1dca -->
 
 ### Non-Functional
-- [ ] Happy path latency < 200ms <!-- tw:5d609b1c-6878-43bf-b728-e01bed27b87b -->
-- [ ] Worst case (retry) latency < 800ms <!-- tw:eb30c7b7-7912-408d-865d-648019b47aa8 -->
-- [ ] No silent failures <!-- tw:d88a2500-1b35-4bf4-b53f-1da808b41139 -->
+- [-] Happy path latency < 200ms <!-- tw:5d609b1c-6878-43bf-b728-e01bed27b87b -->
+- [-] Worst case (retry) latency < 800ms <!-- tw:eb30c7b7-7912-408d-865d-648019b47aa8 -->
+- [-] No silent failures <!-- tw:d88a2500-1b35-4bf4-b53f-1da808b41139 -->
 
 ---
 

@@ -52,9 +52,9 @@ Expose mpv playback state for status bar integration and scripting.
 
 ## Stages
 
-- [ ] **1. Plan**: Implementation plan → implementation-plan.md <!-- tw:25229798-e4b8-49bb-a5c7-f9d8f2aa9f17 -->
-- [ ] **2. Implement**: Code changes → modified source files <!-- tw:2f9350c9-2768-4ab7-a5cb-c92414ac44e9 -->
-- [ ] **3. Test**: Verification → test-walkthrough.md <!-- tw:c9a80424-753c-44aa-9430-2f66c4348d5f -->
+- [-] **1. Plan**: Implementation plan → implementation-plan.md <!-- tw:25229798-e4b8-49bb-a5c7-f9d8f2aa9f17 -->
+- [-] **2. Implement**: Code changes → modified source files <!-- tw:2f9350c9-2768-4ab7-a5cb-c92414ac44e9 -->
+- [-] **3. Test**: Verification → test-walkthrough.md <!-- tw:c9a80424-753c-44aa-9430-2f66c4348d5f -->
 
 ## Dependencies
 
@@ -66,8 +66,8 @@ Expose mpv playback state for status bar integration and scripting.
 
 ## Success Criteria
 
-- [ ] All 3 stories implemented <!-- tw:780459e4-4b6e-4631-927d-2bfca246b953 -->
-- [ ] `media-control status` shows playback state <!-- tw:c7b97cf6-9ca5-4383-84d4-f3413035cbf8 -->
-- [ ] `media-control status --json` emits valid JSON <!-- tw:d23a0ebc-1246-44d9-95ad-88d0668e6fb6 -->
-- [ ] Exit 0 when playing, exit 1 when not <!-- tw:31177b68-6865-4d63-9834-b8581e57d33d -->
-- [ ] `cargo clippy` and `cargo test` pass <!-- tw:73732ed5-91d8-47ea-be9f-51149b42a06e -->
+- [-] All 3 stories implemented <!-- tw:780459e4-4b6e-4631-927d-2bfca246b953 -->
+- [-] `media-control status` shows playback state <!-- tw:c7b97cf6-9ca5-4383-84d4-f3413035cbf8 -->
+- [-] `media-control status --json` emits valid JSON <!-- tw:d23a0ebc-1246-44d9-95ad-88d0668e6fb6 -->
+- [-] Exit 0 when playing, exit 1 when not <!-- tw:31177b68-6865-4d63-9834-b8581e57d33d -->
+- [-] `cargo clippy` and `cargo test` pass <!-- tw:73732ed5-91d8-47ea-be9f-51149b42a06e -->

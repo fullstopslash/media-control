@@ -3,7 +3,7 @@
 //! Provides chapter navigation commands (next/prev) for mpv playback
 //! using the shared mpv IPC infrastructure.
 
-use super::{get_media_window, send_mpv_ipc_command, CommandContext};
+use super::{require_mpv_window, send_mpv_ipc_command, CommandContext};
 use crate::error::Result;
 
 /// Direction for chapter navigation.
@@ -54,17 +54,9 @@ impl ChapterDirection {
 /// # }
 /// ```
 pub async fn chapter(ctx: &CommandContext, direction: ChapterDirection) -> Result<()> {
-    // Get media window, silently succeed if none found
-    let Some(window) = get_media_window(ctx).await? else {
-        return Ok(());
-    };
-
-    // Only operate on mpv windows
-    if window.class != "mpv" {
+    if require_mpv_window(ctx).await?.is_none() {
         return Ok(());
     }
-
-    // Build the mpv IPC command and send via shared hardened IPC
     let payload = format!(r#"{{"command":["add","chapter",{}]}}"#, direction.offset());
 
     send_mpv_ipc_command(&payload).await

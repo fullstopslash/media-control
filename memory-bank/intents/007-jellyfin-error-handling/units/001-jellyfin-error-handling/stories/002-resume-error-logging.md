@@ -19,9 +19,9 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** `get_item_resume_ticks` fails, **When** play command runs, **Then** error is logged to stderr <!-- tw:17fccac2-3090-49bf-b9fd-9836d84a678b -->
-- [ ] **Given** `get_item_resume_ticks` fails, **When** play command runs, **Then** playback still starts from position 0 <!-- tw:18b86219-2111-43ed-a27c-0a22951f820d -->
-- [ ] **Given** `get_item_resume_ticks` succeeds, **When** play command runs, **Then** behavior is unchanged <!-- tw:03ce634b-0ff0-48ed-b6b6-f4879759fe79 -->
+- [-] **Given** `get_item_resume_ticks` fails, **When** play command runs, **Then** error is logged to stderr <!-- tw:17fccac2-3090-49bf-b9fd-9836d84a678b -->
+- [-] **Given** `get_item_resume_ticks` fails, **When** play command runs, **Then** playback still starts from position 0 <!-- tw:18b86219-2111-43ed-a27c-0a22951f820d -->
+- [-] **Given** `get_item_resume_ticks` succeeds, **When** play command runs, **Then** behavior is unchanged <!-- tw:03ce634b-0ff0-48ed-b6b6-f4879759fe79 -->
 
 ## Technical Notes
 

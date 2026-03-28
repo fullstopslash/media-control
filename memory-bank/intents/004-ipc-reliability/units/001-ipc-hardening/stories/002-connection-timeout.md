@@ -19,9 +19,9 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** a valid socket path where mpv is dead, **When** connect is attempted, **Then** it times out within 500ms and tries the next path <!-- tw:eed61627-6f88-4064-bc2f-88390fd66c37 -->
-- [ ] **Given** a valid socket where mpv is alive, **When** connect + write succeeds, **Then** it completes well under 500ms <!-- tw:d04bc8fb-1df7-4a6c-8702-24ce15072885 -->
-- [ ] **Given** all socket paths timeout, **When** send_mpv_script_message finishes, **Then** it returns a timeout error <!-- tw:d5c24033-472a-4617-93ab-e04f0ea032bf -->
+- [-] **Given** a valid socket path where mpv is dead, **When** connect is attempted, **Then** it times out within 500ms and tries the next path <!-- tw:eed61627-6f88-4064-bc2f-88390fd66c37 -->
+- [-] **Given** a valid socket where mpv is alive, **When** connect + write succeeds, **Then** it completes well under 500ms <!-- tw:d04bc8fb-1df7-4a6c-8702-24ce15072885 -->
+- [-] **Given** all socket paths timeout, **When** send_mpv_script_message finishes, **Then** it returns a timeout error <!-- tw:d5c24033-472a-4617-93ab-e04f0ea032bf -->
 
 ## Technical Notes
 

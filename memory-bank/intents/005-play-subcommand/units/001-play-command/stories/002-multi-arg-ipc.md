@@ -19,8 +19,8 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** message "set-play-source" and args ["nextup"], **When** helper is called, **Then** it sends `{"command":["script-message","set-play-source","nextup"]}` <!-- tw:f74f6c38-20c9-44b2-b351-d2ccdefda0d8 -->
-- [ ] **Given** message "foo" and empty args, **When** helper is called, **Then** it behaves like `send_mpv_script_message("foo")` <!-- tw:87a29b92-8bba-4f1c-ac85-00930f990bcf -->
+- [-] **Given** message "set-play-source" and args ["nextup"], **When** helper is called, **Then** it sends `{"command":["script-message","set-play-source","nextup"]}` <!-- tw:f74f6c38-20c9-44b2-b351-d2ccdefda0d8 -->
+- [-] **Given** message "foo" and empty args, **When** helper is called, **Then** it behaves like `send_mpv_script_message("foo")` <!-- tw:87a29b92-8bba-4f1c-ac85-00930f990bcf -->
 
 ## Technical Notes
 

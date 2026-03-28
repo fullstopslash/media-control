@@ -20,8 +20,8 @@ implemented: true
 ## Acceptance Criteria
 
 - [ ] **Given** no config file exists and no --config flag, **When** media-control runs, **Then** it uses successfully <!-- tw:144fe534-0618-468e-ab47-7fe024eaf310 -->
-- [ ] **Given** a config file with parse errors, **When** media-control runs without --config, **Then** it falls back to defaults and logs a debug message <!-- tw:c5e43e72-2526-4144-ae5c-84e88a57147c -->
-- [ ] **Given** --config points to a missing file, **When** media-control runs, **Then** it returns an error (explicit path should not silently fall back) <!-- tw:525c10ab-6ca5-4c74-89f9-8da5fa5dd7af -->
+- [-] **Given** a config file with parse errors, **When** media-control runs without --config, **Then** it falls back to defaults and logs a debug message <!-- tw:c5e43e72-2526-4144-ae5c-84e88a57147c -->
+- [-] **Given** --config points to a missing file, **When** media-control runs, **Then** it returns an error (explicit path should not silently fall back) <!-- tw:525c10ab-6ca5-4c74-89f9-8da5fa5dd7af -->
 
 ## Technical Notes
 

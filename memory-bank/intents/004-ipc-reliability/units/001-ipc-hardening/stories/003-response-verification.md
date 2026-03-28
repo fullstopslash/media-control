@@ -19,9 +19,9 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** a successful write, **When** mpv responds with `{"error":"success"}`, **Then** the command is considered successful <!-- tw:df5d4de5-858f-438d-88b5-406fd1ffaa4c -->
-- [ ] **Given** a successful write, **When** mpv responds with an error, **Then** the error is logged and returned <!-- tw:eec5d7a0-b54a-49e7-b318-f70824c72b38 -->
-- [ ] **Given** a successful write, **When** no response arrives within 200ms, **Then** the command is considered successful with a warning (fire-and-forget fallback) <!-- tw:b4699e89-b842-4f79-b3ae-1775961b7b84 -->
+- [-] **Given** a successful write, **When** mpv responds with `{"error":"success"}`, **Then** the command is considered successful <!-- tw:df5d4de5-858f-438d-88b5-406fd1ffaa4c -->
+- [-] **Given** a successful write, **When** mpv responds with an error, **Then** the error is logged and returned <!-- tw:eec5d7a0-b54a-49e7-b318-f70824c72b38 -->
+- [-] **Given** a successful write, **When** no response arrives within 200ms, **Then** the command is considered successful with a warning (fire-and-forget fallback) <!-- tw:b4699e89-b842-4f79-b3ae-1775961b7b84 -->
 
 ## Technical Notes
 

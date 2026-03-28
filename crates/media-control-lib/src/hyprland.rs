@@ -198,12 +198,17 @@ impl HyprlandClient {
     /// # Ok(())
     /// # }
     /// ```
+    /// Check if a Hyprland IPC response indicates success.
+    #[inline]
+    fn is_success(response: &str) -> bool {
+        response.is_empty() || response.starts_with("ok")
+    }
+
     pub async fn dispatch(&self, action: &str) -> Result<()> {
         let cmd = format!("dispatch {action}");
         let response = self.command(&cmd).await?;
 
-        // Hyprland returns "ok" or empty string on success
-        if response.is_empty() || response == "ok" || response.starts_with("ok") {
+        if Self::is_success(&response) {
             Ok(())
         } else {
             Err(HyprlandError::CommandFailed(response))
@@ -236,7 +241,7 @@ impl HyprlandClient {
         let batch_cmd = format!("[[BATCH]]{}", commands.join("; "));
         let response = self.command(&batch_cmd).await?;
 
-        if response.is_empty() || response.starts_with("ok") {
+        if Self::is_success(&response) {
             Ok(())
         } else {
             Err(HyprlandError::CommandFailed(response))
@@ -315,7 +320,7 @@ impl HyprlandClient {
         let cmd = format!("keyword {key} {value}");
         let response = self.command(&cmd).await?;
 
-        if response.is_empty() || response.starts_with("ok") {
+        if Self::is_success(&response) {
             Ok(())
         } else {
             Err(HyprlandError::CommandFailed(response))

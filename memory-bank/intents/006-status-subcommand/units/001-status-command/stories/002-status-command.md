@@ -19,10 +19,10 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** mpv is playing, **When** `status` runs, **Then** it prints title, position, duration, pause state <!-- tw:a8a953c9-42c6-4884-a3e6-f85a0f9a6ec0 -->
-- [ ] **Given** mpv is playing, **When** `status --json` runs, **Then** it emits valid JSON with all fields <!-- tw:93f6959f-4340-43dd-aea8-ff44acaff65b -->
-- [ ] **Given** no mpv socket, **When** `status` runs, **Then** it exits with code 1 <!-- tw:69dfdebc-45d5-410f-9751-42669f8dcb76 -->
-- [ ] **Given** `--json` and not playing, **When** `status --json` runs, **Then** it emits `{"playing":false}` <!-- tw:3662de61-6062-442c-aef5-f523827c8751 -->
+- [-] **Given** mpv is playing, **When** `status` runs, **Then** it prints title, position, duration, pause state <!-- tw:a8a953c9-42c6-4884-a3e6-f85a0f9a6ec0 -->
+- [-] **Given** mpv is playing, **When** `status --json` runs, **Then** it emits valid JSON with all fields <!-- tw:93f6959f-4340-43dd-aea8-ff44acaff65b -->
+- [-] **Given** no mpv socket, **When** `status` runs, **Then** it exits with code 1 <!-- tw:69dfdebc-45d5-410f-9751-42669f8dcb76 -->
+- [-] **Given** `--json` and not playing, **When** `status --json` runs, **Then** it emits `{"playing":false}` <!-- tw:3662de61-6062-442c-aef5-f523827c8751 -->
 
 ## Technical Notes
 

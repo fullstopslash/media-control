@@ -68,12 +68,12 @@ Add SIGTERM handling to the daemon's foreground select! loop so that `cmd_stop` 
 ## Success Criteria
 
 ### Functional
-- [ ] `media-control-daemon stop` triggers clean shutdown <!-- tw:3602cd04-9a3d-487a-bb52-54bae8252c93 -->
-- [ ] PID file removed after SIGTERM <!-- tw:7c9b8594-8cdf-422d-b218-a45cc062abba -->
-- [ ] FIFO removed after SIGTERM <!-- tw:b240cc6d-4c23-47ec-977b-10fe09168241 -->
+- [-] `media-control-daemon stop` triggers clean shutdown <!-- tw:3602cd04-9a3d-487a-bb52-54bae8252c93 -->
+- [-] PID file removed after SIGTERM <!-- tw:7c9b8594-8cdf-422d-b218-a45cc062abba -->
+- [-] FIFO removed after SIGTERM <!-- tw:b240cc6d-4c23-47ec-977b-10fe09168241 -->
 
 ### Non-Functional
-- [ ] No new dependencies <!-- tw:e3fd571a-ca47-4556-a14c-94bf9ccc2391 -->
+- [-] No new dependencies <!-- tw:e3fd571a-ca47-4556-a14c-94bf9ccc2391 -->
 
 ---
 

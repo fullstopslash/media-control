@@ -19,9 +19,9 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** a GET request returns 401, **When** the response is processed, **Then** it returns a reqwest status error <!-- tw:7edd8323-bce6-4df9-9e46-11bcf817d84d -->
-- [ ] **Given** a GET request returns 200, **When** the response is processed, **Then** behavior is unchanged <!-- tw:06ce4293-30ab-4330-9fce-edb67119da99 -->
-- [ ] **Given** all 8 GET request sites in jellyfin.rs, **When** reviewed, **Then** all include `.error_for_status()?` <!-- tw:4f4d8256-e4e8-469d-8251-88b1178dbda7 -->
+- [-] **Given** a GET request returns 401, **When** the response is processed, **Then** it returns a reqwest status error <!-- tw:7edd8323-bce6-4df9-9e46-11bcf817d84d -->
+- [-] **Given** a GET request returns 200, **When** the response is processed, **Then** behavior is unchanged <!-- tw:06ce4293-30ab-4330-9fce-edb67119da99 -->
+- [-] **Given** all 8 GET request sites in jellyfin.rs, **When** reviewed, **Then** all include `.error_for_status()?` <!-- tw:4f4d8256-e4e8-469d-8251-88b1178dbda7 -->
 
 ## Technical Notes
 

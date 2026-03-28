@@ -19,10 +19,10 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** send_mpv_script_message returns an error, **When** the CLI handles it, **Then** a brief error is printed to stderr <!-- tw:bc01bfa4-dcad-417a-9a0b-1e437cf87cd0 -->
-- [ ] **Given** send_mpv_script_message returns an error, **When** the CLI handles it, **Then** the process exits with non-zero code <!-- tw:380f13f8-fbd4-484b-b14f-702013cbde35 -->
-- [ ] **Given** send_mpv_script_message returns an error, **When** notify-send is available, **Then** a desktop notification is shown with the error <!-- tw:c441dd52-7c39-4242-a0e0-5c6442144913 -->
-- [ ] **Given** notify-send is not available, **When** an error occurs, **Then** stderr output still works (graceful degradation) <!-- tw:2cf1e1bc-58da-4821-94c1-1ab1b735ba36 -->
+- [-] **Given** send_mpv_script_message returns an error, **When** the CLI handles it, **Then** a brief error is printed to stderr <!-- tw:bc01bfa4-dcad-417a-9a0b-1e437cf87cd0 -->
+- [-] **Given** send_mpv_script_message returns an error, **When** the CLI handles it, **Then** the process exits with non-zero code <!-- tw:380f13f8-fbd4-484b-b14f-702013cbde35 -->
+- [-] **Given** send_mpv_script_message returns an error, **When** notify-send is available, **Then** a desktop notification is shown with the error <!-- tw:c441dd52-7c39-4242-a0e0-5c6442144913 -->
+- [-] **Given** notify-send is not available, **When** an error occurs, **Then** stderr output still works (graceful degradation) <!-- tw:2cf1e1bc-58da-4821-94c1-1ab1b735ba36 -->
 
 ## Technical Notes
 

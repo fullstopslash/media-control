@@ -6,7 +6,6 @@ project: media-control
 
 ## Pending <!-- the-desk:filter project:media-control status:pending -->
 
-- [ ] Port next-episode strategy system to jellyfin-mpv-shim fork (Python) <!-- tw:61ed88c8-9cc9-484c-83c2-3871dd7eb35d -->
   - **What**: The media-control Rust codebase has a per-library configurable "next episode" system in `commands/mark_watched.rs` and `config.rs` (`NextEpisodeConfig`, `NextEpisodeStrategy`, `NextEpisodeRule`). This should be ported to the jellyfin-mpv-shim Python fork so the shim handles episode advancement natively instead of relying on external session API commands.
   - **Strategies to port**:
     - `next-up`: Jellyfin's NextUp API (next unwatched in series)
@@ -27,7 +26,6 @@ project: media-control
   - **Advantage of porting to shim**: The shim already knows which library it's playing from internally — no Ancestors API or path matching needed. Strategy logic and config format can carry over directly.
   - **Reference files**: `crates/media-control-lib/src/commands/mark_watched.rs`, `crates/media-control-lib/src/config.rs` (search for `NextEpisode`), `crates/media-control-lib/src/jellyfin.rs` (search for `get_unwatched_items`, `get_collection_items`, `get_item_library`), `~/.config/media-control/config.toml` (live config with all rules)
 
-- [ ] **BLOCKED** mark-watched-and-next flakiness: shim takes seconds to process play commands <!-- tw:eff222d5-0f7b-4833-8c65-3e43323ff84f -->
   - **Root cause**: `jellyfin-mpv-shim-fork` `player.py:578` — `_play_media` blocks on `wait_property(duration)` with a `@synchronous("_lock")` decorator. New play commands queue behind the lock instead of cancelling the current load.
   - **Symptom**: Pressing the keybinding multiple times marks the SAME item watched repeatedly because the session's `NowPlayingItem` is stale (shim hasn't finished loading the new video).
   - **Fix location**: `~/projects/jellyfin-mpv-shim-fork/jellyfin_mpv_shim/player.py` — the `_play_media` method needs to cancel in-progress loads when a new play command arrives.

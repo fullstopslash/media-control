@@ -102,12 +102,12 @@ Restructure main to capture the result from the command match, then handle error
 
 ### Acceptance Criteria
 
-- [ ] Regular files at socket paths are skipped with stderr warning <!-- tw:5a91390e-a86a-4f8d-b74b-f99ab2a4ce30 -->
-- [ ] Dead sockets timeout within 500ms per path <!-- tw:b215c65b-9fe0-4a51-b5a3-fbc3ba6e818c -->
-- [ ] mpv IPC JSON response is read (200ms timeout, warn-only on failure) <!-- tw:622a78a8-1469-4417-88d1-25f52d5ae0b2 -->
-- [ ] Failed first attempt retries after 100ms <!-- tw:247f931a-f1e3-4aab-9c3d-2dbb22bf9141 -->
-- [ ] All IPC errors propagated to main, printed to stderr, shown via notify-send <!-- tw:720fcc0d-6c50-4659-9922-186e7a2f7418 -->
-- [ ] `mark_watched_and_stop` no longer swallows errors with `let _ =` <!-- tw:88f3a096-b0ec-4f1d-8f60-64f1abeff49c -->
-- [ ] Exit code is non-zero on IPC failure <!-- tw:70b133bb-ae32-4128-90ae-169bd69dccef -->
-- [ ] Happy path completes in < 200ms (no new overhead on success) <!-- tw:e961d936-7cbf-4353-ad4e-4f67086d8b83 -->
-- [ ] `cargo clippy` and `cargo test` pass <!-- tw:85b35da5-feba-42a6-a170-0be2d309e00f -->
+- [-] Regular files at socket paths are skipped with stderr warning <!-- tw:5a91390e-a86a-4f8d-b74b-f99ab2a4ce30 -->
+- [-] Dead sockets timeout within 500ms per path <!-- tw:b215c65b-9fe0-4a51-b5a3-fbc3ba6e818c -->
+- [-] mpv IPC JSON response is read (200ms timeout, warn-only on failure) <!-- tw:622a78a8-1469-4417-88d1-25f52d5ae0b2 -->
+- [-] Failed first attempt retries after 100ms <!-- tw:247f931a-f1e3-4aab-9c3d-2dbb22bf9141 -->
+- [-] All IPC errors propagated to main, printed to stderr, shown via notify-send <!-- tw:720fcc0d-6c50-4659-9922-186e7a2f7418 -->
+- [-] `mark_watched_and_stop` no longer swallows errors with `let _ =` <!-- tw:88f3a096-b0ec-4f1d-8f60-64f1abeff49c -->
+- [-] Exit code is non-zero on IPC failure <!-- tw:70b133bb-ae32-4128-90ae-169bd69dccef -->
+- [-] Happy path completes in < 200ms (no new overhead on success) <!-- tw:e961d936-7cbf-4353-ad4e-4f67086d8b83 -->
+- [-] `cargo clippy` and `cargo test` pass <!-- tw:85b35da5-feba-42a6-a170-0be2d309e00f -->

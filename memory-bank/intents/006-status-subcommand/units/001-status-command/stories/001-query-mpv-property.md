@@ -19,9 +19,9 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** mpv is playing, **When** `query_mpv_property("media-title")` is called, **Then** it returns the title as <!-- tw:29815a6a-45dd-4b22-82d1-184707b15fdd -->
-- [ ] **Given** mpv socket doesn't exist, **When** query is attempted, **Then** it returns an error <!-- tw:c60596c2-5abc-4b80-a94e-3de17a660e27 -->
-- [ ] **Given** mpv returns `{"error":"success","data":"Some Title"}`, **When** parsed, **Then** it extracts the `data` field <!-- tw:f26614ca-a571-434f-b346-1281ca957d92 -->
+- [-] **Given** mpv is playing, **When** `query_mpv_property("media-title")` is called, **Then** it returns the title as <!-- tw:29815a6a-45dd-4b22-82d1-184707b15fdd -->
+- [-] **Given** mpv socket doesn't exist, **When** query is attempted, **Then** it returns an error <!-- tw:c60596c2-5abc-4b80-a94e-3de17a660e27 -->
+- [-] **Given** mpv returns `{"error":"success","data":"Some Title"}`, **When** parsed, **Then** it extracts the `data` field <!-- tw:f26614ca-a571-434f-b346-1281ca957d92 -->
 
 ## Technical Notes
 

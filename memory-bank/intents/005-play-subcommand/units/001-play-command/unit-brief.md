@@ -119,16 +119,16 @@ Implement the `media-control play` subcommand that resolves a playback target, s
 ## Success Criteria
 
 ### Functional
-- [ ] `media-control play next-up` plays first NextUp item <!-- tw:df0604b7-3b37-4290-86b3-dfa2e96c228f -->
-- [ ] `media-control play recent-pinchflat` plays most recent unwatched Pinchflat video <!-- tw:47d4896e-2db2-41af-b72f-89404ac1ce4d -->
-- [ ] `media-control play <item-id>` plays specific item <!-- tw:6c324fcb-a114-4887-9ed2-aa6cd33c8d32 -->
-- [ ] Playback resumes from last position <!-- tw:d1bf8c72-c90a-4c0b-aecd-06608e3c0ed8 -->
-- [ ] IPC hint arrives before PlayNow <!-- tw:479a35c0-d68f-4c2d-a8e1-0c4a54588950 -->
-- [ ] Errors show stderr + notify-send <!-- tw:214f2952-466e-406a-ac94-21ab5de54140 -->
+- [-] `media-control play next-up` plays first NextUp item <!-- tw:df0604b7-3b37-4290-86b3-dfa2e96c228f -->
+- [-] `media-control play recent-pinchflat` plays most recent unwatched Pinchflat video <!-- tw:47d4896e-2db2-41af-b72f-89404ac1ce4d -->
+- [-] `media-control play <item-id>` plays specific item <!-- tw:6c324fcb-a114-4887-9ed2-aa6cd33c8d32 -->
+- [-] Playback resumes from last position <!-- tw:d1bf8c72-c90a-4c0b-aecd-06608e3c0ed8 -->
+- [-] IPC hint arrives before PlayNow <!-- tw:479a35c0-d68f-4c2d-a8e1-0c4a54588950 -->
+- [-] Errors show stderr + notify-send <!-- tw:214f2952-466e-406a-ac94-21ab5de54140 -->
 
 ### Non-Functional
-- [ ] Total latency < 200ms <!-- tw:d593b7e8-5d1d-4ec1-847c-8d60e0eba9ab -->
-- [ ] 3 HTTP requests per invocation (down from 6) <!-- tw:e6acf38f-b827-46d7-ab1f-c53ec0115eab -->
+- [-] Total latency < 200ms <!-- tw:d593b7e8-5d1d-4ec1-847c-8d60e0eba9ab -->
+- [-] 3 HTTP requests per invocation (down from 6) <!-- tw:e6acf38f-b827-46d7-ab1f-c53ec0115eab -->
 
 ---
 

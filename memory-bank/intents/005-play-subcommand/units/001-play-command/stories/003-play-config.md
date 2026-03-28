@@ -19,9 +19,9 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** config.toml has `[play]` with `pinchflat_library_id`, **When** config loads, **Then** `config.play.pinchflat_library_id` is Some(id) <!-- tw:1dd32b13-eff5-426a-9c97-b76cd7d1e3fd -->
-- [ ] **Given** config.toml has no `[play]` section, **When** config loads, **Then** `config.play` defaults (no error) <!-- tw:c51138dc-d643-4145-94e7-3f2de8a2e084 -->
-- [ ] **Given** no pinchflat_library_id and `recent-pinchflat` target, **When** play runs, **Then** it errors "No pinchflat_library_id in config" <!-- tw:6d473762-2758-48ae-97d1-dcb6385a8b98 -->
+- [-] **Given** config.toml has `[play]` with `pinchflat_library_id`, **When** config loads, **Then** `config.play.pinchflat_library_id` is Some(id) <!-- tw:1dd32b13-eff5-426a-9c97-b76cd7d1e3fd -->
+- [-] **Given** config.toml has no `[play]` section, **When** config loads, **Then** `config.play` defaults (no error) <!-- tw:c51138dc-d643-4145-94e7-3f2de8a2e084 -->
+- [-] **Given** no pinchflat_library_id and `recent-pinchflat` target, **When** play runs, **Then** it errors "No pinchflat_library_id in config" <!-- tw:6d473762-2758-48ae-97d1-dcb6385a8b98 -->
 
 ## Technical Notes
 

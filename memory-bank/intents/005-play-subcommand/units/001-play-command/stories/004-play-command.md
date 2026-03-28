@@ -19,11 +19,11 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** target "next-up", **When** play runs, **Then** it queries NextUp, sends IPC hint "nextup", gets resume ticks, and sends PlayNow <!-- tw:297ac190-a49d-4a23-b866-c366f6950574 -->
-- [ ] **Given** target "recent-pinchflat", **When** play runs, **Then** it queries unwatched items, sends IPC hint "strategy", gets resume ticks, and sends PlayNow <!-- tw:3867e6b5-ac5b-421c-b840-3a420deb922c -->
-- [ ] **Given** target is a hex item ID, **When** play runs, **Then** it skips resolution, sends IPC hint "strategy", gets resume ticks, and sends PlayNow <!-- tw:4cf51695-5632-466f-a5ce-3e92251cdfc1 -->
-- [ ] **Given** IPC hint fails, **When** play runs, **Then** it warns but continues to PlayNow <!-- tw:85ce744a-7be1-4597-ac39-0d151190dffe -->
-- [ ] **Given** no shim session, **When** play runs, **Then** it errors "Shim not connected" <!-- tw:b473ae8c-98c4-40ac-9d98-fe71eba2a7fc -->
+- [-] **Given** target "next-up", **When** play runs, **Then** it queries NextUp, sends IPC hint "nextup", gets resume ticks, and sends PlayNow <!-- tw:297ac190-a49d-4a23-b866-c366f6950574 -->
+- [-] **Given** target "recent-pinchflat", **When** play runs, **Then** it queries unwatched items, sends IPC hint "strategy", gets resume ticks, and sends PlayNow <!-- tw:3867e6b5-ac5b-421c-b840-3a420deb922c -->
+- [-] **Given** target is a hex item ID, **When** play runs, **Then** it skips resolution, sends IPC hint "strategy", gets resume ticks, and sends PlayNow <!-- tw:4cf51695-5632-466f-a5ce-3e92251cdfc1 -->
+- [-] **Given** IPC hint fails, **When** play runs, **Then** it warns but continues to PlayNow <!-- tw:85ce744a-7be1-4597-ac39-0d151190dffe -->
+- [-] **Given** no shim session, **When** play runs, **Then** it errors "Shim not connected" <!-- tw:b473ae8c-98c4-40ac-9d98-fe71eba2a7fc -->
 
 ## Technical Notes
 

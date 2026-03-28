@@ -68,9 +68,9 @@ Harden Jellyfin HTTP client by surfacing HTTP error status codes and logging res
 ## Success Criteria
 
 ### Functional
-- [ ] All 8 GET requests include `.error_for_status()?` <!-- tw:423fd6b0-5673-403b-be73-72d4f62352a7 -->
-- [ ] Resume position errors logged to stderr <!-- tw:379999ad-88e9-473d-86bc-d2cd9a818c1d -->
-- [ ] `cargo check`, `cargo clippy`, and `cargo test` pass <!-- tw:a354cb98-eeb2-4fff-b1b5-b8050bcee676 -->
+- [-] All 8 GET requests include `.error_for_status()?` <!-- tw:423fd6b0-5673-403b-be73-72d4f62352a7 -->
+- [-] Resume position errors logged to stderr <!-- tw:379999ad-88e9-473d-86bc-d2cd9a818c1d -->
+- [-] `cargo check`, `cargo clippy`, and `cargo test` pass <!-- tw:a354cb98-eeb2-4fff-b1b5-b8050bcee676 -->
 
 ---
 

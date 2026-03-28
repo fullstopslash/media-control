@@ -71,8 +71,8 @@ Commands::Status { json } => {
 
 ### Acceptance Criteria
 
-- [ ] `media-control status` shows human-readable playback state <!-- tw:5a1a3c5f-1516-4a7d-b2c1-de34515cc734 -->
-- [ ] `media-control status --json` emits valid JSON <!-- tw:0c3b0948-c0eb-437e-bedc-1f1fd83f3e0d -->
-- [ ] Exit 0 when playing, exit 1 when not playing <!-- tw:94cea613-00c1-4b9e-b233-347faaefc0c0 -->
-- [ ] Response time < 50ms on local socket <!-- tw:cbd14950-c005-455d-83dd-94eb34bfb2e9 -->
-- [ ] `cargo clippy` and `cargo test` pass <!-- tw:8afeca2a-f1ce-41a9-98d2-b1332b9000d2 -->
+- [-] `media-control status` shows human-readable playback state <!-- tw:5a1a3c5f-1516-4a7d-b2c1-de34515cc734 -->
+- [-] `media-control status --json` emits valid JSON <!-- tw:0c3b0948-c0eb-437e-bedc-1f1fd83f3e0d -->
+- [-] Exit 0 when playing, exit 1 when not playing <!-- tw:94cea613-00c1-4b9e-b233-347faaefc0c0 -->
+- [-] Response time < 50ms on local socket <!-- tw:cbd14950-c005-455d-83dd-94eb34bfb2e9 -->
+- [-] `cargo clippy` and `cargo test` pass <!-- tw:8afeca2a-f1ce-41a9-98d2-b1332b9000d2 -->

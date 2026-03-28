@@ -6,9 +6,8 @@
 use tokio::process::Command;
 
 use super::fullscreen::is_pip_title;
-use super::{send_mpv_script_message, CommandContext};
+use super::{find_focused_address, send_mpv_script_message, CommandContext};
 use crate::error::Result;
-use crate::hyprland::Client;
 
 /// Close the media window gracefully with app-specific handling.
 ///
@@ -36,16 +35,13 @@ use crate::hyprland::Client;
 pub async fn close(ctx: &CommandContext) -> Result<()> {
     let clients = ctx.hyprland.get_clients().await?;
 
-    let focus_addr = clients
-        .iter()
-        .find(|c| c.focus_history_id == 0)
-        .map(|c| c.address.as_str());
+    let focus_addr = find_focused_address(&clients);
 
     let Some(window) = ctx.window_matcher.find_media_window(&clients, focus_addr) else {
         return Ok(());
     };
 
-    close_window_gracefully(ctx, &window.address, &window.class, &window.title, window.pid, &clients).await
+    close_window_gracefully(ctx, &window.address, &window.class, &window.title, window.pid).await
 }
 
 /// Close a specific window gracefully based on its class and title.
@@ -68,7 +64,6 @@ async fn close_window_gracefully(
     class: &str,
     title: &str,
     pid: i32,
-    clients: &[Client],
 ) -> Result<()> {
     // MPV: check if this is the shim's mpv instance.
     // Shim mpv is started with --input-ipc-server=/tmp/mpvctl-jshim.
@@ -89,7 +84,7 @@ async fn close_window_gracefully(
     // When PiP closes, Firefox activates the source tab. We then focus
     // the main Firefox window and send Ctrl+W to close that tab.
     if class == "firefox" && is_pip_title(title) {
-        return close_firefox_pip(ctx, addr, clients).await;
+        return close_firefox_pip(ctx, addr).await;
     }
 
     // All other windows (Jellyfin, default): use closewindow.
@@ -111,7 +106,7 @@ async fn close_window_gracefully(
 /// We can't reliably close the source tab because we don't know which tab
 /// owns the PiP, and Firefox's internal tab activation after PiP close
 /// is not deterministic enough to target with Ctrl+W.
-async fn close_firefox_pip(ctx: &CommandContext, pip_addr: &str, _clients: &[Client]) -> Result<()> {
+async fn close_firefox_pip(ctx: &CommandContext, pip_addr: &str) -> Result<()> {
     // Close the PiP window
     ctx.hyprland
         .dispatch(&format!("closewindow address:{pip_addr}"))

@@ -19,9 +19,9 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** `media-control status`, **When** invoked, **Then** routes to status command with json=false <!-- tw:85a7615b-d98a-4264-aadb-ef5669009663 -->
-- [ ] **Given** `media-control status --json`, **When** invoked, **Then** routes with json=true <!-- tw:6a6dbe6b-d251-4ae2-85c2-dc9cc1ea755b -->
-- [ ] **Given** `media-control --help`, **When** invoked, **Then** shows Status subcommand <!-- tw:892f044e-9e6c-4a81-a289-9da9a15215cb -->
+- [-] **Given** `media-control status`, **When** invoked, **Then** routes to status command with json=false <!-- tw:85a7615b-d98a-4264-aadb-ef5669009663 -->
+- [-] **Given** `media-control status --json`, **When** invoked, **Then** routes with json=true <!-- tw:6a6dbe6b-d251-4ae2-85c2-dc9cc1ea755b -->
+- [-] **Given** `media-control --help`, **When** invoked, **Then** shows Status subcommand <!-- tw:892f044e-9e6c-4a81-a289-9da9a15215cb -->
 
 ## Technical Notes
 

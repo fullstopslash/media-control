@@ -42,9 +42,9 @@ Enable `media-control-daemon stop` to trigger a clean daemon shutdown with prope
 
 ## Stages
 
-- [ ] **1. Plan**: Implementation plan <!-- tw:8987b552-46a2-43f2-ade2-d1c94797bc90 -->
-- [ ] **2. Implement**: Code changes <!-- tw:e78ff2a2-96f0-48b7-8f4d-1a70244819f9 -->
-- [ ] **3. Test**: Verification <!-- tw:d7f2f37e-300a-41a3-a0d4-8831aabb888a -->
+- [-] **1. Plan**: Implementation plan <!-- tw:8987b552-46a2-43f2-ade2-d1c94797bc90 -->
+- [-] **2. Implement**: Code changes <!-- tw:e78ff2a2-96f0-48b7-8f4d-1a70244819f9 -->
+- [-] **3. Test**: Verification <!-- tw:d7f2f37e-300a-41a3-a0d4-8831aabb888a -->
 
 ## Dependencies
 
@@ -56,7 +56,7 @@ Enable `media-control-daemon stop` to trigger a clean daemon shutdown with prope
 
 ## Success Criteria
 
-- [ ] SIGTERM branch added to foreground select! <!-- tw:60eb48c5-c318-4858-9c4e-7df1259439a4 -->
-- [ ] `cargo check` passes <!-- tw:e25d122d-9670-4805-8cb0-887ff821cab5 -->
-- [ ] `cargo clippy` passes <!-- tw:b52024de-ea03-44af-bed0-c89c5f239417 -->
-- [ ] `cargo test` passes <!-- tw:ab3f3b73-1d56-4b27-bdb9-814d80cf7af8 -->
+- [-] SIGTERM branch added to foreground select! <!-- tw:60eb48c5-c318-4858-9c4e-7df1259439a4 -->
+- [-] `cargo check` passes <!-- tw:e25d122d-9670-4805-8cb0-887ff821cab5 -->
+- [-] `cargo clippy` passes <!-- tw:b52024de-ea03-44af-bed0-c89c5f239417 -->
+- [-] `cargo test` passes <!-- tw:ab3f3b73-1d56-4b27-bdb9-814d80cf7af8 -->

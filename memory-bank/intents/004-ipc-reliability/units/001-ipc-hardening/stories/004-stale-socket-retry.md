@@ -19,10 +19,10 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** all socket paths fail on first attempt, **When** retry is triggered, **Then** it waits 100ms and tries all paths again <!-- tw:cf75b7f4-9b0a-4a07-9af5-5d80310c09b0 -->
-- [ ] **Given** mpv respawns within the retry window, **When** the retry attempt runs, **Then** the command succeeds <!-- tw:4fdcd57e-4827-41a3-9a31-e679032bcf20 -->
-- [ ] **Given** all paths fail on both attempts, **When** retry is exhausted, **Then** it returns an error (no infinite loop) <!-- tw:ed0995f8-f606-400f-a256-d22823ee93e9 -->
-- [ ] **Given** the first path succeeds, **When** send_mpv_script_message runs, **Then** no retry is attempted (happy path unchanged) <!-- tw:02a36da3-6f33-44a1-b3d6-2a6545761de8 -->
+- [-] **Given** all socket paths fail on first attempt, **When** retry is triggered, **Then** it waits 100ms and tries all paths again <!-- tw:cf75b7f4-9b0a-4a07-9af5-5d80310c09b0 -->
+- [-] **Given** mpv respawns within the retry window, **When** the retry attempt runs, **Then** the command succeeds <!-- tw:4fdcd57e-4827-41a3-9a31-e679032bcf20 -->
+- [-] **Given** all paths fail on both attempts, **When** retry is exhausted, **Then** it returns an error (no infinite loop) <!-- tw:ed0995f8-f606-400f-a256-d22823ee93e9 -->
+- [-] **Given** the first path succeeds, **When** send_mpv_script_message runs, **Then** no retry is attempted (happy path unchanged) <!-- tw:02a36da3-6f33-44a1-b3d6-2a6545761de8 -->
 
 ## Technical Notes
 

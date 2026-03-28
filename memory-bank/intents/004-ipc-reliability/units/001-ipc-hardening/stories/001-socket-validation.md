@@ -19,10 +19,10 @@ implemented: true
 
 ## Acceptance Criteria
 
-- [ ] **Given** a socket path that is a regular file, **When** send_mpv_script_message tries it, **Then** it is skipped immediately and a warning is logged to stderr <!-- tw:625c66d7-e6a9-4d05-8f91-a6726390aa67 -->
-- [ ] **Given** a socket path that is a Unix socket, **When** send_mpv_script_message tries it, **Then** it proceeds to connect <!-- tw:ddbeae64-31be-492b-843b-af2d45c8dcb3 -->
-- [ ] **Given** a socket path that doesn't exist, **When** send_mpv_script_message tries it, **Then** it is skipped and the next path is tried <!-- tw:046ed077-0105-4db9-aa21-3079df118d69 -->
-- [ ] **Given** all socket paths are invalid, **When** send_mpv_script_message runs, **Then** it returns an error (not a hang) <!-- tw:955fac20-fce7-497b-8395-db4c55e4dc5a -->
+- [-] **Given** a socket path that is a regular file, **When** send_mpv_script_message tries it, **Then** it is skipped immediately and a warning is logged to stderr <!-- tw:625c66d7-e6a9-4d05-8f91-a6726390aa67 -->
+- [-] **Given** a socket path that is a Unix socket, **When** send_mpv_script_message tries it, **Then** it proceeds to connect <!-- tw:ddbeae64-31be-492b-843b-af2d45c8dcb3 -->
+- [-] **Given** a socket path that doesn't exist, **When** send_mpv_script_message tries it, **Then** it is skipped and the next path is tried <!-- tw:046ed077-0105-4db9-aa21-3079df118d69 -->
+- [-] **Given** all socket paths are invalid, **When** send_mpv_script_message runs, **Then** it returns an error (not a hang) <!-- tw:955fac20-fce7-497b-8395-db4c55e4dc5a -->
 
 ## Technical Notes
 

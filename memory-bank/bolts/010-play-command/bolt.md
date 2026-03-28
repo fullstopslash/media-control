@@ -57,9 +57,9 @@ Replace shim-play.sh with a native Rust subcommand that resolves playback target
 
 ## Stages
 
-- [ ] **1. Plan**: Implementation plan → implementation-plan.md <!-- tw:4a12b4bd-2f9a-4ae3-9921-f2d1b1d0e2ba -->
-- [ ] **2. Implement**: Code changes → modified source files <!-- tw:ec0f7d98-9704-469c-ad0f-34063b37bdbf -->
-- [ ] **3. Test**: Verification → test-walkthrough.md <!-- tw:e6d8a922-2799-40c9-b5a2-6947d53ce255 -->
+- [-] **1. Plan**: Implementation plan → implementation-plan.md <!-- tw:4a12b4bd-2f9a-4ae3-9921-f2d1b1d0e2ba -->
+- [-] **2. Implement**: Code changes → modified source files <!-- tw:ec0f7d98-9704-469c-ad0f-34063b37bdbf -->
+- [-] **3. Test**: Verification → test-walkthrough.md <!-- tw:e6d8a922-2799-40c9-b5a2-6947d53ce255 -->
 
 ## Dependencies
 
@@ -71,12 +71,12 @@ Replace shim-play.sh with a native Rust subcommand that resolves playback target
 
 ## Success Criteria
 
-- [ ] All 5 stories implemented <!-- tw:692d7eab-91af-4abe-8bcb-0fd1ae7c6ca6 -->
-- [ ] All acceptance criteria met <!-- tw:b625bd26-0cef-4698-882c-dfa17f5e5af4 -->
-- [ ] `media-control play next-up` works end-to-end <!-- tw:1aa92715-fa18-42ff-9e3d-9f8b94b21083 -->
-- [ ] `media-control play recent-pinchflat` works end-to-end <!-- tw:94e6b303-1ac5-45a0-90a9-01e7149538cb -->
-- [ ] Total latency < 200ms <!-- tw:2cb69c52-54ce-4c66-801a-1189122a197c -->
-- [ ] `cargo clippy` and `cargo test` pass <!-- tw:f574b238-6544-4c82-890d-1b61fa9b7ccc -->
+- [-] All 5 stories implemented <!-- tw:692d7eab-91af-4abe-8bcb-0fd1ae7c6ca6 -->
+- [-] All acceptance criteria met <!-- tw:b625bd26-0cef-4698-882c-dfa17f5e5af4 -->
+- [-] `media-control play next-up` works end-to-end <!-- tw:1aa92715-fa18-42ff-9e3d-9f8b94b21083 -->
+- [-] `media-control play recent-pinchflat` works end-to-end <!-- tw:94e6b303-1ac5-45a0-90a9-01e7149538cb -->
+- [-] Total latency < 200ms <!-- tw:2cb69c52-54ce-4c66-801a-1189122a197c -->
+- [-] `cargo clippy` and `cargo test` pass <!-- tw:f574b238-6544-4c82-890d-1b61fa9b7ccc -->
 
 ## Notes
 

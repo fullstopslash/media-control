@@ -123,11 +123,20 @@ impl CommandContext {
 /// The focused window is the one with `focusHistoryID == 0` (most recently focused).
 /// This avoids race conditions by using the same client snapshot.
 #[inline]
-fn find_focused_address(clients: &[Client]) -> Option<&str> {
+pub(crate) fn find_focused_address(clients: &[Client]) -> Option<&str> {
     clients
         .iter()
         .find(|c| c.focus_history_id == 0)
         .map(|c| c.address.as_str())
+}
+
+/// Get the current mpv media window, or None if no mpv window is found.
+///
+/// Combines the common `get_media_window` + `class == "mpv"` guard
+/// used across mark_watched, chapter, and keep commands.
+pub async fn require_mpv_window(ctx: &CommandContext) -> Result<Option<MediaWindow>> {
+    let window = get_media_window(ctx).await?;
+    Ok(window.filter(|w| w.class == "mpv"))
 }
 
 /// Get the current media window.
@@ -259,19 +268,98 @@ const SOCKET_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// Delay between retry attempts.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Get the ordered list of mpv IPC socket paths to try.
+fn mpv_socket_paths() -> Vec<String> {
+    let mut paths = Vec::with_capacity(3);
+    if let Ok(env_path) = env::var("MPV_IPC_SOCKET") {
+        paths.push(env_path);
+    }
+    paths.push(MPV_IPC_SOCKET_DEFAULT.to_string());
+    paths.push(MPV_IPC_SOCKET_FALLBACK.to_string());
+    paths
+}
+
+/// Low-level: connect to a single validated socket, send payload, optionally read response.
+///
+/// Returns the parsed JSON response if `read_response` is true, or `None` if fire-and-forget.
+/// Skips non-socket paths. Uses SOCKET_CONNECT_TIMEOUT for connect+write,
+/// SOCKET_RESPONSE_TIMEOUT for reading.
+async fn mpv_ipc_exchange(
+    socket_path: &str,
+    payload: &str,
+    read_response: bool,
+) -> std::result::Result<Option<serde_json::Value>, ()> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::path::Path;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    use tokio::time::timeout;
+
+    let path = Path::new(socket_path);
+
+    // Validate socket
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {}
+        Ok(_) => {
+            eprintln!("media-control: skipping {socket_path}: not a socket");
+            return Err(());
+        }
+        Err(_) => return Err(()),
+    }
+
+    // Connect + write with 500ms timeout
+    let stream_result = timeout(SOCKET_CONNECT_TIMEOUT, async {
+        let mut stream = UnixStream::connect(path).await?;
+        stream.write_all(payload.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        Ok::<_, std::io::Error>(stream)
+    })
+    .await;
+
+    let mut stream = match stream_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => return Err(()),
+        Err(_) => {
+            eprintln!("media-control: timeout connecting to {socket_path}");
+            return Err(());
+        }
+    };
+
+    if !read_response {
+        return Ok(None);
+    }
+
+    // Read response with 200ms timeout, skipping mpv event lines
+    let mut reader = BufReader::new(&mut stream);
+    let read_result = timeout(SOCKET_RESPONSE_TIMEOUT, async {
+        loop {
+            let mut buf = String::new();
+            reader.read_line(&mut buf).await?;
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
+                // Skip unsolicited event messages
+                if val.get("event").is_some() && val.get("error").is_none() {
+                    continue;
+                }
+                return Ok::<_, std::io::Error>(val);
+            }
+            // Unparseable line — skip
+        }
+    })
+    .await;
+
+    match read_result {
+        Ok(Ok(val)) => Ok(Some(val)),
+        _ => Ok(None), // read failed or timed out — command was sent
+    }
+}
+
 /// Send a script-message to mpv via IPC socket.
 ///
 /// Routes to handlers registered by jellyfin-mpv-shim. Tries multiple
 /// socket paths in order: `$MPV_IPC_SOCKET`, `/tmp/mpvctl-jshim`, `/tmp/mpvctl0`.
-///
-/// Features:
-/// - Validates socket paths before connecting (skips non-sockets)
-/// - 500ms timeout on connect+write per socket path
-/// - Reads and verifies mpv IPC response (200ms timeout, warn-only)
-/// - Retries once after 100ms if all paths fail (covers mpv respawn window)
+/// Retries once after 100ms if all paths fail (covers mpv respawn window).
 pub async fn send_mpv_script_message(message: &str) -> Result<()> {
-    let payload = format!(r#"{{"command":["script-message","{message}"]}}"#);
-    send_mpv_ipc_command(&payload).await
+    send_mpv_script_message_with_args(message, &[]).await
 }
 
 /// Send a multi-argument script-message to mpv via IPC socket.
@@ -301,53 +389,16 @@ pub async fn send_mpv_script_message_with_args(message: &str, args: &[&str]) -> 
 /// # }
 /// ```
 pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
-    use std::os::unix::fs::FileTypeExt;
-    use std::path::Path;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-    use tokio::time::timeout;
-
     let payload = serde_json::json!({"command": ["get_property", property]}).to_string();
 
-    let env_socket = env::var("MPV_IPC_SOCKET").ok();
-    let sockets = [
-        env_socket.as_deref(),
-        Some(MPV_IPC_SOCKET_DEFAULT),
-        Some(MPV_IPC_SOCKET_FALLBACK),
-    ];
-
-    for socket_path in sockets.iter().copied().flatten() {
-        let path = Path::new(socket_path);
-
-        match std::fs::metadata(path) {
-            Ok(meta) if meta.file_type().is_socket() => {}
-            _ => continue,
-        }
-
-        let stream_result = timeout(SOCKET_RESPONSE_TIMEOUT, async {
-            let mut stream = UnixStream::connect(path).await?;
-            stream.write_all(payload.as_bytes()).await?;
-            stream.write_all(b"\n").await?;
-
-            let mut buf = String::new();
-            let mut reader = BufReader::new(&mut stream);
-            reader.read_line(&mut buf).await?;
-            Ok::<_, std::io::Error>(buf)
-        })
-        .await;
-
-        match stream_result {
-            Ok(Ok(buf)) => {
-                let resp: serde_json::Value = serde_json::from_str(&buf)
-                    .map_err(|_| crate::error::MediaControlError::mpv_connection_failed("invalid JSON response"))?;
-                if resp.get("error").and_then(|e| e.as_str()) == Some("success") {
-                    return Ok(resp.get("data").cloned().unwrap_or(serde_json::Value::Null));
-                }
-                return Err(crate::error::MediaControlError::mpv_connection_failed(
-                    format!("mpv error: {}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("unknown")),
-                ));
+    for socket_path in &mpv_socket_paths() {
+        if let Ok(Some(resp)) = mpv_ipc_exchange(socket_path, &payload, true).await {
+            if resp.get("error").and_then(|e| e.as_str()) == Some("success") {
+                return Ok(resp.get("data").cloned().unwrap_or(serde_json::Value::Null));
             }
-            _ => continue,
+            return Err(crate::error::MediaControlError::mpv_connection_failed(
+                format!("mpv error: {}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("unknown")),
+            ));
         }
     }
 
@@ -356,90 +407,39 @@ pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
 
 /// Send a raw JSON command to mpv via IPC socket.
 ///
-/// This is the shared implementation for all mpv IPC communication.
-/// Both `send_mpv_script_message` and chapter navigation use this.
+/// Tries multiple socket paths with retry. Fire-and-forget: response is
+/// read for verification but errors are only logged, not propagated.
 pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
-    use std::path::Path;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-    use tokio::time::timeout;
-
-    let env_socket = env::var("MPV_IPC_SOCKET").ok();
-    let sockets = [
-        env_socket.as_deref(),
-        Some(MPV_IPC_SOCKET_DEFAULT),
-        Some(MPV_IPC_SOCKET_FALLBACK),
-    ];
+    let paths = mpv_socket_paths();
 
     for attempt in 0..2u8 {
         if attempt > 0 {
             tokio::time::sleep(RETRY_DELAY).await;
         }
 
-        for socket_path in sockets.iter().copied().flatten() {
-            let path = Path::new(socket_path);
-
-            // FR-1: Socket validation — stat before connect
-            match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if !meta.file_type().is_socket() {
-                        eprintln!(
-                            "media-control: skipping {socket_path}: not a socket"
-                        );
-                        continue;
+        for socket_path in &paths {
+            if let Ok(resp) = mpv_ipc_exchange(socket_path, payload, true).await {
+                // Log mpv errors but still return Ok — command was sent
+                if let Some(val) = resp {
+                    if let Some(err) = val.get("error").and_then(|e| e.as_str()) {
+                        if err != "success" {
+                            eprintln!("media-control: mpv returned error: {err}");
+                        }
                     }
                 }
-                Err(_) => continue, // doesn't exist, try next
+                return Ok(());
             }
-
-            // FR-2: Connection timeout — 500ms for connect+write
-            let stream_result = timeout(SOCKET_CONNECT_TIMEOUT, async {
-                let mut stream = UnixStream::connect(path).await?;
-                stream.write_all(payload.as_bytes()).await?;
-                stream.write_all(b"\n").await?;
-                Ok::<_, std::io::Error>(stream)
-            })
-            .await;
-
-            let mut stream = match stream_result {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(_)) => continue, // connect/write failed, try next
-                Err(_) => {
-                    eprintln!(
-                        "media-control: timeout connecting to {socket_path}"
-                    );
-                    continue;
-                }
-            };
-
-            // FR-4: Response verification — read response with 200ms timeout
-            let mut buf = String::new();
-            let mut reader = BufReader::new(&mut stream);
-            match timeout(SOCKET_RESPONSE_TIMEOUT, reader.read_line(&mut buf)).await {
-                Ok(Ok(_)) => {
-                    // Check for mpv error response
-                    if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&buf)
-                        && let Some(err) = resp.get("error").and_then(|e| e.as_str())
-                        && err != "success"
-                    {
-                        eprintln!("media-control: mpv returned error: {err}");
-                    }
-                }
-                Ok(Err(e)) => {
-                    eprintln!("media-control: failed to read mpv response: {e}");
-                }
-                Err(_) => {
-                    // No response within timeout — command was sent, treat as success
-                }
-            }
-
-            return Ok(());
         }
     }
 
-    // FR-5: All paths failed on both attempts
     Err(crate::error::MediaControlError::mpv_no_socket())
+}
+
+/// Send a payload to a specific mpv socket (fire-and-forget, no response read).
+///
+/// Used by `keep` for broadcast semantics.
+pub async fn send_to_mpv_socket(socket_path: &str, payload: &str) -> bool {
+    mpv_ipc_exchange(socket_path, payload, false).await.is_ok()
 }
 
 #[cfg(test)]
