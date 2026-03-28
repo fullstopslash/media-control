@@ -392,25 +392,29 @@ impl JellyfinClient {
         Ok(sessions)
     }
 
-    /// Find the active MPV or jellyfin-mpv-shim session.
+    /// Find the active mpv-shim session.
     ///
-    /// Looks for sessions where:
-    /// - The device ID matches our configured device ID, OR
-    /// - The client name contains "mpv" or "jellyfin mpv shim"
+    /// Prefers the Rust mpv-shim (client="mpv-shim") over the legacy Python shim.
+    /// Falls back to any session with "mpv" in the client name.
     pub async fn find_mpv_session(&self) -> Result<Option<Session>> {
         let sessions = self.fetch_sessions().await?;
 
-        let session = sessions.into_iter().find(|s| {
-            // Exclude our own sessions (media-control)
-            if s.client == "media-control" {
-                return false;
-            }
-            s.device_id == self.device_id
-                || s.client.to_lowercase().contains("mpv")
-                || s.client.to_lowercase().contains("jellyfin mpv shim")
-        });
+        let mpv_sessions: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| s.client != "media-control")
+            .filter(|s| {
+                s.device_id == self.device_id
+                    || s.client.to_lowercase().contains("mpv")
+            })
+            .collect();
 
-        Ok(session)
+        // Prefer Rust shim (client="mpv-shim") over legacy Python shim
+        if let Some(s) = mpv_sessions.iter().find(|s| s.client == "mpv-shim") {
+            return Ok(Some(s.clone()));
+        }
+
+        // Fall back to any mpv session
+        Ok(mpv_sessions.into_iter().next())
     }
 
     /// Find the active MPV session or return an error.
