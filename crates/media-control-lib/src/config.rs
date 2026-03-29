@@ -294,9 +294,18 @@ pub struct Positioning {
     /// When moused over, the window toggles between default_y and secondary_y.
     pub secondary_y: String,
 
+    /// Scale factor for minified mode (0.0–1.0, default 0.5).
+    /// When minified, window dimensions are multiplied by this factor.
+    #[serde(default = "default_minified_scale")]
+    pub minified_scale: f32,
+
     /// Per-class position overrides.
     #[serde(default)]
     pub overrides: Vec<PositionOverride>,
+}
+
+fn default_minified_scale() -> f32 {
+    0.5
 }
 
 impl Default for Positioning {
@@ -311,6 +320,7 @@ impl Default for Positioning {
             default_y: "y_bottom".to_string(),
             secondary_x: "x_left".to_string(),
             secondary_y: "y_bottom".to_string(),
+            minified_scale: default_minified_scale(),
             overrides: Vec::new(),
         }
     }

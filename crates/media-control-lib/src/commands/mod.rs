@@ -26,6 +26,7 @@ pub mod focus;
 pub mod fullscreen;
 pub mod keep;
 pub mod mark_watched;
+pub mod minify;
 pub mod move_window;
 pub mod pin;
 pub mod play;
@@ -251,6 +252,44 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Get the path to the minified state file.
+///
+/// Presence of this file means the media window is in minified mode.
+/// Located in `$XDG_RUNTIME_DIR` (tmpfs) so it resets on reboot.
+pub fn get_minify_state_path() -> PathBuf {
+    let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(runtime_dir).join("media-control-minified")
+}
+
+/// Check if minified mode is active.
+pub fn is_minified() -> bool {
+    get_minify_state_path().exists()
+}
+
+/// Toggle minified mode on/off. Returns the new state.
+pub async fn toggle_minified() -> Result<bool> {
+    let path = get_minify_state_path();
+    if path.exists() {
+        fs::remove_file(&path).await?;
+        Ok(false)
+    } else {
+        fs::write(&path, "1").await?;
+        Ok(true)
+    }
+}
+
+/// Get the effective window dimensions, accounting for minified mode.
+pub fn effective_dimensions(ctx: &CommandContext) -> (i32, i32) {
+    let w = ctx.config.positions.width;
+    let h = ctx.config.positions.height;
+    if is_minified() {
+        let scale = ctx.config.positioning.minified_scale;
+        ((w as f32 * scale) as i32, (h as f32 * scale) as i32)
+    } else {
+        (w, h)
+    }
 }
 
 /// Default mpv IPC socket path (jellyfin-mpv-shim).

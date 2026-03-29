@@ -1,21 +1,20 @@
-//! Play subcommand — resolve a Jellyfin item and start playback.
+//! Play subcommand — start playback via mpv-shim IPC.
 //!
-//! Replaces shim-play.sh with native Rust. Supports three targets:
-//! - `next-up`: First NextUp item across all shows
-//! - `recent-pinchflat`: Most recent unwatched video from Pinchflat library
-//! - `<item-id>`: Direct Jellyfin item ID
+//! Targets:
+//! - `next-up`: play next-up from the currently active store
+//! - `<store-name>`: switch to that store and play its next-up (twitch, jellyfin, pinchflat, etc.)
+//! - `<item-id>`: play a specific item by hex ID (shim auto-detects store)
 
 use super::{send_mpv_script_message, send_mpv_script_message_with_args, CommandContext};
-use crate::jellyfin::JellyfinClient;
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayTarget {
-    /// First NextUp item across all shows.
+    /// Play next-up from the active store.
     NextUp,
-    /// Most recent unwatched Pinchflat video.
-    RecentPinchflat,
-    /// A specific Jellyfin item ID.
+    /// Switch to a named store/context and play its next-up item.
+    Store(String),
+    /// A specific item ID (hex, 32+ chars).
     ItemId(String),
 }
 
@@ -24,55 +23,39 @@ impl PlayTarget {
     pub fn parse(s: &str) -> Self {
         match s {
             "next-up" => Self::NextUp,
-            "recent-pinchflat" => Self::RecentPinchflat,
-            id => Self::ItemId(id.to_string()),
+            id if id.len() >= 32 && id.chars().all(|c| c.is_ascii_hexdigit()) => {
+                Self::ItemId(id.to_string())
+            }
+            // Everything else is a store/context name
+            name => Self::Store(name.to_string()),
         }
     }
 }
 
-/// Resolve a playback target and start playback via IPC.
+/// Start playback via mpv-shim IPC.
 ///
-/// All targets now resolve to an item ID and send it directly to the shim
-/// via `play-item` IPC command. No Jellyfin session routing needed.
-pub async fn play(ctx: &CommandContext, target_str: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+/// All playback delegation goes through the shim — media-control is just
+/// the control plane, not the resolution engine.
+pub async fn play(
+    _ctx: &CommandContext,
+    target_str: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let target = PlayTarget::parse(target_str);
 
-    // NextUp: delegate entirely to the shim
-    if matches!(target, PlayTarget::NextUp) {
-        send_mpv_script_message("play-next-up").await?;
-        return Ok(());
-    }
-
-    // Resolve item ID
-    let item_id = match &target {
-        PlayTarget::RecentPinchflat => {
-            let jf = JellyfinClient::from_default_credentials().await?;
-            let lib_id = ctx
-                .config
-                .play
-                .pinchflat_library_id
-                .as_ref()
-                .ok_or("No pinchflat_library_id in config.toml [play] section")?;
-            let items = jf
-                .get_unwatched_items(lib_id, "DateCreated", "Descending", None, 1)
-                .await?;
-            items
-                .into_iter()
-                .next()
-                .map(|item| item.id)
-                .ok_or("No unwatched Pinchflat videos found")?
+    match target {
+        PlayTarget::NextUp => {
+            send_mpv_script_message("play-next-up").await?;
         }
-        PlayTarget::ItemId(id) => id.clone(),
-        PlayTarget::NextUp => unreachable!(),
-    };
-
-    // Send IPC play-source hint (non-fatal)
-    if let Err(e) = send_mpv_script_message_with_args("set-play-source", &["strategy"]).await {
-        eprintln!("media-control: IPC hint failed (non-fatal): {e}");
+        PlayTarget::Store(name) => {
+            // Send play-{name} to the shim. Each store/context handles its own
+            // play logic (e.g., play-twitch, play-jellyfin, play-pinchflat).
+            let cmd = format!("play-{}", name);
+            send_mpv_script_message(&cmd).await?;
+        }
+        PlayTarget::ItemId(id) => {
+            send_mpv_script_message_with_args("play-item", &[&id]).await?;
+        }
     }
-
-    // Send item ID directly to shim via IPC — shim resolves URL and plays
-    send_mpv_script_message_with_args("play-item", &[&item_id]).await?;
 
     Ok(())
 }
@@ -82,31 +65,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn play_target_parse_next_up() {
+    fn parse_next_up() {
         assert_eq!(PlayTarget::parse("next-up"), PlayTarget::NextUp);
     }
 
     #[test]
-    fn play_target_parse_recent_pinchflat() {
+    fn parse_store_name() {
         assert_eq!(
-            PlayTarget::parse("recent-pinchflat"),
-            PlayTarget::RecentPinchflat
+            PlayTarget::parse("twitch"),
+            PlayTarget::Store("twitch".to_string())
+        );
+        assert_eq!(
+            PlayTarget::parse("jellyfin"),
+            PlayTarget::Store("jellyfin".to_string())
+        );
+        assert_eq!(
+            PlayTarget::parse("pinchflat"),
+            PlayTarget::Store("pinchflat".to_string())
         );
     }
 
     #[test]
-    fn play_target_parse_item_id() {
+    fn parse_item_id() {
         assert_eq!(
             PlayTarget::parse("a5c0a87b1d058d1b7e70f5406ee274e2"),
             PlayTarget::ItemId("a5c0a87b1d058d1b7e70f5406ee274e2".to_string())
-        );
-    }
-
-    #[test]
-    fn play_target_parse_unknown_defaults_to_item_id() {
-        assert_eq!(
-            PlayTarget::parse("something-else"),
-            PlayTarget::ItemId("something-else".to_string())
         );
     }
 }

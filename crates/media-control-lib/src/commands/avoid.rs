@@ -120,7 +120,7 @@ fn calculate_target_position(
     let positions = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
 
-    let media_width = positions.width;
+    let (media_width, _) = super::effective_dimensions(ctx);
     let available_width = positions.x_right + media_width - positions.x_left;
     let screen_center_x = (positions.x_left + positions.x_right) / 2;
     let screen_center_y = (positions.y_top + positions.y_bottom) / 2;
@@ -151,6 +151,7 @@ fn calculate_target_position(
 }
 
 /// Move a media window to a specific position.
+/// Respects minified mode — scales dimensions when active.
 async fn move_media_window(
     ctx: &CommandContext,
     addr: &str,
@@ -159,8 +160,9 @@ async fn move_media_window(
     width: Option<i32>,
     height: Option<i32>,
 ) -> Result<()> {
-    let w = width.unwrap_or(ctx.config.positions.width);
-    let h = height.unwrap_or(ctx.config.positions.height);
+    let (ew, eh) = super::effective_dimensions(ctx);
+    let w = width.unwrap_or(ew);
+    let h = height.unwrap_or(eh);
 
     ctx.hyprland
         .batch(&[
@@ -421,8 +423,9 @@ async fn handle_move_to_primary(
                     continue;
                 }
             } else {
-                let media_w = pair.width.unwrap_or(ctx.config.positions.width);
-                let media_h = pair.height.unwrap_or(ctx.config.positions.height);
+                let (ew, eh) = super::effective_dimensions(ctx);
+                let media_w = pair.width.unwrap_or(ew);
+                let media_h = pair.height.unwrap_or(eh);
                 let primary_overlaps = rectangles_overlap(
                     pair.primary_x, pair.primary_y, media_w, media_h,
                     focused.x, focused.y, focused.width, focused.height,
@@ -502,8 +505,7 @@ async fn handle_mouseover_geometry(
     }
 
     let (target_x, target_y) = calculate_target_position(ctx, focused.x, focused.y, focused.width);
-    let media_w = ctx.config.positions.width;
-    let media_h = ctx.config.positions.height;
+    let (media_w, media_h) = super::effective_dimensions(ctx);
 
     // Verify target doesn't overlap with any non-media window on the workspace
     let target_overlaps = clients.iter().any(|c| {
@@ -538,8 +540,7 @@ async fn handle_geometry_overlap(
     focused: &FocusedWindow<'_>,
     media_windows: &[MediaWindow],
 ) -> Result<()> {
-    let media_w = ctx.config.positions.width;
-    let media_h = ctx.config.positions.height;
+    let (media_w, media_h) = super::effective_dimensions(ctx);
 
     for window in media_windows {
         if rectangles_overlap(

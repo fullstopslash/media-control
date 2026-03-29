@@ -104,6 +104,9 @@ enum Commands {
     /// Tag current item as "keep" (prevents auto-deletion)
     Keep,
 
+    /// Toggle minified mode (smaller media window)
+    Minify,
+
     /// Navigate chapters in mpv
     Chapter {
         /// Direction: next or prev
@@ -231,6 +234,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Keep => {
             commands::keep::keep(&ctx).await?;
+        }
+        Commands::Minify => {
+            commands::minify::minify(&ctx).await?;
         }
         Commands::Chapter { direction } => {
             let dir = match direction.as_str() {

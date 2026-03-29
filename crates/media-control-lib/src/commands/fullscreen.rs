@@ -212,16 +212,14 @@ async fn exit_fullscreen(
             .unwrap_or(positions.y_bottom);
 
         // Move to default position
+        let (ew, eh) = super::effective_dimensions(ctx);
         ctx.hyprland
             .batch(&[
                 &format!(
                     "dispatch movewindowpixel exact {} {},address:{}",
                     target_x, target_y, addr
                 ),
-                &format!(
-                    "dispatch resizewindowpixel exact {} {},address:{}",
-                    positions.width, positions.height, addr
-                ),
+                &format!("dispatch resizewindowpixel exact {ew} {eh},address:{addr}"),
             ])
             .await?;
 
