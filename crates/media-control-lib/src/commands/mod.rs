@@ -292,6 +292,25 @@ pub fn effective_dimensions(ctx: &CommandContext) -> (i32, i32) {
     }
 }
 
+/// Resolve a position name adjusted for minified mode.
+///
+/// When minified, "x_right" and "y_bottom" shift outward because the
+/// smaller window needs a larger x/y to maintain the same gap from the
+/// screen edge. "x_left" and "y_top" stay the same.
+pub fn resolve_effective_position(ctx: &CommandContext, name: &str) -> Option<i32> {
+    let raw = ctx.config.resolve_position(name)?;
+    if !is_minified() {
+        return Some(raw);
+    }
+    let p = &ctx.config.positions;
+    let (ew, eh) = effective_dimensions(ctx);
+    match name {
+        "x_right" => Some(raw + (p.width - ew)),
+        "y_bottom" => Some(raw + (p.height - eh)),
+        _ => Some(raw),
+    }
+}
+
 /// Default mpv IPC socket path (jellyfin-mpv-shim).
 const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpvctl-jshim";
 

@@ -63,26 +63,27 @@ struct PositionPair {
 fn get_position_pair(ctx: &CommandContext, focused_class: &str, focused_title: &str) -> PositionPair {
     let positions = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
+    let resolve = |name: &str| super::resolve_effective_position(ctx, name);
 
-    // Default positions
-    let default_primary_x = ctx.config.resolve_position(&positioning.default_x).unwrap_or(positions.x_right);
-    let default_primary_y = ctx.config.resolve_position(&positioning.default_y).unwrap_or(positions.y_bottom);
-    let default_secondary_x = ctx.config.resolve_position(&positioning.secondary_x).unwrap_or(positions.x_left);
-    let default_secondary_y = ctx.config.resolve_position(&positioning.secondary_y).unwrap_or(positions.y_bottom);
+    // Default positions (adjusted for minified mode)
+    let default_primary_x = resolve(&positioning.default_x).unwrap_or(positions.x_right);
+    let default_primary_y = resolve(&positioning.default_y).unwrap_or(positions.y_bottom);
+    let default_secondary_x = resolve(&positioning.secondary_x).unwrap_or(positions.x_left);
+    let default_secondary_y = resolve(&positioning.secondary_y).unwrap_or(positions.y_bottom);
 
     // Check for class/title override (case-insensitive class, regex title)
     if let Some(override_cfg) = positioning.get_override(focused_class, focused_title) {
         let primary_x = override_cfg.pref_x.as_ref()
-            .and_then(|s| ctx.config.resolve_position(s))
+            .and_then(|s| resolve(s))
             .unwrap_or(default_primary_x);
         let primary_y = override_cfg.pref_y.as_ref()
-            .and_then(|s| ctx.config.resolve_position(s))
+            .and_then(|s| resolve(s))
             .unwrap_or(default_primary_y);
         let secondary_x = override_cfg.secondary_x.as_ref()
-            .and_then(|s| ctx.config.resolve_position(s))
+            .and_then(|s| resolve(s))
             .unwrap_or(default_secondary_x);
         let secondary_y = override_cfg.secondary_y.as_ref()
-            .and_then(|s| ctx.config.resolve_position(s))
+            .and_then(|s| resolve(s))
             .unwrap_or(default_secondary_y);
 
         return PositionPair {
@@ -117,34 +118,35 @@ fn calculate_target_position(
     media_y: i32,
     focus_w: i32,
 ) -> (i32, i32) {
-    let positions = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
+    let resolve = |name: &str| super::resolve_effective_position(ctx, name);
+
+    // Use effective positions (adjusted for minified mode)
+    let x_left = resolve("x_left").unwrap_or(48);
+    let x_right = resolve("x_right").unwrap_or(1272);
+    let y_top = resolve("y_top").unwrap_or(48);
+    let y_bottom = resolve("y_bottom").unwrap_or(712);
 
     let (media_width, _) = super::effective_dimensions(ctx);
-    let available_width = positions.x_right + media_width - positions.x_left;
-    let screen_center_x = (positions.x_left + positions.x_right) / 2;
-    let screen_center_y = (positions.y_top + positions.y_bottom) / 2;
+    let available_width = x_right + media_width - x_left;
+    let screen_center_x = (x_left + x_right) / 2;
+    let screen_center_y = (y_top + y_bottom) / 2;
 
     let wide_threshold = i32::from(positioning.wide_window_threshold);
 
-    // Check if focused window is "wide" (takes up most of available width)
     if focus_w >= available_width * wide_threshold / 100 {
-        // Wide window: move vertically
-        // If media is below screen center, move to top; otherwise move to bottom
         let target_y = if media_y >= screen_center_y {
-            positions.y_top
+            y_top
         } else {
-            positions.y_bottom
+            y_bottom
         };
         (media_x, target_y)
     } else {
-        // Normal window: move horizontally
-        // If media center is left of screen center, move to right; otherwise move to left
         let media_center = media_x + media_width / 2;
         let target_x = if media_center <= screen_center_x {
-            positions.x_right
+            x_right
         } else {
-            positions.x_left
+            x_left
         };
         (target_x, media_y)
     }

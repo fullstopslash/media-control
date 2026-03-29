@@ -202,13 +202,9 @@ async fn exit_fullscreen(
         let positioning = &ctx.config.positioning;
 
         // Use default position - avoider will adjust if needed after focus restore
-        let target_x = ctx
-            .config
-            .resolve_position(&positioning.default_x)
+        let target_x = super::resolve_effective_position(ctx, &positioning.default_x)
             .unwrap_or(positions.x_right);
-        let target_y = ctx
-            .config
-            .resolve_position(&positioning.default_y)
+        let target_y = super::resolve_effective_position(ctx, &positioning.default_y)
             .unwrap_or(positions.y_bottom);
 
         // Move to default position
