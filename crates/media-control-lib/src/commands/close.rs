@@ -6,7 +6,7 @@
 use tokio::process::Command;
 
 use super::fullscreen::is_pip_title;
-use super::{find_focused_address, send_mpv_script_message, CommandContext};
+use super::{find_focused_address, get_minify_state_path, send_mpv_script_message, CommandContext};
 use crate::error::Result;
 
 /// Close the media window gracefully with app-specific handling.
@@ -33,6 +33,9 @@ use crate::error::Result;
 /// # }
 /// ```
 pub async fn close(ctx: &CommandContext) -> Result<()> {
+    // Always clear minified state so next window spawns at normal size
+    let _ = tokio::fs::remove_file(get_minify_state_path()).await;
+
     let clients = ctx.hyprland.get_clients().await?;
 
     let focus_addr = find_focused_address(&clients);
