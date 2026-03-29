@@ -6,8 +6,11 @@
 use tokio::process::Command;
 
 use super::fullscreen::is_pip_title;
-use super::{find_focused_address, get_minify_state_path, send_mpv_script_message, CommandContext};
+use super::{find_focused_address, get_minify_state_path, send_to_mpv_socket, CommandContext};
 use crate::error::Result;
+
+/// Default mpv IPC socket path (jellyfin-mpv-shim).
+const SHIM_SOCKET: &str = "/tmp/mpv-shim";
 
 /// Close the media window gracefully with app-specific handling.
 ///
@@ -51,7 +54,7 @@ pub async fn close(ctx: &CommandContext) -> Result<()> {
 ///
 /// This is the internal implementation that handles app-specific close logic.
 /// Check if a process is the jellyfin-mpv-shim's mpv by looking for
-/// `--input-ipc-server=/tmp/mpvctl-jshim` in its command line.
+/// `--input-ipc-server=/tmp/mpv-shim` in its command line.
 fn is_shim_mpv(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -69,12 +72,14 @@ async fn close_window_gracefully(
     pid: i32,
 ) -> Result<()> {
     // MPV: check if this is the shim's mpv instance.
-    // Shim mpv is started with --input-ipc-server=/tmp/mpvctl-jshim.
+    // Shim mpv is started with --input-ipc-server=/tmp/mpv-shim.
     // For shim mpv: send stop-and-clear, keep window alive for reuse.
     // For standalone mpv: close via Hyprland like any other window.
     if class == "mpv" {
         if is_shim_mpv(pid) {
-            let _ = send_mpv_script_message("stop-and-clear").await;
+            // Fire-and-forget: no retry, no response read.
+            // The shim handles state sync internally before stopping.
+            let _ = send_to_mpv_socket(SHIM_SOCKET, r#"{"command":["script-message","stop-and-clear"]}"#).await;
             return Ok(());
         }
         ctx.hyprland

@@ -30,6 +30,7 @@ pub mod minify;
 pub mod move_window;
 pub mod pin;
 pub mod play;
+pub mod random;
 pub mod status;
 
 use std::env;
@@ -311,11 +312,11 @@ pub fn resolve_effective_position(ctx: &CommandContext, name: &str) -> Option<i3
     }
 }
 
-/// Default mpv IPC socket path (jellyfin-mpv-shim).
-const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpvctl-jshim";
+/// Default mpv IPC socket path (mpv-shim).
+const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpv-shim";
 
-/// Fallback mpv IPC socket path.
-const MPV_IPC_SOCKET_FALLBACK: &str = "/tmp/mpvctl0";
+/// Fallback mpv IPC socket path (legacy).
+const MPV_IPC_SOCKET_FALLBACK: &str = "/tmp/mpvctl-jshim";
 
 /// Timeout for connecting to and writing to a socket.
 const SOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);

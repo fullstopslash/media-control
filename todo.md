@@ -1,5 +1,10 @@
 ---
+title: media-control
 project: media-control
+area: code
+horizon: projects
+created: 2025-11-30
+tags: []
 ---
 
 # Todo - media-control

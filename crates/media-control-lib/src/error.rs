@@ -272,7 +272,7 @@ impl MediaControlError {
     pub fn mpv_no_socket() -> Self {
         Self::MpvIpc {
             kind: MpvIpcErrorKind::NoSocket,
-            message: "no mpv IPC socket found (tried $MPV_IPC_SOCKET, /tmp/mpvctl-jshim, /tmp/mpvctl0)".into(),
+            message: "no mpv IPC socket found (tried $MPV_IPC_SOCKET, /tmp/mpv-shim, /tmp/mpvctl-jshim)".into(),
         }
     }
 

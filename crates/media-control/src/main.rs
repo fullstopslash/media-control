@@ -104,6 +104,15 @@ enum Commands {
     /// Tag current item as "keep" (prevents auto-deletion)
     Keep,
 
+    /// Toggle favorite on current item
+    Favorite,
+
+    /// Delete current item (Jellyfin: remove, Twitch: unfollow, Stash: delete scene)
+    Delete,
+
+    /// Increment o-counter for current Stash scene
+    AddO,
+
     /// Toggle minified mode (smaller media window)
     Minify,
 
@@ -117,6 +126,13 @@ enum Commands {
     Play {
         /// What to play: next-up, recent-pinchflat, or a Jellyfin item ID
         target: String,
+    },
+
+    /// Pick and play a random item from the active store
+    Random {
+        /// Optional type filter (store-specific: show, movie, scene, performer, studio)
+        #[arg(name = "TYPE")]
+        random_type: Option<String>,
     },
 
     /// Show current playback status
@@ -235,6 +251,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Keep => {
             commands::keep::keep(&ctx).await?;
         }
+        Commands::Favorite => {
+            commands::keep::favorite(&ctx).await?;
+        }
+        Commands::Delete => {
+            commands::keep::delete(&ctx).await?;
+        }
+        Commands::AddO => {
+            commands::keep::add_o(&ctx).await?;
+        }
         Commands::Minify => {
             commands::minify::minify(&ctx).await?;
         }
@@ -248,6 +273,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Play { target } => {
             commands::play::play(&ctx, &target).await?;
+        }
+        Commands::Random { random_type } => {
+            commands::random::random(random_type.as_deref()).await?;
         }
         Commands::Status { .. } => unreachable!(), // handled before config loading
         Commands::Completions { .. } => unreachable!(),

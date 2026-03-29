@@ -13,3 +13,27 @@ pub async fn keep(ctx: &CommandContext) -> Result<()> {
     }
     send_mpv_script_message("keep").await
 }
+
+/// Toggle favorite on the current item.
+pub async fn favorite(ctx: &CommandContext) -> Result<()> {
+    if require_mpv_window(ctx).await?.is_none() {
+        return Ok(());
+    }
+    send_mpv_script_message("favorite").await
+}
+
+/// Delete the current item.
+pub async fn delete(ctx: &CommandContext) -> Result<()> {
+    if require_mpv_window(ctx).await?.is_none() {
+        return Ok(());
+    }
+    send_mpv_script_message("delete").await
+}
+
+/// Increment o-counter on the current item.
+pub async fn add_o(ctx: &CommandContext) -> Result<()> {
+    if require_mpv_window(ctx).await?.is_none() {
+        return Ok(());
+    }
+    send_mpv_script_message("add-o").await
+}
