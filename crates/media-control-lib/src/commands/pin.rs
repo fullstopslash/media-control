@@ -79,22 +79,19 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
         ctx.hyprland.batch(&cmd_refs).await?;
     }
 
-    // Position to configured default corner
+    // Position to configured default corner (adjusted for minified mode)
     let pos = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
-    let target_x = ctx
-        .config
-        .resolve_position(&positioning.default_x)
+    let target_x = super::resolve_effective_position(ctx, &positioning.default_x)
         .unwrap_or(pos.x_right);
-    let target_y = ctx
-        .config
-        .resolve_position(&positioning.default_y)
+    let target_y = super::resolve_effective_position(ctx, &positioning.default_y)
         .unwrap_or(pos.y_bottom);
+    let (ew, eh) = super::effective_dimensions(ctx);
     ctx.hyprland
         .batch(&[
             &format!(
-                "dispatch resizewindowpixel exact {} {},address:{}",
-                pos.width, pos.height, media.address
+                "dispatch resizewindowpixel exact {ew} {eh},address:{}",
+                media.address
             ),
             &format!(
                 "dispatch movewindowpixel exact {} {},address:{}",
