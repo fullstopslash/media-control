@@ -31,18 +31,34 @@ pub async fn mark_watched_and_next(ctx: &CommandContext) -> Result<()> {
     send_mpv_script_message("mark-watched-next").await
 }
 
-/// Skip to next item via per-library strategy (no mark watched).
-pub async fn skip_next(ctx: &CommandContext) -> Result<()> {
+/// Next item via per-library strategy (episode-level, no mark watched).
+pub async fn next(ctx: &CommandContext) -> Result<()> {
     if require_mpv_window(ctx).await?.is_none() {
         return Ok(());
     }
-    send_mpv_script_message("skip-next").await
+    send_mpv_script_message("next").await
 }
 
-/// Skip to previous item (no mark watched).
-pub async fn skip_prev(ctx: &CommandContext) -> Result<()> {
+/// Previous item via per-library strategy (episode-level, no mark watched).
+pub async fn prev(ctx: &CommandContext) -> Result<()> {
     if require_mpv_window(ctx).await?.is_none() {
         return Ok(());
     }
-    send_mpv_script_message("skip-prev").await
+    send_mpv_script_message("prev").await
+}
+
+/// Jump to next series/collection (series-level navigation).
+pub async fn next_series(ctx: &CommandContext) -> Result<()> {
+    if require_mpv_window(ctx).await?.is_none() {
+        return Ok(());
+    }
+    send_mpv_script_message("next-series").await
+}
+
+/// Return to previous series/collection (series-level navigation).
+pub async fn prev_series(ctx: &CommandContext) -> Result<()> {
+    if require_mpv_window(ctx).await?.is_none() {
+        return Ok(());
+    }
+    send_mpv_script_message("prev-series").await
 }

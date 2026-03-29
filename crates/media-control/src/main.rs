@@ -89,11 +89,17 @@ enum Commands {
     /// Mark watched and advance queue
     MarkWatchedAndNext,
 
-    /// Skip to next item via strategy (no mark watched)
-    SkipNext,
+    /// Next item via per-library strategy (no mark watched)
+    Next,
 
-    /// Skip to previous item (no mark watched)
-    SkipPrev,
+    /// Previous item via per-library strategy (no mark watched)
+    Prev,
+
+    /// Jump to next series/collection
+    NextSeries,
+
+    /// Return to previous series/collection
+    PrevSeries,
 
     /// Tag current item as "keep" (prevents auto-deletion)
     Keep,
@@ -211,11 +217,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::MarkWatchedAndNext => {
             commands::mark_watched::mark_watched_and_next(&ctx).await?;
         }
-        Commands::SkipNext => {
-            commands::mark_watched::skip_next(&ctx).await?;
+        Commands::Next => {
+            commands::mark_watched::next(&ctx).await?;
         }
-        Commands::SkipPrev => {
-            commands::mark_watched::skip_prev(&ctx).await?;
+        Commands::Prev => {
+            commands::mark_watched::prev(&ctx).await?;
+        }
+        Commands::NextSeries => {
+            commands::mark_watched::next_series(&ctx).await?;
+        }
+        Commands::PrevSeries => {
+            commands::mark_watched::prev_series(&ctx).await?;
         }
         Commands::Keep => {
             commands::keep::keep(&ctx).await?;

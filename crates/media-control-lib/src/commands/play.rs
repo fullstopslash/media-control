@@ -30,21 +30,23 @@ impl PlayTarget {
     }
 }
 
-/// Resolve a playback target, send IPC hint, and start playback.
+/// Resolve a playback target and start playback via IPC.
+///
+/// All targets now resolve to an item ID and send it directly to the shim
+/// via `play-item` IPC command. No Jellyfin session routing needed.
 pub async fn play(ctx: &CommandContext, target_str: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let target = PlayTarget::parse(target_str);
-    let jf = JellyfinClient::from_default_credentials().await?;
 
-    // NextUp: delegate entirely to the shim's merged queue (includes movies + series)
+    // NextUp: delegate entirely to the shim
     if matches!(target, PlayTarget::NextUp) {
         send_mpv_script_message("play-next-up").await?;
         return Ok(());
     }
 
-    // Step 1: Resolve item ID
+    // Resolve item ID
     let item_id = match &target {
         PlayTarget::RecentPinchflat => {
-            // Must use HTTP API — query socket doesn't support library filtering
+            let jf = JellyfinClient::from_default_credentials().await?;
             let lib_id = ctx
                 .config
                 .play
@@ -64,28 +66,13 @@ pub async fn play(ctx: &CommandContext, target_str: &str) -> std::result::Result
         PlayTarget::NextUp => unreachable!(),
     };
 
-    // Step 2: Send IPC play-source hint (non-fatal)
-    let source = "strategy";
-    if let Err(e) = send_mpv_script_message_with_args("set-play-source", &[source]).await {
+    // Send IPC play-source hint (non-fatal)
+    if let Err(e) = send_mpv_script_message_with_args("set-play-source", &["strategy"]).await {
         eprintln!("media-control: IPC hint failed (non-fatal): {e}");
     }
 
-    // Step 3: Get resume position
-    let resume_ticks = match jf.get_item_resume_ticks(&item_id).await {
-        Ok(ticks) => ticks,
-        Err(e) => {
-            eprintln!("media-control: failed to get resume position (starting from beginning): {e}");
-            0
-        }
-    };
-
-    // Step 4: Find session and play
-    let session = jf
-        .find_mpv_session()
-        .await?
-        .ok_or("Shim not connected")?;
-    jf.play_item_with_resume(&session.id, &item_id, resume_ticks)
-        .await?;
+    // Send item ID directly to shim via IPC — shim resolves URL and plays
+    send_mpv_script_message_with_args("play-item", &[&item_id]).await?;
 
     Ok(())
 }
