@@ -122,6 +122,12 @@ enum Commands {
         direction: String,
     },
 
+    /// Seek to an absolute percentage position (0-100)
+    Seek {
+        /// Percentage position (0=start, 100=end)
+        percent: u8,
+    },
+
     /// Play a Jellyfin item (next-up, recent-pinchflat, or item ID)
     Play {
         /// What to play: next-up, recent-pinchflat, or a Jellyfin item ID
@@ -262,6 +268,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Minify => {
             commands::minify::minify(&ctx).await?;
+        }
+        Commands::Seek { percent } => {
+            commands::seek::seek(&ctx, percent).await?;
         }
         Commands::Chapter { direction } => {
             let dir = match direction.as_str() {

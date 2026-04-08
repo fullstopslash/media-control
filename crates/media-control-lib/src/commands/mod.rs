@@ -31,6 +31,7 @@ pub mod move_window;
 pub mod pin;
 pub mod play;
 pub mod random;
+pub mod seek;
 pub mod status;
 
 use std::env;
