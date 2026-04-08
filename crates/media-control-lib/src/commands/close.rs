@@ -60,7 +60,7 @@ fn is_shim_mpv(pid: i32) -> bool {
         return false;
     }
     std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-        .map(|cmdline| cmdline.contains("mpvctl-jshim"))
+        .map(|cmdline| cmdline.contains("mpv-shim"))
         .unwrap_or(false)
 }
 
