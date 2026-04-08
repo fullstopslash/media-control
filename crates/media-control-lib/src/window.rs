@@ -179,10 +179,7 @@ impl WindowMatcher {
                 let regex = match Regex::new(&p.value) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!(
-                            "media-control: invalid regex {:?}: {e}, skipping",
-                            p.value
-                        );
+                        eprintln!("media-control: invalid regex {:?}: {e}, skipping", p.value);
                         return None;
                     }
                 };
@@ -259,8 +256,7 @@ impl WindowMatcher {
                 }
 
                 // Priority 2: Focused
-                if focused_match.is_none()
-                    && focus_addr.is_some_and(|addr| client.address == addr)
+                if focused_match.is_none() && focus_addr.is_some_and(|addr| client.address == addr)
                 {
                     focused_match = Some((client, match_result));
                     continue;
@@ -377,7 +373,7 @@ mod tests {
             class: class.to_string(),
             title: title.to_string(),
             focus_history_id: 0,
-                pid: 0,
+            pid: 0,
         }
     }
 
@@ -577,9 +573,7 @@ mod tests {
             make_client("0x3", "firefox", "browser", false, false),
         ];
 
-        let result = matcher
-            .find_media_window(&clients, Some("0x2"))
-            .unwrap();
+        let result = matcher.find_media_window(&clients, Some("0x2")).unwrap();
         assert_eq!(result.address, "0x2");
         assert_eq!(result.priority, 2);
     }
@@ -618,9 +612,7 @@ mod tests {
         ];
 
         // Even with focus_addr pointing to 0x1, pinned window should win
-        let result = matcher
-            .find_media_window(&clients, Some("0x1"))
-            .unwrap();
+        let result = matcher.find_media_window(&clients, Some("0x1")).unwrap();
         assert_eq!(result.address, "0x2");
         assert_eq!(result.priority, 1);
     }
@@ -730,8 +722,17 @@ mod tests {
         }];
         let matcher = WindowMatcher::new(&patterns).unwrap();
 
-        let clients =
-            vec![make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 0)];
+        let clients = vec![make_client_full(
+            "0x1",
+            "mpv",
+            "video.mp4",
+            true,
+            true,
+            0,
+            1,
+            0,
+            0,
+        )];
 
         let result = matcher.find_previous_focus(&clients, "0x1", None);
         assert!(result.is_none());
@@ -759,7 +760,17 @@ mod tests {
             make_client_full("0x1", "mpv", "video1", false, true, 0, 1, 0, 2),
             make_client_full("0x2", "mpv", "video2", true, true, 0, 1, 0, 1), // Pinned
             make_client_full("0x3", "firefox", "pip", false, true, 0, 1, 1, 0), // Different monitor
-            make_client_full("0x4", "firefox", "Picture-in-Picture", true, true, 0, 1, 0, 0),
+            make_client_full(
+                "0x4",
+                "firefox",
+                "Picture-in-Picture",
+                true,
+                true,
+                0,
+                1,
+                0,
+                0,
+            ),
         ];
 
         let windows = matcher.find_media_windows(&clients, 0);

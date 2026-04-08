@@ -5,7 +5,10 @@
 
 use regex::Regex;
 
-use super::{clear_suppression, get_media_window_with_clients, restore_focus, suppress_avoider, CommandContext};
+use super::{
+    CommandContext, clear_suppression, get_media_window_with_clients, restore_focus,
+    suppress_avoider,
+};
 use crate::error::Result;
 use crate::hyprland::Client;
 use crate::window::MediaWindow;
@@ -61,13 +64,11 @@ async fn auto_pin_window(ctx: &CommandContext, media: &MediaWindow) -> Result<()
     if !media.floating {
         ctx.hyprland
             .dispatch(&format!("togglefloating address:{}", media.address))
-            .await
-            ?;
+            .await?;
     }
     ctx.hyprland
         .dispatch(&format!("pin address:{}", media.address))
-        .await
-        ?;
+        .await?;
     Ok(())
 }
 
@@ -112,9 +113,7 @@ async fn exit_fullscreen(
 ) -> Result<()> {
     let addr = &media.address;
     let should_restore_pin = media.always_pin || media.pinned || is_pip_title(&media.title);
-    let previous_focus = ctx
-        .window_matcher
-        .find_previous_focus(clients, addr, None);
+    let previous_focus = ctx.window_matcher.find_previous_focus(clients, addr, None);
     // Suppress avoider BEFORE starting - prevents repositioning during state changes
     if let Err(e) = suppress_avoider().await {
         eprintln!("media-control: failed to suppress avoider: {e}");
@@ -127,8 +126,7 @@ async fn exit_fullscreen(
             &format!("dispatch focuswindow address:{addr}"),
             "dispatch fullscreen 0",
         ])
-        .await
-        ?;
+        .await?;
 
     // Retry loop for exiting fullscreen (like bash script)
     let mut attempt = 0;
@@ -158,8 +156,7 @@ async fn exit_fullscreen(
                 &format!("dispatch focuswindow address:{addr}"),
                 "dispatch fullscreen 0",
             ])
-            .await
-            ?;
+            .await?;
 
         // Aggressive double-toggle on final attempt
         if attempt == MAX_FULLSCREEN_EXIT_ATTEMPTS {
@@ -169,8 +166,7 @@ async fn exit_fullscreen(
                     "dispatch fullscreen 0",
                     "dispatch fullscreen 0",
                 ])
-                .await
-                ?;
+                .await?;
         }
     }
 
@@ -191,8 +187,7 @@ async fn exit_fullscreen(
     if should_restore_pin && !current_pinned {
         ctx.hyprland
             .dispatch(&format!("pin address:{addr}"))
-            .await
-            ?;
+            .await?;
     }
 
     // Position the media window to default position and resize
@@ -439,7 +434,7 @@ mod tests {
             class: "mpv".to_string(),
             title: "video.mp4".to_string(),
             focus_history_id: 0,
-                pid: 0,
+            pid: 0,
         }];
 
         // Only the media window exists
@@ -456,12 +451,30 @@ mod tests {
         // mpv is floating, not pinned, not fullscreen
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", false, true,
-                0, 1, 0, 1, [1272, 712], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                false,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -475,9 +488,15 @@ mod tests {
         let batch = cmds.iter().find(|c| c.contains("fullscreen"));
         assert!(batch.is_some(), "expected fullscreen dispatch: {cmds:?}");
         let batch = batch.unwrap();
-        assert!(batch.contains("focuswindow"), "should focus before fullscreen");
+        assert!(
+            batch.contains("focuswindow"),
+            "should focus before fullscreen"
+        );
         // Should NOT contain pin toggle
-        assert!(!batch.contains("dispatch pin"), "should not unpin when not pinned: {batch}");
+        assert!(
+            !batch.contains("dispatch pin"),
+            "should not unpin when not pinned: {batch}"
+        );
     }
 
     #[tokio::test]
@@ -487,12 +506,30 @@ mod tests {
         // mpv is pinned + floating
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [1272, 712], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -506,7 +543,10 @@ mod tests {
         assert!(batch.is_some(), "expected fullscreen: {cmds:?}");
         let batch = batch.unwrap();
         // Should contain pin toggle (unpin before fullscreen)
-        assert!(batch.contains("dispatch pin"), "should unpin before fullscreen: {batch}");
+        assert!(
+            batch.contains("dispatch pin"),
+            "should unpin before fullscreen: {batch}"
+        );
     }
 
     #[tokio::test]
@@ -517,22 +557,58 @@ mod tests {
         // After exit_fullscreen, the mock returns it as non-fullscreen, non-pinned
         let clients_fullscreen = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 1, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                2, 1, 0, 0, [0, 0], [1920, 1080], // fullscreen=2, pinned=true
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                2,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080], // fullscreen=2, pinned=true
             ),
         ];
         let clients_exited = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 1, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", false, true,
-                0, 1, 0, 0, [1272, 712], [640, 360], // fullscreen=0, pinned=false
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                false,
+                true,
+                0,
+                1,
+                0,
+                0,
+                [1272, 712],
+                [640, 360], // fullscreen=0, pinned=false
             ),
         ];
 
@@ -551,7 +627,9 @@ mod tests {
 
         let cmds = mock.captured_commands().await;
         // Should dispatch pin to restore it
-        let has_pin = cmds.iter().any(|c| c.contains("dispatch pin address:0xmpv") && !c.contains("fullscreen"));
+        let has_pin = cmds
+            .iter()
+            .any(|c| c.contains("dispatch pin address:0xmpv") && !c.contains("fullscreen"));
         assert!(has_pin, "should restore pin after exit: {cmds:?}");
     }
 
@@ -561,8 +639,17 @@ mod tests {
 
         // No media windows
         let clients = vec![make_test_client_full(
-            "0xfirefox", "firefox", "Browser", false, false,
-            0, 1, 0, 0, [0, 0], [1920, 1080],
+            "0xfirefox",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
         )];
         mock.set_response("j/clients", &make_clients_json(&clients))
             .await;
@@ -584,12 +671,30 @@ mod tests {
         // Window is floating but NOT pinned
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xpip", "firefox", "Picture-in-Picture", false, true,
-                0, 1, 0, 1, [1272, 712], [320, 180],
+                "0xpip",
+                "firefox",
+                "Picture-in-Picture",
+                false,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [320, 180],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -603,7 +708,10 @@ mod tests {
         let has_pin = cmds.iter().any(|c| c.contains("dispatch pin"));
         assert!(has_pin, "should auto-pin PiP window: {cmds:?}");
         let has_fullscreen = cmds.iter().any(|c| c.contains("fullscreen"));
-        assert!(!has_fullscreen, "should NOT fullscreen when auto-pinning: {cmds:?}");
+        assert!(
+            !has_fullscreen,
+            "should NOT fullscreen when auto-pinning: {cmds:?}"
+        );
     }
 
     #[tokio::test]
@@ -613,22 +721,58 @@ mod tests {
         // mpv fullscreen, firefox was previous focus
         let clients_fullscreen = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 1, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", false, true,
-                2, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                false,
+                true,
+                2,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
         ];
         let clients_exited = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 1, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", false, true,
-                0, 1, 0, 0, [1272, 712], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                false,
+                true,
+                0,
+                1,
+                0,
+                0,
+                [1272, 712],
+                [640, 360],
             ),
         ];
 
@@ -646,9 +790,12 @@ mod tests {
 
         let cmds = mock.captured_commands().await;
         // Should restore focus to firefox
-        let has_focus_restore = cmds.iter().any(|c| {
-            c.contains("focuswindow address:0xfirefox") && c.contains("no_warps")
-        });
-        assert!(has_focus_restore, "should restore focus to firefox: {cmds:?}");
+        let has_focus_restore = cmds
+            .iter()
+            .any(|c| c.contains("focuswindow address:0xfirefox") && c.contains("no_warps"));
+        assert!(
+            has_focus_restore,
+            "should restore focus to firefox: {cmds:?}"
+        );
     }
 }

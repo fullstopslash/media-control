@@ -6,7 +6,7 @@
 use tokio::process::Command;
 
 use super::fullscreen::is_pip_title;
-use super::{find_focused_address, get_minify_state_path, send_to_mpv_socket, CommandContext};
+use super::{CommandContext, find_focused_address, get_minify_state_path, send_to_mpv_socket};
 use crate::error::Result;
 
 /// Default mpv IPC socket path (jellyfin-mpv-shim).
@@ -47,7 +47,14 @@ pub async fn close(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     };
 
-    close_window_gracefully(ctx, &window.address, &window.class, &window.title, window.pid).await
+    close_window_gracefully(
+        ctx,
+        &window.address,
+        &window.class,
+        &window.title,
+        window.pid,
+    )
+    .await
 }
 
 /// Close a specific window gracefully based on its class and title.
@@ -79,7 +86,11 @@ async fn close_window_gracefully(
         if is_shim_mpv(pid) {
             // Fire-and-forget: no retry, no response read.
             // The shim handles state sync internally before stopping.
-            let _ = send_to_mpv_socket(SHIM_SOCKET, r#"{"command":["script-message","stop-and-clear"]}"#).await;
+            let _ = send_to_mpv_socket(
+                SHIM_SOCKET,
+                r#"{"command":["script-message","stop-and-clear"]}"#,
+            )
+            .await;
             return Ok(());
         }
         ctx.hyprland
@@ -168,17 +179,30 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xjelly", "com.github.iwalton3.jellyfin-media-player", "Jellyfin", true, true,
-            0, 1, 0, 0, [0, 0], [1920, 1080],
+            "0xjelly",
+            "com.github.iwalton3.jellyfin-media-player",
+            "Jellyfin",
+            true,
+            true,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         close(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
         let has_kill = cmds.iter().any(|c| c.contains("closewindow"));
-        assert!(has_kill, "should dispatch closewindow for jellyfin: {cmds:?}");
+        assert!(
+            has_kill,
+            "should dispatch closewindow for jellyfin: {cmds:?}"
+        );
     }
 
     #[tokio::test]
@@ -186,17 +210,30 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xpip", "firefox", "Picture-in-Picture", true, true,
-            0, 1, 0, 0, [1272, 712], [320, 180],
+            "0xpip",
+            "firefox",
+            "Picture-in-Picture",
+            true,
+            true,
+            0,
+            1,
+            0,
+            0,
+            [1272, 712],
+            [320, 180],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         close(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
         let close_cmd = cmds.iter().find(|c| c.contains("closewindow"));
-        assert!(close_cmd.is_some(), "should dispatch closewindow for PiP: {cmds:?}");
+        assert!(
+            close_cmd.is_some(),
+            "should dispatch closewindow for PiP: {cmds:?}"
+        );
         assert!(
             close_cmd.unwrap().contains("0xpip"),
             "should target the PiP window address"
@@ -213,10 +250,20 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xmpv", "mpv", "video.mp4", true, true,
-            0, 1, 0, 0, [1272, 712], [640, 360],
+            "0xmpv",
+            "mpv",
+            "video.mp4",
+            true,
+            true,
+            0,
+            1,
+            0,
+            0,
+            [1272, 712],
+            [640, 360],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         close(&ctx).await.unwrap();
@@ -231,10 +278,20 @@ mod tests {
 
         // Some other media window class
         let clients = vec![make_test_client_full(
-            "0xvlc", "vlc", "movie.mkv", true, true,
-            0, 1, 0, 0, [1272, 712], [640, 360],
+            "0xvlc",
+            "vlc",
+            "movie.mkv",
+            true,
+            true,
+            0,
+            1,
+            0,
+            0,
+            [1272, 712],
+            [640, 360],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
 
         // Need vlc in patterns for it to be found as media window
         let mut config = crate::config::Config::default();
@@ -250,7 +307,10 @@ mod tests {
 
         let cmds = mock.captured_commands().await;
         let has_kill = cmds.iter().any(|c| c.contains("closewindow"));
-        assert!(has_kill, "should dispatch closewindow for default class: {cmds:?}");
+        assert!(
+            has_kill,
+            "should dispatch closewindow for default class: {cmds:?}"
+        );
     }
 
     #[tokio::test]
@@ -258,10 +318,20 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xfirefox", "firefox", "Browser", false, false,
-            0, 1, 0, 0, [0, 0], [1920, 1080],
+            "0xfirefox",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         close(&ctx).await.unwrap();

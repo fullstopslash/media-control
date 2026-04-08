@@ -82,12 +82,10 @@ impl CommandContext {
     /// - The Hyprland socket is not available
     /// - Any pattern regex fails to compile
     pub fn new() -> Result<Self> {
-        let config = Config::load().map_err(|e| {
-            crate::error::MediaControlError::Config {
-                kind: crate::error::ConfigErrorKind::NotFound,
-                path: Config::default_path().ok(),
-                source: Some(Box::new(e)),
-            }
+        let config = Config::load().map_err(|e| crate::error::MediaControlError::Config {
+            kind: crate::error::ConfigErrorKind::NotFound,
+            path: Config::default_path().ok(),
+            source: Some(Box::new(e)),
         })?;
 
         Self::with_config(config)
@@ -101,15 +99,14 @@ impl CommandContext {
     /// - The Hyprland socket is not available
     /// - Any pattern regex fails to compile
     pub fn with_config(config: Config) -> Result<Self> {
-        let hyprland = HyprlandClient::new().map_err(|e| {
-            crate::error::MediaControlError::HyprlandIpc {
+        let hyprland =
+            HyprlandClient::new().map_err(|e| crate::error::MediaControlError::HyprlandIpc {
                 kind: crate::error::HyprlandIpcErrorKind::SocketNotFound,
                 source: Some(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     e.to_string(),
                 )),
-            }
-        })?;
+            })?;
 
         let window_matcher = WindowMatcher::new(&config.patterns)?;
 
@@ -172,7 +169,10 @@ pub async fn get_media_window(ctx: &CommandContext) -> Result<Option<MediaWindow
 /// # Returns
 ///
 /// The best matching media window, or `None` if no match found.
-pub fn get_media_window_with_clients(ctx: &CommandContext, clients: &[Client]) -> Option<MediaWindow> {
+pub fn get_media_window_with_clients(
+    ctx: &CommandContext,
+    clients: &[Client],
+) -> Option<MediaWindow> {
     let focus_addr = find_focused_address(clients);
     ctx.window_matcher.find_media_window(clients, focus_addr)
 }
@@ -496,7 +496,12 @@ pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
                 return Ok(resp.get("data").cloned().unwrap_or(serde_json::Value::Null));
             }
             return Err(crate::error::MediaControlError::mpv_connection_failed(
-                format!("mpv error: {}", resp.get("error").and_then(|e| e.as_str()).unwrap_or("unknown")),
+                format!(
+                    "mpv error: {}",
+                    resp.get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("unknown")
+                ),
             ));
         }
     }
@@ -519,12 +524,11 @@ pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
         for socket_path in &paths {
             if let Ok(resp) = mpv_ipc_exchange(socket_path, payload, true).await {
                 // Log mpv errors but still return Ok — command was sent
-                if let Some(val) = resp {
-                    if let Some(err) = val.get("error").and_then(|e| e.as_str()) {
-                        if err != "success" {
-                            eprintln!("media-control: mpv returned error: {err}");
-                        }
-                    }
+                if let Some(val) = resp
+                    && let Some(err) = val.get("error").and_then(|e| e.as_str())
+                    && err != "success"
+                {
+                    eprintln!("media-control: mpv returned error: {err}");
                 }
                 return Ok(());
             }
@@ -611,7 +615,9 @@ mod tests {
         // Verify suppress_avoider writes without error.
         // We don't check the file content because parallel tests also write
         // to the same shared suppress file, causing race conditions.
-        suppress_avoider().await.expect("should write suppress file");
+        suppress_avoider()
+            .await
+            .expect("should write suppress file");
 
         // Verify the file exists
         let path = get_suppress_file_path();
@@ -622,7 +628,9 @@ mod tests {
     async fn clear_suppression_succeeds() {
         // Just verify it doesn't error. Can't assert file content because
         // parallel tests also write to the shared suppress file.
-        clear_suppression().await.expect("should clear suppress file");
+        clear_suppression()
+            .await
+            .expect("should clear suppress file");
     }
 
     #[test]

@@ -116,8 +116,8 @@ impl HyprlandClient {
     ///
     /// Returns an error if `XDG_RUNTIME_DIR` or `HYPRLAND_INSTANCE_SIGNATURE` are not set.
     pub fn new() -> Result<Self> {
-        let runtime_dir =
-            env::var("XDG_RUNTIME_DIR").map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
+        let runtime_dir = env::var("XDG_RUNTIME_DIR")
+            .map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
         let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")
             .map_err(|_| HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"))?;
 

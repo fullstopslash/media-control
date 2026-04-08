@@ -3,7 +3,7 @@
 //! All commands delegate to the jellyfin-mpv-shim fork via mpv IPC.
 //! The shim handles Jellyfin API calls, strategy resolution, and playback natively.
 
-use super::{require_mpv_window, send_mpv_script_message, CommandContext};
+use super::{CommandContext, require_mpv_window, send_mpv_script_message};
 use crate::error::Result;
 
 /// Mark the current item as watched.

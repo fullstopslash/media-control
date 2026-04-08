@@ -299,7 +299,9 @@ impl JellyfinClient {
     /// Returns an error if the file doesn't exist or can't be parsed.
     pub async fn load_credentials() -> Result<Credentials> {
         let home = std::env::var("HOME").map_err(|_| {
-            JellyfinError::CredentialsNotFound(PathBuf::from("~/.config/jellyfin-mpv-shim/cred.json"))
+            JellyfinError::CredentialsNotFound(PathBuf::from(
+                "~/.config/jellyfin-mpv-shim/cred.json",
+            ))
         })?;
 
         let cred_path = PathBuf::from(home).join(".config/jellyfin-mpv-shim/cred.json");
@@ -343,12 +345,10 @@ impl JellyfinClient {
         );
         headers.insert(
             "X-Emby-Token",
-            HeaderValue::from_str(&credentials.token).map_err(|_| JellyfinError::InvalidCredentials("token"))?,
+            HeaderValue::from_str(&credentials.token)
+                .map_err(|_| JellyfinError::InvalidCredentials("token"))?,
         );
-        headers.insert(
-            "X-Emby-Client",
-            HeaderValue::from_static("media-control"),
-        );
+        headers.insert("X-Emby-Client", HeaderValue::from_static("media-control"));
         headers.insert(
             "X-Emby-Device-Name",
             HeaderValue::from_str(&hostname).map_err(|_| JellyfinError::HostnameError)?,
@@ -388,7 +388,14 @@ impl JellyfinClient {
     /// Returns an error if the HTTP request fails.
     pub async fn fetch_sessions(&self) -> Result<Vec<Session>> {
         let url = format!("{}/Sessions", self.server_url);
-        let sessions = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let sessions = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(sessions)
     }
 
@@ -402,10 +409,7 @@ impl JellyfinClient {
         let mpv_sessions: Vec<_> = sessions
             .into_iter()
             .filter(|s| s.client != "media-control")
-            .filter(|s| {
-                s.device_id == self.device_id
-                    || s.client.to_lowercase().contains("mpv")
-            })
+            .filter(|s| s.device_id == self.device_id || s.client.to_lowercase().contains("mpv"))
             .collect();
 
         // Prefer Rust shim (client="mpv-shim") over legacy Python shim
@@ -458,18 +462,14 @@ impl JellyfinClient {
     /// Mark the currently playing item as watched.
     pub async fn mark_current_watched(&self) -> Result<()> {
         let session = self.require_mpv_session().await?;
-        let item = session
-            .current_item()
-            .ok_or(JellyfinError::NoPlayingItem)?;
+        let item = session.current_item().ok_or(JellyfinError::NoPlayingItem)?;
         self.mark_watched(&item.id).await
     }
 
     /// Mark the current item as watched and stop playback.
     pub async fn mark_watched_and_stop(&self) -> Result<()> {
         let session = self.require_mpv_session().await?;
-        let item = session
-            .current_item()
-            .ok_or(JellyfinError::NoPlayingItem)?;
+        let item = session.current_item().ok_or(JellyfinError::NoPlayingItem)?;
         let item_id = item.id.clone();
 
         self.mark_watched(&item_id).await?;
@@ -487,7 +487,14 @@ impl JellyfinClient {
             self.server_url, series_id, self.user_id
         );
 
-        let response: NextUpResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let response: NextUpResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(response.items.into_iter().next().map(|item| item.id))
     }
 
@@ -501,7 +508,14 @@ impl JellyfinClient {
             self.server_url, self.user_id
         );
 
-        let response: NextUpResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let response: NextUpResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(response.items.into_iter().next().map(|item| item.id))
     }
 
@@ -514,7 +528,14 @@ impl JellyfinClient {
             self.server_url, self.user_id, item_id
         );
 
-        let response: ItemDetail = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let response: ItemDetail = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(response
             .user_data
             .map(|ud| ud.playback_position_ticks)
@@ -585,7 +606,12 @@ impl JellyfinClient {
         };
 
         let url = format!("{}/Sessions/{}/Command/Play", self.server_url, session_id);
-        self.client.post(&url).json(&command).send().await?.error_for_status()?;
+        self.client
+            .post(&url)
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -615,9 +641,10 @@ impl JellyfinClient {
         let current_idx = queue.iter().position(|item| item.id == current_item_id);
 
         match current_idx {
-            Some(idx) if idx + 1 < queue.len() => {
-                queue[idx + 1..].iter().map(|item| item.id.clone()).collect()
-            }
+            Some(idx) if idx + 1 < queue.len() => queue[idx + 1..]
+                .iter()
+                .map(|item| item.id.clone())
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -642,9 +669,7 @@ impl JellyfinClient {
     /// Mark the current item as watched and advance to the next in queue.
     pub async fn mark_watched_and_next(&self) -> Result<()> {
         let session = self.require_mpv_session().await?;
-        let item = session
-            .current_item()
-            .ok_or(JellyfinError::NoPlayingItem)?;
+        let item = session.current_item().ok_or(JellyfinError::NoPlayingItem)?;
 
         let item_id = item.id.clone();
         let series_id = item.series_id.clone();
@@ -662,10 +687,10 @@ impl JellyfinClient {
         }
 
         // Queue empty — use NextUp API to find the next episode in the series
-        if let Some(sid) = series_id {
-            if let Ok(Some(next_id)) = self.get_next_up(&sid).await {
-                return self.play_item(&session_id, &next_id).await;
-            }
+        if let Some(sid) = series_id
+            && let Ok(Some(next_id)) = self.get_next_up(&sid).await
+        {
+            return self.play_item(&session_id, &next_id).await;
         }
 
         Ok(())
@@ -676,14 +701,28 @@ impl JellyfinClient {
     /// Used by strategy code that needs to check for BoxSet ancestors.
     pub async fn fetch_ancestors_raw(&self, item_id: &str) -> Result<Vec<serde_json::Value>> {
         let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
-        let ancestors = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let ancestors = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(ancestors)
     }
 
     /// Get the library that an item belongs to via the Ancestors API.
     pub async fn get_item_library(&self, item_id: &str) -> Result<Option<LibraryInfo>> {
         let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
-        let ancestors: Vec<AncestorItem> = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let ancestors: Vec<AncestorItem> = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
 
         Ok(ancestors.into_iter().find_map(|a| {
             if a.item_type == "CollectionFolder" {
@@ -724,7 +763,14 @@ impl JellyfinClient {
             url.push_str(&format!("&ExcludeItemIds={}", exc));
         }
 
-        let response: ItemsResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let response: ItemsResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(response.items)
     }
 
@@ -737,7 +783,14 @@ impl JellyfinClient {
             self.server_url, self.user_id, collection_id
         );
 
-        let response: ItemsResponse = self.client.get(&url).send().await?.error_for_status()?.json().await?;
+        let response: ItemsResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(response.items)
     }
 
@@ -869,10 +922,18 @@ mod tests {
             now_playing_item: None,
             play_state: None,
             now_playing_queue: vec![
-                QueueItem { id: "a".to_string() },
-                QueueItem { id: "b".to_string() },
-                QueueItem { id: "c".to_string() },
-                QueueItem { id: "d".to_string() },
+                QueueItem {
+                    id: "a".to_string(),
+                },
+                QueueItem {
+                    id: "b".to_string(),
+                },
+                QueueItem {
+                    id: "c".to_string(),
+                },
+                QueueItem {
+                    id: "d".to_string(),
+                },
             ],
             now_playing_queue_full_items: Vec::new(),
         };
@@ -951,8 +1012,14 @@ mod tests {
         assert_eq!(response.play_session_id, "play-session-123");
         assert_eq!(response.media_sources.len(), 1);
         assert_eq!(response.media_sources[0].id, "media-source-456");
-        assert_eq!(response.media_sources[0].default_audio_stream_index, Some(1));
-        assert_eq!(response.media_sources[0].default_subtitle_stream_index, Some(2));
+        assert_eq!(
+            response.media_sources[0].default_audio_stream_index,
+            Some(1)
+        );
+        assert_eq!(
+            response.media_sources[0].default_subtitle_stream_index,
+            Some(2)
+        );
     }
 
     #[test]
@@ -1000,7 +1067,10 @@ mod tests {
         assert_eq!(response.items[0].id, "item1");
         assert_eq!(response.items[0].name, "Episode 1");
         assert_eq!(response.items[0].index_number, Some(1));
-        assert_eq!(response.items[1].date_created.as_deref(), Some("2026-03-16T10:00:00Z"));
+        assert_eq!(
+            response.items[1].date_created.as_deref(),
+            Some("2026-03-16T10:00:00Z")
+        );
     }
 
     #[test]
@@ -1024,7 +1094,10 @@ mod tests {
         }"#;
         let detail: ItemDetail = serde_json::from_str(json).unwrap();
         assert_eq!(detail.id, "abc123");
-        assert_eq!(detail.user_data.unwrap().playback_position_ticks, 54321000000);
+        assert_eq!(
+            detail.user_data.unwrap().playback_position_ticks,
+            54321000000
+        );
     }
 
     #[test]

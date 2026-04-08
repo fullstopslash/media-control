@@ -23,13 +23,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::fs;
 
-use super::{get_suppress_file_path, restore_focus, suppress_avoider, CommandContext};
+use super::{CommandContext, get_suppress_file_path, restore_focus, suppress_avoider};
 use crate::error::Result;
 use crate::hyprland::Client;
 use crate::window::MediaWindow;
 
 /// Check if two rectangles overlap.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn rectangles_overlap(
     x1: i32,
     y1: i32,
@@ -60,7 +61,11 @@ struct PositionPair {
 ///
 /// Returns primary and secondary positions for mouseover toggle behavior.
 /// Looks up config overrides by focused_class (case-insensitive) and/or title (regex).
-fn get_position_pair(ctx: &CommandContext, focused_class: &str, focused_title: &str) -> PositionPair {
+fn get_position_pair(
+    ctx: &CommandContext,
+    focused_class: &str,
+    focused_title: &str,
+) -> PositionPair {
     let positions = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
     let resolve = |name: &str| super::resolve_effective_position(ctx, name);
@@ -73,16 +78,24 @@ fn get_position_pair(ctx: &CommandContext, focused_class: &str, focused_title: &
 
     // Check for class/title override (case-insensitive class, regex title)
     if let Some(override_cfg) = positioning.get_override(focused_class, focused_title) {
-        let primary_x = override_cfg.pref_x.as_ref()
+        let primary_x = override_cfg
+            .pref_x
+            .as_ref()
             .and_then(|s| resolve(s))
             .unwrap_or(default_primary_x);
-        let primary_y = override_cfg.pref_y.as_ref()
+        let primary_y = override_cfg
+            .pref_y
+            .as_ref()
             .and_then(|s| resolve(s))
             .unwrap_or(default_primary_y);
-        let secondary_x = override_cfg.secondary_x.as_ref()
+        let secondary_x = override_cfg
+            .secondary_x
+            .as_ref()
             .and_then(|s| resolve(s))
             .unwrap_or(default_secondary_x);
-        let secondary_y = override_cfg.secondary_y.as_ref()
+        let secondary_y = override_cfg
+            .secondary_y
+            .as_ref()
             .and_then(|s| resolve(s))
             .unwrap_or(default_secondary_y);
 
@@ -313,10 +326,7 @@ fn classify_case<'a>(
             // Mouseover: find previous window to determine toggle positions
             let prev_window = find_previous_focus(clients, focused.workspace_id, ctx)
                 .and_then(|addr| clients.iter().find(|c| c.address == addr));
-            return match prev_window {
-                Some(prev) => Some(AvoidCase::MouseoverToggle { prev_window: prev }),
-                None => None, // Empty workspace with only pinned media — don't interfere
-            };
+            return prev_window.map(|prev| AvoidCase::MouseoverToggle { prev_window: prev });
         }
         return Some(AvoidCase::MoveToPrimary);
     }
@@ -358,10 +368,15 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
 
     tracing::debug!(
         "avoid: focused={} is_media={} fullscreen={} single_ws={} media_count={}",
-        focused.class, focused.is_media, focused.fullscreen, is_single_workspace, media_windows.len()
+        focused.class,
+        focused.is_media,
+        focused.fullscreen,
+        is_single_workspace,
+        media_windows.len()
     );
 
-    let Some(case) = classify_case(&focused, is_single_workspace, &media_windows, &clients, ctx) else {
+    let Some(case) = classify_case(&focused, is_single_workspace, &media_windows, &clients, ctx)
+    else {
         tracing::debug!("avoid: no action needed");
         return Ok(());
     };
@@ -412,16 +427,30 @@ async fn handle_move_to_primary(
         if focused.floating {
             if at_primary {
                 let overlaps = rectangles_overlap(
-                    window.x, window.y, window.width, window.height,
-                    focused.x, focused.y, focused.width, focused.height,
+                    window.x,
+                    window.y,
+                    window.width,
+                    window.height,
+                    focused.x,
+                    focused.y,
+                    focused.width,
+                    focused.height,
                 );
                 if overlaps {
                     tracing::debug!(
                         "avoid: at primary but overlapping floating focused, moving to secondary ({}, {})",
-                        pair.secondary_x, pair.secondary_y
+                        pair.secondary_x,
+                        pair.secondary_y
                     );
-                    move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
-                        .await?;
+                    move_media_window(
+                        ctx,
+                        &window.address,
+                        pair.secondary_x,
+                        pair.secondary_y,
+                        pair.width,
+                        pair.height,
+                    )
+                    .await?;
                     continue;
                 }
             } else {
@@ -429,16 +458,30 @@ async fn handle_move_to_primary(
                 let media_w = pair.width.unwrap_or(ew);
                 let media_h = pair.height.unwrap_or(eh);
                 let primary_overlaps = rectangles_overlap(
-                    pair.primary_x, pair.primary_y, media_w, media_h,
-                    focused.x, focused.y, focused.width, focused.height,
+                    pair.primary_x,
+                    pair.primary_y,
+                    media_w,
+                    media_h,
+                    focused.x,
+                    focused.y,
+                    focused.width,
+                    focused.height,
                 );
                 if primary_overlaps {
                     tracing::debug!(
                         "avoid: primary would overlap floating focused, moving to secondary ({}, {})",
-                        pair.secondary_x, pair.secondary_y
+                        pair.secondary_x,
+                        pair.secondary_y
                     );
-                    move_media_window(ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height)
-                        .await?;
+                    move_media_window(
+                        ctx,
+                        &window.address,
+                        pair.secondary_x,
+                        pair.secondary_y,
+                        pair.width,
+                        pair.height,
+                    )
+                    .await?;
                     continue;
                 }
             }
@@ -446,9 +489,20 @@ async fn handle_move_to_primary(
 
         // Default: move to primary (or stay if already there)
         if !at_primary {
-            tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
-            move_media_window(ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height)
-                .await?;
+            tracing::debug!(
+                "avoid: moving to primary ({}, {})",
+                pair.primary_x,
+                pair.primary_y
+            );
+            move_media_window(
+                ctx,
+                &window.address,
+                pair.primary_x,
+                pair.primary_y,
+                pair.width,
+                pair.height,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -475,7 +529,15 @@ async fn handle_mouseover_toggle(
     if !within_tolerance(focused.x, target_x, tolerance)
         || !within_tolerance(focused.y, target_y, tolerance)
     {
-        move_media_window(ctx, focused.address, target_x, target_y, pair.width, pair.height).await?;
+        move_media_window(
+            ctx,
+            focused.address,
+            target_x,
+            target_y,
+            pair.width,
+            pair.height,
+        )
+        .await?;
     }
 
     // Restore focus so subsequent mouseovers trigger new events
@@ -497,8 +559,14 @@ async fn handle_mouseover_geometry(
             && c.mapped
             && !c.hidden
             && rectangles_overlap(
-                focused.x, focused.y, focused.width, focused.height,
-                c.at[0], c.at[1], c.size[0], c.size[1],
+                focused.x,
+                focused.y,
+                focused.width,
+                focused.height,
+                c.at[0],
+                c.at[1],
+                c.size[0],
+                c.size[1],
             )
     });
 
@@ -516,13 +584,16 @@ async fn handle_mouseover_geometry(
             && c.mapped
             && !c.hidden
             && rectangles_overlap(
-                target_x, target_y, media_w, media_h,
-                c.at[0], c.at[1], c.size[0], c.size[1],
+                target_x, target_y, media_w, media_h, c.at[0], c.at[1], c.size[0], c.size[1],
             )
     });
 
     if target_overlaps {
-        tracing::debug!("avoid: target ({}, {}) also overlaps, skipping", target_x, target_y);
+        tracing::debug!(
+            "avoid: target ({}, {}) also overlaps, skipping",
+            target_x,
+            target_y
+        );
         return Ok(());
     }
 
@@ -546,22 +617,43 @@ async fn handle_geometry_overlap(
 
     for window in media_windows {
         if rectangles_overlap(
-            window.x, window.y, window.width, window.height,
-            focused.x, focused.y, focused.width, focused.height,
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+            focused.x,
+            focused.y,
+            focused.width,
+            focused.height,
         ) {
-            let (target_x, target_y) = calculate_target_position(ctx, window.x, window.y, focused.width);
+            let (target_x, target_y) =
+                calculate_target_position(ctx, window.x, window.y, focused.width);
 
             // Verify the target position doesn't also overlap with the focused window.
             // Without this check, the avoider bounces the window back and forth.
             if rectangles_overlap(
-                target_x, target_y, media_w, media_h,
-                focused.x, focused.y, focused.width, focused.height,
+                target_x,
+                target_y,
+                media_w,
+                media_h,
+                focused.x,
+                focused.y,
+                focused.width,
+                focused.height,
             ) {
-                tracing::debug!("avoid: target ({}, {}) also overlaps, skipping", target_x, target_y);
+                tracing::debug!(
+                    "avoid: target ({}, {}) also overlaps, skipping",
+                    target_x,
+                    target_y
+                );
                 return Ok(());
             }
 
-            tracing::debug!("avoid: overlap detected, moving to ({}, {})", target_x, target_y);
+            tracing::debug!(
+                "avoid: overlap detected, moving to ({}, {})",
+                target_x,
+                target_y
+            );
             move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
             return Ok(());
         }
@@ -576,7 +668,8 @@ async fn handle_fullscreen_nonmedia(
     media_windows: &[MediaWindow],
 ) -> Result<()> {
     for window in media_windows {
-        let (target_x, target_y) = calculate_target_position(ctx, window.x, window.y, focused.width);
+        let (target_x, target_y) =
+            calculate_target_position(ctx, window.x, window.y, focused.width);
         move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
     }
     Ok(())
@@ -633,12 +726,30 @@ mod tests {
     fn scenario_single_workspace(mpv_at: [i32; 2]) -> String {
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, mpv_at, [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                mpv_at,
+                [640, 360],
             ),
         ];
         make_clients_json(&clients)
@@ -651,12 +762,30 @@ mod tests {
         // mpv at [0, 0], firefox at [0, 400] with small size (doesn't overlap primary)
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 400], [800, 300],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 400],
+                [800, 300],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [0, 0], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [640, 360],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -680,12 +809,30 @@ mod tests {
         // mpv at primary, firefox small and not overlapping primary
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [800, 600],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [1272, 712], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -696,7 +843,10 @@ mod tests {
 
         let cmds = mock.captured_commands().await;
         let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
-        assert!(!has_move, "should not move when at primary with no overlap: {cmds:?}");
+        assert!(
+            !has_move,
+            "should not move when at primary with no overlap: {cmds:?}"
+        );
     }
 
     #[tokio::test]
@@ -706,12 +856,30 @@ mod tests {
         // mpv at primary (1272, 712), floating firefox focused and overlapping that position
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, true, // floating!
-                0, 1, 0, 0, [900, 500], [1020, 580], // overlaps primary position
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                true, // floating!
+                0,
+                1,
+                0,
+                0,
+                [900, 500],
+                [1020, 580], // overlaps primary position
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [1272, 712], [640, 360], // at primary
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360], // at primary
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -722,10 +890,16 @@ mod tests {
 
         let cmds = mock.captured_commands().await;
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
-        assert!(batch.is_some(), "should move when primary overlaps focused: {cmds:?}");
+        assert!(
+            batch.is_some(),
+            "should move when primary overlaps focused: {cmds:?}"
+        );
         let batch = batch.unwrap();
         // Should move to secondary (x_left=48) instead of staying at primary
-        assert!(batch.contains("48"), "expected secondary x_left=48: {batch}");
+        assert!(
+            batch.contains("48"),
+            "expected secondary x_left=48: {batch}"
+        );
     }
 
     #[tokio::test]
@@ -735,12 +909,30 @@ mod tests {
         // mpv at some random position, floating firefox overlaps the primary position
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, true, // floating!
-                0, 1, 0, 0, [900, 500], [1020, 580], // overlaps primary (1272, 712)
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                true, // floating!
+                0,
+                1,
+                0,
+                0,
+                [900, 500],
+                [1020, 580], // overlaps primary (1272, 712)
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [500, 300], [640, 360], // not at primary
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [500, 300],
+                [640, 360], // not at primary
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -753,7 +945,10 @@ mod tests {
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
         assert!(batch.is_some(), "should move to secondary: {cmds:?}");
         let batch = batch.unwrap();
-        assert!(batch.contains("48"), "expected secondary x_left=48: {batch}");
+        assert!(
+            batch.contains("48"),
+            "expected secondary x_left=48: {batch}"
+        );
     }
 
     #[tokio::test]
@@ -763,12 +958,30 @@ mod tests {
         // Firefox is fullscreen
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                2, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                2,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [0, 0], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [640, 360],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -779,7 +992,10 @@ mod tests {
 
         let cmds = mock.captured_commands().await;
         let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
-        assert!(!has_move, "should not move when focused is fullscreen (case 1)");
+        assert!(
+            !has_move,
+            "should not move when focused is fullscreen (case 1)"
+        );
     }
 
     #[tokio::test]
@@ -791,12 +1007,30 @@ mod tests {
         // Single workspace (only 1 non-media window)
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 1, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 0, [1272, 712], [640, 360], // at primary (default x_right, y_bottom)
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                0,
+                [1272, 712],
+                [640, 360], // at primary (default x_right, y_bottom)
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -810,7 +1044,10 @@ mod tests {
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
         assert!(batch.is_some(), "expected move for toggle: {cmds:?}");
         let batch = batch.unwrap();
-        assert!(batch.contains("48"), "expected x_left=48 in toggle: {batch}");
+        assert!(
+            batch.contains("48"),
+            "expected x_left=48 in toggle: {batch}"
+        );
 
         // Should also restore focus to firefox
         let focus_cmd = cmds.iter().find(|c| c.contains("focuswindow"));
@@ -827,8 +1064,17 @@ mod tests {
 
         // Only mpv on workspace, no previous focus candidate
         let clients = vec![make_test_client_full(
-            "0xmpv", "mpv", "video.mp4", true, true,
-            0, 1, 0, 0, [1272, 712], [640, 360],
+            "0xmpv",
+            "mpv",
+            "video.mp4",
+            true,
+            true,
+            0,
+            1,
+            0,
+            0,
+            [1272, 712],
+            [640, 360],
         )];
         mock.set_response("j/clients", &make_clients_json(&clients))
             .await;
@@ -849,16 +1095,43 @@ mod tests {
         // Firefox focused, overlapping with mpv
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [900, 500], [800, 600], // overlaps mpv
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [900, 500],
+                [800, 600], // overlaps mpv
             ),
             make_test_client_full(
-                "0xkitty", "kitty", "Terminal", false, false,
-                0, 1, 0, 2, [0, 0], [800, 600],
+                "0xkitty",
+                "kitty",
+                "Terminal",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [1272, 712], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -879,16 +1152,43 @@ mod tests {
         // Multi-workspace: 2 non-media windows + mpv, no overlap
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [800, 600],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xkitty", "kitty", "Terminal", false, false,
-                0, 1, 0, 2, [0, 600], [800, 400],
+                "0xkitty",
+                "kitty",
+                "Terminal",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [0, 600],
+                [800, 400],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [1272, 712], [640, 360], // far away, no overlap
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360], // far away, no overlap
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -908,8 +1208,17 @@ mod tests {
 
         // No window has focus_history_id == 0
         let clients = vec![make_test_client_full(
-            "0xmpv", "mpv", "video.mp4", true, true,
-            0, 1, 0, 5, [100, 100], [640, 360],
+            "0xmpv",
+            "mpv",
+            "video.mp4",
+            true,
+            true,
+            0,
+            1,
+            0,
+            5,
+            [100, 100],
+            [640, 360],
         )];
         mock.set_response("j/clients", &make_clients_json(&clients))
             .await;
@@ -927,8 +1236,17 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xfirefox", "firefox", "Browser", false, false,
-            0, 1, 0, 0, [0, 0], [1920, 1080],
+            "0xfirefox",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
         )];
         mock.set_response("j/clients", &make_clients_json(&clients))
             .await;
@@ -963,16 +1281,25 @@ mod tests {
             .as_millis() as u64;
         let elapsed = current.saturating_sub(timestamp_ms);
 
-        assert!(elapsed < 60_000, "timestamp should be recent: elapsed={elapsed}ms");
+        assert!(
+            elapsed < 60_000,
+            "timestamp should be recent: elapsed={elapsed}ms"
+        );
         assert!(elapsed < 150, "should be within default suppress_ms");
     }
 
     #[tokio::test]
     async fn should_suppress_with_stale_timestamp() {
         // Timestamp of 0 is always stale
-        assert!(!should_suppress(150).await || true, "stale or missing file should not suppress");
+        assert!(
+            !should_suppress(150).await || true,
+            "stale or missing file should not suppress"
+        );
         // The real test: with 0ms timeout, nothing is suppressed
-        assert!(!should_suppress(0).await, "0ms timeout means never suppress");
+        assert!(
+            !should_suppress(0).await,
+            "0ms timeout means never suppress"
+        );
     }
 
     #[tokio::test]
@@ -1002,6 +1329,9 @@ mod tests {
         assert!(batch.is_some(), "expected move with override: {cmds:?}");
         let batch = batch.unwrap();
         // Should use x_left=48, y_top=48 from override
-        assert!(batch.contains("48"), "expected x_left=48 from override: {batch}");
+        assert!(
+            batch.contains("48"),
+            "expected x_left=48 from override: {batch}"
+        );
     }
 }

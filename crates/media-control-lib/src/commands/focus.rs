@@ -25,7 +25,7 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use super::{get_media_window, suppress_avoider, CommandContext};
+use super::{CommandContext, get_media_window, suppress_avoider};
 use crate::error::Result;
 
 /// Focus the media window, or launch a command if no media window exists.
@@ -40,7 +40,7 @@ use crate::error::Result;
 ///
 /// * `ctx` - The command context
 /// * `launch_cmd` - Optional command to run if no media window is found.
-///                  The command is executed via `sh -c` for shell expansion.
+///   The command is executed via `sh -c` for shell expansion.
 ///
 /// # Returns
 ///
@@ -110,15 +110,34 @@ mod tests {
 
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [1272, 712], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         let result = focus_or_launch(&ctx, None).await.unwrap();
@@ -134,10 +153,20 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xfirefox", "firefox", "Browser", false, false,
-            0, 1, 0, 0, [0, 0], [1920, 1080],
+            "0xfirefox",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         let result = focus_or_launch(&ctx, None).await.unwrap();

@@ -333,11 +333,15 @@ impl Positioning {
     /// Returns the first matching override, or None if no match.
     ///
     /// Regexes are compiled lazily on first use and cached for subsequent calls.
-    pub fn get_override(&self, focused_class: &str, focused_title: &str) -> Option<&PositionOverride> {
+    pub fn get_override(
+        &self,
+        focused_class: &str,
+        focused_title: &str,
+    ) -> Option<&PositionOverride> {
         self.overrides.iter().find(|o| {
             // Check class match (if specified, case-insensitive)
-            let class_matches = o.focused_class.is_empty()
-                || o.focused_class.eq_ignore_ascii_case(focused_class);
+            let class_matches =
+                o.focused_class.is_empty() || o.focused_class.eq_ignore_ascii_case(focused_class);
 
             // Check title match (if specified, using cached regex)
             let title_matches = o.matches_title(focused_title);
@@ -422,7 +426,9 @@ impl PositionOverride {
         if self.focused_title.is_empty() {
             true
         } else {
-            self.title_regex().map(|re| re.is_match(title)).unwrap_or(false)
+            self.title_regex()
+                .map(|re| re.is_match(title))
+                .unwrap_or(false)
         }
     }
 }
@@ -629,7 +635,9 @@ pref_x = "x_left"
         let config: Config = toml::from_str(config_with_title).expect("failed to parse config");
 
         // Match by title regex (Unicode)
-        let claude = config.positioning.get_override("kitty", "✳ Claude Config Issue");
+        let claude = config
+            .positioning
+            .get_override("kitty", "✳ Claude Config Issue");
         assert!(claude.is_some(), "Should match title with ✳");
         assert_eq!(claude.unwrap().pref_x.as_deref(), Some("x_left"));
 
@@ -712,15 +720,24 @@ pref_x = "x_left"
 
         // Both match
         let result = config.positioning.get_override("kitty", "Special Terminal");
-        assert!(result.is_some(), "should match when both class and title match");
+        assert!(
+            result.is_some(),
+            "should match when both class and title match"
+        );
 
         // Class matches, title doesn't
         let result = config.positioning.get_override("kitty", "Regular Terminal");
-        assert!(result.is_none(), "should not match when title doesn't match");
+        assert!(
+            result.is_none(),
+            "should not match when title doesn't match"
+        );
 
         // Title matches, class doesn't
         let result = config.positioning.get_override("firefox", "Special Page");
-        assert!(result.is_none(), "should not match when class doesn't match");
+        assert!(
+            result.is_none(),
+            "should not match when class doesn't match"
+        );
     }
 
     #[test]
@@ -733,10 +750,16 @@ pref_x = "x_left"
         let config: Config = toml::from_str(config_str).expect("parse");
 
         let result = config.positioning.get_override("firefox", "any title here");
-        assert!(result.is_some(), "class-only override should match any title");
+        assert!(
+            result.is_some(),
+            "class-only override should match any title"
+        );
 
         let result = config.positioning.get_override("firefox", "");
-        assert!(result.is_some(), "class-only override should match empty title");
+        assert!(
+            result.is_some(),
+            "class-only override should match empty title"
+        );
     }
 
     #[test]
@@ -748,7 +771,12 @@ pref_x = "x_left"
 "#;
         let config: Config = toml::from_str(config_str).expect("parse");
 
-        let result = config.positioning.get_override("anything", "Special Window");
-        assert!(result.is_some(), "title-only override should match any class");
+        let result = config
+            .positioning
+            .get_override("anything", "Special Window");
+        assert!(
+            result.is_some(),
+            "title-only override should match any class"
+        );
     }
 }

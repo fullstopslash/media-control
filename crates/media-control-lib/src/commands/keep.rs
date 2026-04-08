@@ -3,7 +3,7 @@
 //! Sends `script-message keep` to the shim via the standard IPC path.
 //! The Rust shim routes the command to the active store plugin internally.
 
-use super::{require_mpv_window, send_mpv_script_message, CommandContext};
+use super::{CommandContext, require_mpv_window, send_mpv_script_message};
 use crate::error::Result;
 
 /// Tag the current item as "keep".

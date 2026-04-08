@@ -5,7 +5,7 @@
 //! - `<store-name>`: switch to that store and play its next-up (twitch, jellyfin, pinchflat, etc.)
 //! - `<item-id>`: play a specific item by hex ID (shim auto-detects store)
 
-use super::{send_mpv_script_message, send_mpv_script_message_with_args, CommandContext};
+use super::{CommandContext, send_mpv_script_message, send_mpv_script_message_with_args};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -16,7 +16,7 @@
 //! # }
 //! ```
 
-use super::{get_media_window, suppress_avoider, CommandContext};
+use super::{CommandContext, get_media_window, suppress_avoider};
 use crate::error::Result;
 
 /// Movement direction using vim-style keys.
@@ -78,16 +78,16 @@ impl Direction {
     /// use media_control_lib::commands::move_window::Direction;
     ///
     /// // Vim-style keys
-    /// assert_eq!(Direction::from_str("h"), Some(Direction::Left));
-    /// assert_eq!(Direction::from_str("l"), Some(Direction::Right));
+    /// assert_eq!(Direction::parse("h"), Some(Direction::Left));
+    /// assert_eq!(Direction::parse("l"), Some(Direction::Right));
     ///
     /// // Intuitive names (case-insensitive)
-    /// assert_eq!(Direction::from_str("left"), Some(Direction::Left));
-    /// assert_eq!(Direction::from_str("RIGHT"), Some(Direction::Right));
-    /// assert_eq!(Direction::from_str("Up"), Some(Direction::Up));
+    /// assert_eq!(Direction::parse("left"), Some(Direction::Left));
+    /// assert_eq!(Direction::parse("RIGHT"), Some(Direction::Right));
+    /// assert_eq!(Direction::parse("Up"), Some(Direction::Up));
     /// ```
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         // Try intuitive names first (case-insensitive)
         match s.to_lowercase().as_str() {
             "left" => Some(Self::Left),
@@ -173,9 +173,7 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
         window.address
     );
 
-    ctx.hyprland
-        .batch(&[&move_cmd, &resize_cmd])
-        .await?;
+    ctx.hyprland.batch(&[&move_cmd, &resize_cmd]).await?;
 
     // Suppress avoider to prevent immediate repositioning
     let _ = suppress_avoider().await;
@@ -205,37 +203,37 @@ mod tests {
 
     #[test]
     fn direction_from_str_valid() {
-        assert_eq!(Direction::from_str("h"), Some(Direction::Left));
-        assert_eq!(Direction::from_str("j"), Some(Direction::Down));
-        assert_eq!(Direction::from_str("k"), Some(Direction::Up));
-        assert_eq!(Direction::from_str("l"), Some(Direction::Right));
+        assert_eq!(Direction::parse("h"), Some(Direction::Left));
+        assert_eq!(Direction::parse("j"), Some(Direction::Down));
+        assert_eq!(Direction::parse("k"), Some(Direction::Up));
+        assert_eq!(Direction::parse("l"), Some(Direction::Right));
     }
 
     #[test]
     fn direction_from_str_intuitive_names() {
-        assert_eq!(Direction::from_str("left"), Some(Direction::Left));
-        assert_eq!(Direction::from_str("right"), Some(Direction::Right));
-        assert_eq!(Direction::from_str("up"), Some(Direction::Up));
-        assert_eq!(Direction::from_str("down"), Some(Direction::Down));
+        assert_eq!(Direction::parse("left"), Some(Direction::Left));
+        assert_eq!(Direction::parse("right"), Some(Direction::Right));
+        assert_eq!(Direction::parse("up"), Some(Direction::Up));
+        assert_eq!(Direction::parse("down"), Some(Direction::Down));
     }
 
     #[test]
     fn direction_from_str_case_insensitive() {
-        assert_eq!(Direction::from_str("LEFT"), Some(Direction::Left));
-        assert_eq!(Direction::from_str("Right"), Some(Direction::Right));
-        assert_eq!(Direction::from_str("UP"), Some(Direction::Up));
-        assert_eq!(Direction::from_str("DoWn"), Some(Direction::Down));
+        assert_eq!(Direction::parse("LEFT"), Some(Direction::Left));
+        assert_eq!(Direction::parse("Right"), Some(Direction::Right));
+        assert_eq!(Direction::parse("UP"), Some(Direction::Up));
+        assert_eq!(Direction::parse("DoWn"), Some(Direction::Down));
     }
 
     #[test]
     fn direction_from_str_vim_fallback() {
         // Single vim-style characters still work
-        assert_eq!(Direction::from_str("hjkl"), Some(Direction::Left)); // 'h' is first
+        assert_eq!(Direction::parse("hjkl"), Some(Direction::Left)); // 'h' is first
     }
 
     #[test]
     fn direction_from_str_empty() {
-        assert_eq!(Direction::from_str(""), None);
+        assert_eq!(Direction::parse(""), None);
     }
 
     #[test]
@@ -278,12 +276,30 @@ mod tests {
     fn mpv_at(x: i32, y: i32) -> String {
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [x, y], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [x, y],
+                [640, 360],
             ),
         ];
         make_clients_json(&clients)
@@ -300,7 +316,10 @@ mod tests {
         let cmds = mock.captured_commands().await;
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
         // x_left=48, keep current y=712
-        assert!(batch.contains("exact 48 712"), "expected x_left=48, y=712: {batch}");
+        assert!(
+            batch.contains("exact 48 712"),
+            "expected x_left=48, y=712: {batch}"
+        );
         assert!(batch.contains("resizewindowpixel"), "should also resize");
     }
 
@@ -315,7 +334,10 @@ mod tests {
         let cmds = mock.captured_commands().await;
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
         // x_right=1272, keep current y=712
-        assert!(batch.contains("exact 1272 712"), "expected x_right=1272, y=712: {batch}");
+        assert!(
+            batch.contains("exact 1272 712"),
+            "expected x_right=1272, y=712: {batch}"
+        );
     }
 
     #[tokio::test]
@@ -329,7 +351,10 @@ mod tests {
         let cmds = mock.captured_commands().await;
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
         // keep current x=1272, y_top=48
-        assert!(batch.contains("exact 1272 48"), "expected x=1272, y_top=48: {batch}");
+        assert!(
+            batch.contains("exact 1272 48"),
+            "expected x=1272, y_top=48: {batch}"
+        );
     }
 
     #[tokio::test]
@@ -343,22 +368,38 @@ mod tests {
         let cmds = mock.captured_commands().await;
         let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
         // keep current x=1272, y_bottom=712
-        assert!(batch.contains("exact 1272 712"), "expected x=1272, y_bottom=712: {batch}");
+        assert!(
+            batch.contains("exact 1272 712"),
+            "expected x=1272, y_bottom=712: {batch}"
+        );
     }
 
     #[tokio::test]
     async fn move_no_media_window_is_noop() {
         let mock = MockHyprland::start().await;
         let clients = vec![make_test_client_full(
-            "0xfirefox", "firefox", "Browser", false, false,
-            0, 1, 0, 0, [0, 0], [1920, 1080],
+            "0xfirefox",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         move_window(&ctx, Direction::Left).await.unwrap();
 
         let cmds = mock.captured_commands().await;
-        assert!(!cmds.iter().any(|c| c.contains("movewindowpixel")), "should not move: {cmds:?}");
+        assert!(
+            !cmds.iter().any(|c| c.contains("movewindowpixel")),
+            "should not move: {cmds:?}"
+        );
     }
 }

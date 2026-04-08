@@ -1,6 +1,6 @@
 //! mpv seek by absolute percentage.
 
-use super::{require_mpv_window, send_mpv_ipc_command, CommandContext};
+use super::{CommandContext, require_mpv_window, send_mpv_ipc_command};
 use crate::error::Result;
 
 /// Seek to an absolute percentage position in mpv.

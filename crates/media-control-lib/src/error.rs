@@ -178,7 +178,7 @@ impl From<crate::hyprland::HyprlandError> for MediaControlError {
             },
             HyprlandError::CommandFailed(msg) => Self::HyprlandIpc {
                 kind: HyprlandIpcErrorKind::ConnectionFailed,
-                source: Some(std::io::Error::new(std::io::ErrorKind::Other, msg)),
+                source: Some(std::io::Error::other(msg)),
             },
         }
     }
@@ -219,7 +219,10 @@ impl MediaControlError {
     }
 
     /// Create a config parse error.
-    pub fn config_parse(path: impl Into<PathBuf>, source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+    pub fn config_parse(
+        path: impl Into<PathBuf>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
         Self::Config {
             kind: ConfigErrorKind::ParseError,
             path: Some(path.into()),
@@ -272,7 +275,9 @@ impl MediaControlError {
     pub fn mpv_no_socket() -> Self {
         Self::MpvIpc {
             kind: MpvIpcErrorKind::NoSocket,
-            message: "no mpv IPC socket found (tried $MPV_IPC_SOCKET, /tmp/mpv-shim, /tmp/mpvctl-jshim)".into(),
+            message:
+                "no mpv IPC socket found (tried $MPV_IPC_SOCKET, /tmp/mpv-shim, /tmp/mpvctl-jshim)"
+                    .into(),
         }
     }
 
@@ -361,10 +366,19 @@ mod tests {
 
     #[test]
     fn mpv_ipc_error_kind_display() {
-        assert_eq!(MpvIpcErrorKind::NoSocket.to_string(), "no mpv IPC socket found");
+        assert_eq!(
+            MpvIpcErrorKind::NoSocket.to_string(),
+            "no mpv IPC socket found"
+        );
         assert_eq!(MpvIpcErrorKind::Timeout.to_string(), "connection timed out");
-        assert_eq!(MpvIpcErrorKind::ConnectionFailed.to_string(), "connection failed");
-        assert_eq!(MpvIpcErrorKind::ResponseError.to_string(), "mpv returned an error");
+        assert_eq!(
+            MpvIpcErrorKind::ConnectionFailed.to_string(),
+            "connection failed"
+        );
+        assert_eq!(
+            MpvIpcErrorKind::ResponseError.to_string(),
+            "mpv returned an error"
+        );
     }
 
     #[test]

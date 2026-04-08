@@ -4,7 +4,10 @@
 //! (configurable via `positioning.minified_scale`). All positioning and
 //! avoidance rules still apply — just with smaller dimensions.
 
-use super::{effective_dimensions, get_media_window, resolve_effective_position, suppress_avoider, toggle_minified, CommandContext};
+use super::{
+    CommandContext, effective_dimensions, get_media_window, resolve_effective_position,
+    suppress_avoider, toggle_minified,
+};
 use crate::error::Result;
 
 /// Toggle minified mode, resize, and reposition the media window.
@@ -30,8 +33,14 @@ pub async fn minify(ctx: &CommandContext) -> Result<()> {
 
     ctx.hyprland
         .batch(&[
-            &format!("dispatch resizewindowpixel exact {w} {h},address:{}", window.address),
-            &format!("dispatch movewindowpixel exact {target_x} {target_y},address:{}", window.address),
+            &format!(
+                "dispatch resizewindowpixel exact {w} {h},address:{}",
+                window.address
+            ),
+            &format!(
+                "dispatch movewindowpixel exact {target_x} {target_y},address:{}",
+                window.address
+            ),
         ])
         .await?;
 
@@ -40,7 +49,10 @@ pub async fn minify(ctx: &CommandContext) -> Result<()> {
     tracing::debug!(
         "minify: {} ({}x{} at {},{}))",
         if now_minified { "minified" } else { "restored" },
-        w, h, target_x, target_y
+        w,
+        h,
+        target_x,
+        target_y
     );
 
     Ok(())

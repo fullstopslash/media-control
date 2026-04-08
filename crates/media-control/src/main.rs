@@ -217,8 +217,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::fullscreen::fullscreen(&ctx).await?;
         }
         Commands::Move { direction } => {
-            let dir = commands::move_window::Direction::from_str(&direction)
-                .ok_or_else(|| "Direction must be left, right, up, down (or h, j, k, l)")?;
+            let dir = commands::move_window::Direction::parse(&direction)
+                .ok_or("Direction must be left, right, up, down (or h, j, k, l)")?;
             commands::move_window::move_window(&ctx, dir).await?;
         }
         Commands::Close => {

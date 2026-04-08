@@ -3,7 +3,7 @@
 //! Provides chapter navigation commands (next/prev) for mpv playback
 //! using the shared mpv IPC infrastructure.
 
-use super::{require_mpv_window, send_mpv_ipc_command, CommandContext};
+use super::{CommandContext, require_mpv_window, send_mpv_ipc_command};
 use crate::error::Result;
 
 /// Direction for chapter navigation.

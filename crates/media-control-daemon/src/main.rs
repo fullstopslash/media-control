@@ -61,8 +61,8 @@ fn get_fifo_path() -> PathBuf {
 /// Get the path to Hyprland's socket2.
 fn get_socket2_path() -> Result<PathBuf, String> {
     let runtime_dir = env::var("XDG_RUNTIME_DIR").map_err(|_| "XDG_RUNTIME_DIR not set")?;
-    let instance_sig =
-        env::var("HYPRLAND_INSTANCE_SIGNATURE").map_err(|_| "HYPRLAND_INSTANCE_SIGNATURE not set")?;
+    let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .map_err(|_| "HYPRLAND_INSTANCE_SIGNATURE not set")?;
 
     Ok(PathBuf::from(runtime_dir)
         .join("hypr")
@@ -115,7 +115,7 @@ fn create_fifo() -> std::io::Result<PathBuf> {
 
     // Create new FIFO using nix
     nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     info!("Created trigger FIFO at {:?}", path);
     Ok(path)
@@ -161,54 +161,66 @@ async fn fifo_listener(tx: mpsc::Sender<()>) {
     }
 }
 
-/// Run the event loop, listening to Hyprland socket2 events and FIFO triggers.
-#[allow(unused_assignments)] // avoid_in_progress guard is defensive; select! arms don't interleave
-async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
-    // Load config and create context once (reused for all avoid triggers)
-    let config = Config::load().unwrap_or_default();
-    let debounce_ms = config.positioning.debounce_ms;
-    let ctx = CommandContext::with_config(config.clone())?;
-
+/// Connect to Hyprland socket2 with retries and backoff.
+async fn connect_hyprland_socket() -> Result<UnixStream, String> {
     let socket_path = get_socket2_path()?;
-    info!("Connecting to Hyprland socket at {:?}", socket_path);
+    let mut backoff = Duration::from_millis(500);
+    let max_backoff = Duration::from_secs(10);
 
-    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path))
-        .await
-        .map_err(|_| format!("Timed out connecting to Hyprland socket at {socket_path:?}"))??;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path)).await
+        {
+            Ok(Ok(stream)) => {
+                info!("Connected to Hyprland socket at {:?}", socket_path);
+                return Ok(stream);
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Failed to connect to Hyprland socket: {} (retry in {:?})",
+                    e, backoff
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "Timed out connecting to Hyprland socket (retry in {:?})",
+                    backoff
+                );
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+/// Run a single session of the event loop (until socket disconnect).
+/// Returns Ok(true) to signal reconnect, Ok(false) for clean shutdown.
+#[allow(unused_assignments)]
+async fn run_event_session(
+    ctx: &CommandContext,
+    debounce_duration: Duration,
+    fifo_rx: &mut mpsc::Receiver<()>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let stream = connect_hyprland_socket().await?;
     let reader = BufReader::new(stream);
     let mut lines = reader.lines();
 
-    // Create FIFO for manual triggers
-    create_fifo()?;
-
-    // Channel for FIFO triggers
-    let (fifo_tx, mut fifo_rx) = mpsc::channel::<()>(16);
-
-    // Spawn FIFO listener task (supervised via JoinHandle)
-    let mut fifo_handle = tokio::spawn(fifo_listener(fifo_tx));
-
-    // Debounce state
     let mut last_avoid_time = Instant::now();
-    let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
     let mut avoid_in_progress = false;
 
-    info!("Event loop started, listening for Hyprland events and FIFO triggers");
+    info!("Event session started");
 
     loop {
         tokio::select! {
-            // Handle Hyprland socket events
             line_result = lines.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
-                        // Parse event: "eventname>>data"
                         let (event, _data) = line.split_once(">>").unwrap_or((&line, ""));
 
-                        // Events that trigger avoidance
                         match event {
                             "workspace" | "activewindow" | "movewindow" | "openwindow" | "closewindow" | "swapwindow" => {
                                 if !avoid_in_progress && last_avoid_time.elapsed() >= debounce_duration {
                                     avoid_in_progress = true;
-                                    trigger_avoid(&ctx).await;
+                                    trigger_avoid(ctx).await;
                                     last_avoid_time = Instant::now();
                                     avoid_in_progress = false;
                                 }
@@ -217,40 +229,67 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Ok(None) => {
-                        info!("Hyprland socket closed");
-                        break;
+                        warn!("Hyprland socket closed, will reconnect");
+                        return Ok(true);
                     }
                     Err(e) => {
-                        error!("Error reading from Hyprland socket: {}", e);
-                        break;
+                        error!("Hyprland socket read error: {}, will reconnect", e);
+                        return Ok(true);
                     }
                 }
             }
 
-            // Handle FIFO triggers (for togglesplit etc.)
             Some(()) = fifo_rx.recv() => {
                 if !avoid_in_progress && last_avoid_time.elapsed() >= debounce_duration {
                     debug!("Processing FIFO trigger");
                     avoid_in_progress = true;
-                    trigger_avoid(&ctx).await;
+                    trigger_avoid(ctx).await;
                     last_avoid_time = Instant::now();
                     avoid_in_progress = false;
                 }
             }
+        }
+    }
+}
 
-            // Supervise FIFO listener: log and break if it exits unexpectedly
-            result = &mut fifo_handle => {
-                match result {
-                    Ok(()) => warn!("FIFO listener exited unexpectedly"),
-                    Err(e) => error!("FIFO listener panicked: {}", e),
+/// Run the event loop with automatic reconnection.
+async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load().unwrap_or_default();
+    let debounce_ms = config.positioning.debounce_ms;
+    let ctx = CommandContext::with_config(config.clone())?;
+    let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
+
+    // Create FIFO for manual triggers
+    create_fifo()?;
+
+    // Channel for FIFO triggers — persists across reconnections
+    let (fifo_tx, mut fifo_rx) = mpsc::channel::<()>(16);
+    tokio::spawn(fifo_listener(fifo_tx));
+
+    info!("Event loop started");
+
+    loop {
+        match run_event_session(&ctx, debounce_duration, &mut fifo_rx).await {
+            Ok(true) => {
+                // Reconnect after brief delay
+                info!("Reconnecting to Hyprland socket...");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Recreate FIFO in case it was cleaned up
+                if !get_fifo_path().exists() {
+                    let _ = create_fifo();
                 }
-                break;
+            }
+            Ok(false) => {
+                info!("Event loop ended (clean shutdown)");
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Event session error: {}, retrying in 2s", e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
-
-    info!("Event loop ended");
-    Ok(())
 }
 
 /// Run the daemon in foreground mode.

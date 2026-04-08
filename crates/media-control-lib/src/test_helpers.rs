@@ -100,8 +100,7 @@ impl MockHyprland {
 
     /// Create a `CommandContext` using this mock server with the given config.
     pub fn context(&self, config: Config) -> CommandContext {
-        CommandContext::for_test(self.client(), config)
-            .expect("build test context")
+        CommandContext::for_test(self.client(), config).expect("build test context")
     }
 
     /// Create a `CommandContext` using this mock server with default config.
@@ -372,7 +371,11 @@ mod tests {
         let mock = MockHyprland::start().await;
         mock.set_response_sequence(
             "j/clients",
-            vec!["first".to_string(), "second".to_string(), "last".to_string()],
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "last".to_string(),
+            ],
         )
         .await;
 

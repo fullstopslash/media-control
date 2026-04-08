@@ -59,7 +59,11 @@ pub async fn status(json_output: bool) -> Result<bool, Box<dyn std::error::Error
         println!("{output}");
     } else {
         println!("Playing: {title}");
-        println!("Position: {} / {}", format_time(position), format_time(duration));
+        println!(
+            "Position: {} / {}",
+            format_time(position),
+            format_time(duration)
+        );
         println!("Paused: {}", if paused { "yes" } else { "no" });
     }
 

@@ -82,10 +82,10 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
     // Position to configured default corner (adjusted for minified mode)
     let pos = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
-    let target_x = super::resolve_effective_position(ctx, &positioning.default_x)
-        .unwrap_or(pos.x_right);
-    let target_y = super::resolve_effective_position(ctx, &positioning.default_y)
-        .unwrap_or(pos.y_bottom);
+    let target_x =
+        super::resolve_effective_position(ctx, &positioning.default_x).unwrap_or(pos.x_right);
+    let target_y =
+        super::resolve_effective_position(ctx, &positioning.default_y).unwrap_or(pos.y_bottom);
     let (ew, eh) = super::effective_dimensions(ctx);
     ctx.hyprland
         .batch(&[
@@ -115,15 +115,34 @@ mod tests {
         // mpv is not floating, not pinned
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", false, false,
-                0, 1, 0, 1, [100, 100], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [100, 100],
+                [640, 360],
             ),
         ];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         pin_and_float(&ctx).await.unwrap();
@@ -145,15 +164,34 @@ mod tests {
         // mpv is floating + pinned → toggle off
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser", false, false,
-                0, 1, 0, 0, [0, 0], [1920, 1080],
+                "0xfirefox",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4", true, true,
-                0, 1, 0, 1, [1272, 712], [640, 360],
+                "0xmpv",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         pin_and_float(&ctx).await.unwrap();
@@ -163,10 +201,16 @@ mod tests {
         let batch = cmds.iter().find(|c| c.contains("dispatch pin"));
         assert!(batch.is_some(), "should unpin: {cmds:?}");
         let batch = batch.unwrap();
-        assert!(batch.contains("togglefloating"), "should also unfloat: {batch}");
+        assert!(
+            batch.contains("togglefloating"),
+            "should also unfloat: {batch}"
+        );
         // Should NOT have resize (no positioning when toggling off)
         let has_resize = cmds.iter().any(|c| c.contains("resizewindowpixel"));
-        assert!(!has_resize, "should not position when toggling off: {cmds:?}");
+        assert!(
+            !has_resize,
+            "should not position when toggling off: {cmds:?}"
+        );
     }
 
     #[tokio::test]
@@ -174,17 +218,31 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xmpv", "mpv", "video.mp4", false, false,
-            2, 1, 0, 0, [0, 0], [1920, 1080], // fullscreen
+            "0xmpv",
+            "mpv",
+            "video.mp4",
+            false,
+            false,
+            2,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080], // fullscreen
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         pin_and_float(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
         // Should only fetch clients, no dispatches
-        assert_eq!(cmds.len(), 1, "should only fetch clients for fullscreen: {cmds:?}");
+        assert_eq!(
+            cmds.len(),
+            1,
+            "should only fetch clients for fullscreen: {cmds:?}"
+        );
     }
 
     #[tokio::test]
@@ -192,10 +250,20 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xfirefox", "firefox", "Browser", false, false,
-            0, 1, 0, 0, [0, 0], [1920, 1080],
+            "0xfirefox",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
         )];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
         let ctx = mock.default_context();
 
         pin_and_float(&ctx).await.unwrap();
