@@ -255,6 +255,7 @@ mod tests {
     #[test]
     fn direction_clone_copy() {
         let dir = Direction::Left;
+        #[allow(clippy::clone_on_copy)]
         let cloned = dir.clone();
         let copied = dir;
 

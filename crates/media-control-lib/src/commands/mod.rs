@@ -319,14 +319,14 @@ const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpv-shim";
 /// Fallback mpv IPC socket path (legacy).
 const MPV_IPC_SOCKET_FALLBACK: &str = "/tmp/mpvctl-jshim";
 
-/// Timeout for connecting to and writing to a socket.
-const SOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Timeout for connecting to and writing to a socket (local Unix socket — fast).
+const SOCKET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Timeout for reading a response from mpv.
-const SOCKET_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+const SOCKET_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Delay between retry attempts.
-const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Shim query socket path for cached lookups.
 const SHIM_QUERY_SOCKET: &str = "/tmp/mpv-shim-query.sock";
@@ -452,25 +452,41 @@ async fn mpv_ipc_exchange(
     }
 }
 
-/// Send a script-message to mpv via IPC socket.
+/// Send a script-message to mpv via IPC socket (fire-and-forget).
 ///
-/// Routes to handlers registered by jellyfin-mpv-shim. Tries multiple
-/// socket paths in order: `$MPV_IPC_SOCKET`, `/tmp/mpvctl-jshim`, `/tmp/mpvctl0`.
-/// Retries once after 100ms if all paths fail (covers mpv respawn window).
+/// Writes the command and closes — does NOT read the response. During rapid
+/// fire, mpv floods the socket with event lines (file-loaded, property-change,
+/// etc.) and reading through them to find the response adds 10-50ms+ per call.
+/// Script-messages are delivered asynchronously by mpv regardless of response.
 pub async fn send_mpv_script_message(message: &str) -> Result<()> {
     send_mpv_script_message_with_args(message, &[]).await
 }
 
-/// Send a multi-argument script-message to mpv via IPC socket.
-///
-/// Like `send_mpv_script_message` but supports additional arguments.
-/// E.g., `send_mpv_script_message_with_args("set-play-source", &["nextup"])`
-/// sends `{"command":["script-message","set-play-source","nextup"]}`.
+/// Send a multi-argument script-message to mpv (fire-and-forget).
 pub async fn send_mpv_script_message_with_args(message: &str, args: &[&str]) -> Result<()> {
     let mut parts: Vec<&str> = vec!["script-message", message];
     parts.extend_from_slice(args);
     let payload = serde_json::json!({"command": parts}).to_string();
-    send_mpv_ipc_command(&payload).await
+    send_mpv_fire_and_forget(&payload).await
+}
+
+/// Send a command to mpv without reading the response.
+async fn send_mpv_fire_and_forget(payload: &str) -> Result<()> {
+    let paths = mpv_socket_paths();
+
+    for attempt in 0..2u8 {
+        if attempt > 0 {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+
+        for socket_path in &paths {
+            if mpv_ipc_exchange(socket_path, payload, false).await.is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(crate::error::MediaControlError::mpv_no_socket())
 }
 
 /// Query an mpv property and return its value.
@@ -509,33 +525,12 @@ pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
     Err(crate::error::MediaControlError::mpv_no_socket())
 }
 
-/// Send a raw JSON command to mpv via IPC socket.
+/// Send a raw JSON command to mpv via IPC socket (fire-and-forget).
 ///
-/// Tries multiple socket paths with retry. Fire-and-forget: response is
-/// read for verification but errors are only logged, not propagated.
+/// Tries multiple socket paths with retry. Does not read the response —
+/// avoids blocking on mpv's event flood during rapid-fire commands.
 pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
-    let paths = mpv_socket_paths();
-
-    for attempt in 0..2u8 {
-        if attempt > 0 {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-
-        for socket_path in &paths {
-            if let Ok(resp) = mpv_ipc_exchange(socket_path, payload, true).await {
-                // Log mpv errors but still return Ok — command was sent
-                if let Some(val) = resp
-                    && let Some(err) = val.get("error").and_then(|e| e.as_str())
-                    && err != "success"
-                {
-                    eprintln!("media-control: mpv returned error: {err}");
-                }
-                return Ok(());
-            }
-        }
-    }
-
-    Err(crate::error::MediaControlError::mpv_no_socket())
+    send_mpv_fire_and_forget(payload).await
 }
 
 /// Send a payload to a specific mpv socket (fire-and-forget, no response read).
@@ -688,7 +683,7 @@ mod tests {
             set_env("MPV_IPC_SOCKET", socket_path.to_str().unwrap());
         }
 
-        // Spawn a task to accept the connection and respond
+        // Spawn a task to accept the connection and verify the command arrived
         let handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut reader = tokio::io::BufReader::new(stream);
@@ -697,14 +692,7 @@ mod tests {
             // Verify we received the command
             assert!(line.contains("script-message"));
             assert!(line.contains("test-cmd"));
-            // Send success response (mpv IPC protocol)
-            use tokio::io::AsyncWriteExt;
-            reader
-                .get_mut()
-                .write_all(br#"{"error":"success"}"#)
-                .await
-                .unwrap();
-            reader.get_mut().write_all(b"\n").await.unwrap();
+            // No response needed — fire-and-forget
         });
 
         let result = send_mpv_script_message("test-cmd").await;

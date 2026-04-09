@@ -377,6 +377,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_client_full(
         address: &str,
         class: &str,

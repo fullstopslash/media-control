@@ -234,43 +234,43 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::pin::pin_and_float(&ctx).await?;
         }
         Commands::MarkWatched => {
-            commands::mark_watched::mark_watched(&ctx).await?;
+            commands::mark_watched::mark_watched().await?;
         }
         Commands::MarkWatchedAndStop => {
-            commands::mark_watched::mark_watched_and_stop(&ctx).await?;
+            commands::mark_watched::mark_watched_and_stop().await?;
         }
         Commands::MarkWatchedAndNext => {
-            commands::mark_watched::mark_watched_and_next(&ctx).await?;
+            commands::mark_watched::mark_watched_and_next().await?;
         }
         Commands::Next => {
-            commands::mark_watched::next(&ctx).await?;
+            commands::mark_watched::next().await?;
         }
         Commands::Prev => {
-            commands::mark_watched::prev(&ctx).await?;
+            commands::mark_watched::prev().await?;
         }
         Commands::NextSeries => {
-            commands::mark_watched::next_series(&ctx).await?;
+            commands::mark_watched::next_series().await?;
         }
         Commands::PrevSeries => {
-            commands::mark_watched::prev_series(&ctx).await?;
+            commands::mark_watched::prev_series().await?;
         }
         Commands::Keep => {
-            commands::keep::keep(&ctx).await?;
+            commands::keep::keep().await?;
         }
         Commands::Favorite => {
-            commands::keep::favorite(&ctx).await?;
+            commands::keep::favorite().await?;
         }
         Commands::Delete => {
-            commands::keep::delete(&ctx).await?;
+            commands::keep::delete().await?;
         }
         Commands::AddO => {
-            commands::keep::add_o(&ctx).await?;
+            commands::keep::add_o().await?;
         }
         Commands::Minify => {
             commands::minify::minify(&ctx).await?;
         }
         Commands::Seek { percent } => {
-            commands::seek::seek(&ctx, percent).await?;
+            commands::seek::seek(percent).await?;
         }
         Commands::Chapter { direction } => {
             let dir = match direction.as_str() {
@@ -278,7 +278,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "prev" => commands::chapter::ChapterDirection::Prev,
                 _ => return Err("Direction must be 'next' or 'prev'".into()),
             };
-            commands::chapter::chapter(&ctx, dir).await?;
+            commands::chapter::chapter(dir).await?;
         }
         Commands::Play { target } => {
             commands::play::play(&ctx, &target).await?;

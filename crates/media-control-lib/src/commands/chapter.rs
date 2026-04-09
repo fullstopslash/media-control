@@ -3,7 +3,7 @@
 //! Provides chapter navigation commands (next/prev) for mpv playback
 //! using the shared mpv IPC infrastructure.
 
-use super::{CommandContext, require_mpv_window, send_mpv_ipc_command};
+use super::send_mpv_ipc_command;
 use crate::error::Result;
 
 /// Direction for chapter navigation.
@@ -27,38 +27,22 @@ impl ChapterDirection {
 
 /// Navigate to the next or previous chapter in mpv.
 ///
-/// This command only operates on mpv windows. If no media window is found,
-/// or if the media window is not mpv, the command silently succeeds.
-///
-/// # Arguments
-///
-/// * `ctx` - Command context with Hyprland client and configuration
-/// * `direction` - Whether to navigate to the next or previous chapter
-///
 /// # Errors
 ///
-/// Returns an error if:
-/// - Hyprland IPC fails when fetching windows
-/// - No mpv IPC socket is available
-/// - Socket communication fails
+/// Returns an error if no mpv IPC socket is available.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use media_control_lib::commands::{CommandContext, chapter::{chapter, ChapterDirection}};
+/// use media_control_lib::commands::chapter::{chapter, ChapterDirection};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let ctx = CommandContext::new()?;
-/// chapter(&ctx, ChapterDirection::Next).await?;
+/// chapter(ChapterDirection::Next).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn chapter(ctx: &CommandContext, direction: ChapterDirection) -> Result<()> {
-    if require_mpv_window(ctx).await?.is_none() {
-        return Ok(());
-    }
+pub async fn chapter(direction: ChapterDirection) -> Result<()> {
     let payload = format!(r#"{{"command":["add","chapter",{}]}}"#, direction.offset());
-
     send_mpv_ipc_command(&payload).await
 }
 

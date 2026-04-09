@@ -302,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::invalid_regex)]
     fn regex_error_converts() {
         let regex_err = regex::Regex::new("[invalid").unwrap_err();
         let err: MediaControlError = regex_err.into();

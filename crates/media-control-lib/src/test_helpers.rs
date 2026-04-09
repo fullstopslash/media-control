@@ -162,10 +162,10 @@ fn find_response(map: &mut ResponseMap, command: &str) -> String {
         .find(|key| command.starts_with(key.as_str()))
         .cloned();
 
-    if let Some(key) = prefix_key {
-        if let Some(responses) = map.get_mut(&key) {
-            return consume_response(responses);
-        }
+    if let Some(key) = prefix_key
+        && let Some(responses) = map.get_mut(&key)
+    {
+        return consume_response(responses);
     }
 
     // 3. Default
@@ -228,6 +228,7 @@ pub fn make_test_client(
 }
 
 /// Create a test `Client` with full control over all fields.
+#[allow(clippy::too_many_arguments)]
 pub fn make_test_client_full(
     address: &str,
     class: &str,

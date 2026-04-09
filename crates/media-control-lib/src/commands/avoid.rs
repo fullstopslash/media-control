@@ -1291,11 +1291,7 @@ mod tests {
     #[tokio::test]
     async fn should_suppress_with_stale_timestamp() {
         // Timestamp of 0 is always stale
-        assert!(
-            !should_suppress(150).await || true,
-            "stale or missing file should not suppress"
-        );
-        // The real test: with 0ms timeout, nothing is suppressed
+        // With 0ms timeout, nothing is suppressed
         assert!(
             !should_suppress(0).await,
             "0ms timeout means never suppress"
