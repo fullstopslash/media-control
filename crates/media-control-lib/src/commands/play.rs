@@ -39,7 +39,7 @@ impl PlayTarget {
 pub async fn play(
     _ctx: &CommandContext,
     target_str: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> crate::error::Result<()> {
     let target = PlayTarget::parse(target_str);
 
     match target {
@@ -90,6 +90,32 @@ mod tests {
         assert_eq!(
             PlayTarget::parse("a5c0a87b1d058d1b7e70f5406ee274e2"),
             PlayTarget::ItemId("a5c0a87b1d058d1b7e70f5406ee274e2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_short_hex_is_store() {
+        // 31 chars — too short for an item ID
+        assert_eq!(
+            PlayTarget::parse("a5c0a87b1d058d1b7e70f5406ee274e"),
+            PlayTarget::Store("a5c0a87b1d058d1b7e70f5406ee274e".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_hex_with_non_hex_char_is_store() {
+        // Has 'g' — not valid hex
+        assert_eq!(
+            PlayTarget::parse("a5c0a87b1d058d1b7e70f5406ee274g2"),
+            PlayTarget::Store("a5c0a87b1d058d1b7e70f5406ee274g2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_empty_string_is_store() {
+        assert_eq!(
+            PlayTarget::parse(""),
+            PlayTarget::Store(String::new())
         );
     }
 }

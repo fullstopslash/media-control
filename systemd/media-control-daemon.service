@@ -19,7 +19,6 @@ Environment=RUST_LOG=media_control=info
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-PrivateTmp=yes
 ReadWritePaths=%t
 
 [Install]

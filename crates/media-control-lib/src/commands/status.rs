@@ -7,7 +7,7 @@ use super::query_mpv_property;
 
 /// Format seconds as MM:SS.
 fn format_time(seconds: f64) -> String {
-    let total = seconds as u64;
+    let total = seconds.max(0.0) as u64;
     let mins = total / 60;
     let secs = total % 60;
     format!("{mins}:{secs:02}")
@@ -17,7 +17,7 @@ fn format_time(seconds: f64) -> String {
 ///
 /// Returns `Ok(true)` if playing, `Ok(false)` if not playing.
 /// The caller should set the exit code based on the return value.
-pub async fn status(json_output: bool) -> Result<bool, Box<dyn std::error::Error>> {
+pub async fn status(json_output: bool) -> crate::error::Result<bool> {
     // Try to query media-title first — if this fails, nothing is playing
     let title = match query_mpv_property("media-title").await {
         Ok(v) => v.as_str().unwrap_or("Unknown").to_string(),
@@ -92,5 +92,30 @@ mod tests {
     #[test]
     fn format_time_over_an_hour() {
         assert_eq!(format_time(3661.0), "61:01");
+    }
+
+    #[test]
+    fn format_time_negative() {
+        // Negative values (can happen during mpv seeks) should not panic
+        assert_eq!(format_time(-5.0), "0:00");
+    }
+
+    #[test]
+    fn format_time_large_value() {
+        // Very large values should not panic
+        let result = format_time(1e15);
+        assert!(result.contains(':'));
+    }
+
+    #[test]
+    fn format_time_exactly_60() {
+        assert_eq!(format_time(60.0), "1:00");
+    }
+
+    #[test]
+    fn format_time_nan() {
+        // NaN should not panic (saturates to 0 via max(0.0))
+        let result = format_time(f64::NAN);
+        assert_eq!(result, "0:00");
     }
 }

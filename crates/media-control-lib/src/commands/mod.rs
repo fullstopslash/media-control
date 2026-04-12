@@ -177,21 +177,19 @@ pub fn get_media_window_with_clients(
     ctx.window_matcher.find_media_window(clients, focus_addr)
 }
 
+/// Get the runtime directory (`$XDG_RUNTIME_DIR` or `/tmp` fallback).
+fn runtime_dir() -> PathBuf {
+    let dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(dir)
+}
+
 /// Get the path to the avoider suppress file.
 ///
 /// The suppress file is located at `$XDG_RUNTIME_DIR/media-avoider-suppress`.
 /// When this file exists and contains a recent timestamp, the avoider daemon
 /// will skip repositioning to prevent feedback loops.
-///
-/// # Returns
-///
-/// Path to the suppress file, or a fallback path if `XDG_RUNTIME_DIR` is not set.
 pub fn get_suppress_file_path() -> PathBuf {
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        eprintln!("media-control: XDG_RUNTIME_DIR not set, falling back to /tmp for suppress file");
-        "/tmp".to_string()
-    });
-    PathBuf::from(runtime_dir).join("media-avoider-suppress")
+    runtime_dir().join("media-avoider-suppress")
 }
 
 /// Write a timestamp to the suppress file to prevent avoider repositioning.
@@ -261,8 +259,7 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
 /// Presence of this file means the media window is in minified mode.
 /// Located in `$XDG_RUNTIME_DIR` (tmpfs) so it resets on reboot.
 pub fn get_minify_state_path() -> PathBuf {
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(runtime_dir).join("media-control-minified")
+    runtime_dir().join("media-control-minified")
 }
 
 /// Check if minified mode is active.
@@ -311,6 +308,26 @@ pub fn resolve_effective_position(ctx: &CommandContext, name: &str) -> Option<i3
         "y_bottom" => Some(raw + (p.height - eh)),
         _ => Some(raw),
     }
+}
+
+/// Resize and move a window to its default configured position.
+///
+/// Resolves the default x/y from config (adjusted for minified mode),
+/// then batches a resize + move. Used by fullscreen exit, pin, and minify.
+pub(crate) async fn reposition_to_default(ctx: &CommandContext, addr: &str) -> Result<()> {
+    let positioning = &ctx.config.positioning;
+    let target_x = resolve_effective_position(ctx, &positioning.default_x)
+        .unwrap_or(ctx.config.positions.x_right);
+    let target_y = resolve_effective_position(ctx, &positioning.default_y)
+        .unwrap_or(ctx.config.positions.y_bottom);
+    let (ew, eh) = effective_dimensions(ctx);
+    ctx.hyprland
+        .batch(&[
+            &format!("dispatch resizewindowpixel exact {ew} {eh},address:{addr}"),
+            &format!("dispatch movewindowpixel exact {target_x} {target_y},address:{addr}"),
+        ])
+        .await?;
+    Ok(())
 }
 
 /// Default mpv IPC socket path (mpv-shim).
@@ -406,7 +423,7 @@ async fn mpv_ipc_exchange(
         Err(_) => return Err(()),
     }
 
-    // Connect + write with 500ms timeout
+    // Connect + write with timeout
     let stream_result = timeout(SOCKET_CONNECT_TIMEOUT, async {
         let mut stream = UnixStream::connect(path).await?;
         stream.write_all(payload.as_bytes()).await?;
@@ -428,12 +445,19 @@ async fn mpv_ipc_exchange(
         return Ok(None);
     }
 
-    // Read response with 200ms timeout, skipping mpv event lines
+    // Read response with timeout, skipping mpv event lines
     let mut reader = BufReader::new(&mut stream);
     let read_result = timeout(SOCKET_RESPONSE_TIMEOUT, async {
         loop {
             let mut buf = String::new();
-            reader.read_line(&mut buf).await?;
+            let n = reader.read_line(&mut buf).await?;
+            if n == 0 {
+                // EOF — mpv closed the connection
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "mpv closed connection",
+                ));
+            }
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
                 // Skip unsolicited event messages
                 if val.get("event").is_some() && val.get("error").is_none() {
@@ -787,5 +811,40 @@ mod tests {
         assert_eq!(media.address, "0x2");
         assert_eq!(media.class, "mpv");
         assert_eq!(media.priority, 1); // Pinned beats focused non-media
+    }
+
+    #[test]
+    fn effective_dimensions_normal() {
+        let config = Config::default();
+        let ctx = CommandContext::for_test(
+            HyprlandClient::with_socket_path("/tmp/nonexistent-test-socket".into()),
+            config.clone(),
+        )
+        .unwrap();
+
+        // When not minified, returns raw config dimensions
+        let (w, h) = effective_dimensions(&ctx);
+        assert_eq!(w, config.positions.width);
+        assert_eq!(h, config.positions.height);
+    }
+
+    #[test]
+    fn resolve_effective_position_normal() {
+        let config = Config::default();
+        let ctx = CommandContext::for_test(
+            HyprlandClient::with_socket_path("/tmp/nonexistent-test-socket".into()),
+            config.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_effective_position(&ctx, "x_left"),
+            Some(config.positions.x_left)
+        );
+        assert_eq!(
+            resolve_effective_position(&ctx, "x_right"),
+            Some(config.positions.x_right)
+        );
+        assert_eq!(resolve_effective_position(&ctx, "unknown"), None);
     }
 }

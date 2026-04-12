@@ -16,7 +16,7 @@ use super::{send_mpv_script_message, send_mpv_script_message_with_args};
 /// `random` script-message. The active store interprets the type.
 pub async fn random(
     random_type: Option<&str>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> crate::error::Result<()> {
     match random_type {
         Some(t) => {
             send_mpv_script_message_with_args("random", &[t]).await?;

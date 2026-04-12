@@ -6,7 +6,7 @@
 use tokio::process::Command;
 
 use super::fullscreen::is_pip_title;
-use super::{CommandContext, find_focused_address, get_minify_state_path, send_to_mpv_socket};
+use super::{CommandContext, get_media_window, get_minify_state_path, send_to_mpv_socket};
 use crate::error::Result;
 
 /// Default mpv IPC socket path (jellyfin-mpv-shim).
@@ -39,11 +39,7 @@ pub async fn close(ctx: &CommandContext) -> Result<()> {
     // Always clear minified state so next window spawns at normal size
     let _ = tokio::fs::remove_file(get_minify_state_path()).await;
 
-    let clients = ctx.hyprland.get_clients().await?;
-
-    let focus_addr = find_focused_address(&clients);
-
-    let Some(window) = ctx.window_matcher.find_media_window(&clients, focus_addr) else {
+    let Some(window) = get_media_window(ctx).await? else {
         return Ok(());
     };
 
@@ -78,41 +74,25 @@ async fn close_window_gracefully(
     title: &str,
     pid: i32,
 ) -> Result<()> {
-    // MPV: check if this is the shim's mpv instance.
-    // Shim mpv is started with --input-ipc-server=/tmp/mpv-shim.
-    // For shim mpv: send stop-and-clear, keep window alive for reuse.
-    // For standalone mpv: close via Hyprland like any other window.
-    if class == "mpv" {
-        if is_shim_mpv(pid) {
-            // Fire-and-forget: no retry, no response read.
-            // The shim handles state sync internally before stopping.
-            let _ = send_to_mpv_socket(
-                SHIM_SOCKET,
-                r#"{"command":["script-message","stop-and-clear"]}"#,
-            )
-            .await;
-            return Ok(());
-        }
-        ctx.hyprland
-            .dispatch(&format!("closewindow address:{addr}"))
-            .await?;
+    let close_cmd = format!("closewindow address:{addr}");
+
+    // Shim mpv: send stop-and-clear, keep window alive for reuse.
+    if class == "mpv" && is_shim_mpv(pid) {
+        let _ = send_to_mpv_socket(
+            SHIM_SOCKET,
+            r#"{"command":["script-message","stop-and-clear"]}"#,
+        )
+        .await;
         return Ok(());
     }
 
-    // Firefox PiP: close the PiP window, then close the source tab.
-    // When PiP closes, Firefox activates the source tab. We then focus
-    // the main Firefox window and send Ctrl+W to close that tab.
+    // Firefox PiP: close the PiP window, then pause media via MPRIS.
     if class == "firefox" && is_pip_title(title) {
         return close_firefox_pip(ctx, addr).await;
     }
 
-    // All other windows (Jellyfin, default): use closewindow.
-    // closewindow sends xdg_toplevel::close which gracefully closes just the
-    // targeted window surface.
-    ctx.hyprland
-        .dispatch(&format!("closewindow address:{addr}"))
-        .await?;
-
+    // All other windows (standalone mpv, Jellyfin, default): closewindow.
+    ctx.hyprland.dispatch(&close_cmd).await?;
     Ok(())
 }
 
@@ -143,32 +123,6 @@ async fn close_firefox_pip(ctx: &CommandContext, pip_addr: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::test_helpers::*;
-
-    #[test]
-    fn jellyfin_class_detection() {
-        // Test various Jellyfin class names
-        let class_variants = [
-            "com.github.iwalton3.jellyfin-media-player",
-            "jellyfin-media-player",
-            "Jellyfin",
-            "JELLYFIN",
-        ];
-
-        for class in class_variants {
-            assert!(
-                class.to_lowercase().contains("jellyfin"),
-                "Failed to detect Jellyfin for class: {class}"
-            );
-        }
-    }
-
-    #[test]
-    fn mpv_class_detection() {
-        // mpv class should be exact match
-        assert_eq!("mpv", "mpv");
-        assert_ne!("mpv", "MPV");
-        assert_ne!("mpv", "vlc-mpv");
-    }
 
     // --- E2E tests ---
 

@@ -125,6 +125,7 @@ enum Commands {
     /// Seek to an absolute percentage position (0-100)
     Seek {
         /// Percentage position (0=start, 100=end)
+        #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
         percent: u8,
     },
 
@@ -170,6 +171,13 @@ async fn main() {
         return;
     }
 
+    // Setup logging (off by default, enabled with -v)
+    if cli.verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter("media_control=debug")
+            .init();
+    }
+
     // Handle status early (no config/context needed — just mpv IPC)
     if let Commands::Status { json } = cli.command {
         match commands::status::status(json).await {
@@ -180,13 +188,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-    }
-
-    // Setup logging (off by default, enabled with -v)
-    if cli.verbose {
-        tracing_subscriber::fmt()
-            .with_env_filter("media_control=debug")
-            .init();
     }
 
     if let Err(e) = run(cli).await {

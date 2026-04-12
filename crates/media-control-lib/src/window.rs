@@ -334,11 +334,13 @@ impl WindowMatcher {
         })?;
 
         // Find candidates on the same workspace, excluding the media window
+        // and windows that were never focused (focus_history_id < 0)
         clients
             .iter()
             .filter(|c| c.workspace.id == target_workspace)
             .filter(|c| c.address != media_addr)
             .filter(|c| c.mapped && !c.hidden)
+            .filter(|c| c.focus_history_id >= 0)
             .min_by_key(|c| c.focus_history_id)
             .map(|c| c.address.clone())
     }
@@ -918,5 +920,77 @@ mod tests {
 
         // Should still work with valid pattern
         assert!(matcher.matches(&client).is_some());
+    }
+
+    #[test]
+    fn find_previous_focus_ignores_never_focused() {
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns).unwrap();
+
+        // All candidates have focus_history_id = -1 (never focused)
+        let clients = vec![
+            make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 2),
+            make_client_full("0x2", "firefox", "browser", false, false, 0, 1, 0, -1),
+            make_client_full("0x3", "kitty", "terminal", false, false, 0, 1, 0, -1),
+        ];
+
+        let result = matcher.find_previous_focus(&clients, "0x1", None);
+        assert!(
+            result.is_none(),
+            "should not return never-focused windows"
+        );
+    }
+
+    #[test]
+    fn find_previous_focus_prefers_focused_over_never_focused() {
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns).unwrap();
+
+        let clients = vec![
+            make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 3),
+            make_client_full("0x2", "firefox", "browser", false, false, 0, 1, 0, -1), // never focused
+            make_client_full("0x3", "kitty", "terminal", false, false, 0, 1, 0, 1), // was focused
+        ];
+
+        let result = matcher.find_previous_focus(&clients, "0x1", None);
+        assert_eq!(result, Some("0x3".to_string()));
+    }
+
+    #[test]
+    fn find_media_window_skips_unmapped() {
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns).unwrap();
+
+        let mut client = make_client("0x1", "mpv", "video", false, true);
+        client.mapped = false;
+
+        assert!(matcher.find_media_window(&[client], None).is_none());
+    }
+
+    #[test]
+    fn find_media_window_skips_hidden() {
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns).unwrap();
+
+        let mut client = make_client("0x1", "mpv", "video", false, true);
+        client.hidden = true;
+
+        assert!(matcher.find_media_window(&[client], None).is_none());
     }
 }

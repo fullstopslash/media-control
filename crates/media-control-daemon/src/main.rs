@@ -194,7 +194,6 @@ async fn connect_hyprland_socket() -> Result<UnixStream, String> {
 
 /// Run a single session of the event loop (until socket disconnect).
 /// Returns Ok(true) to signal reconnect, Ok(false) for clean shutdown.
-#[allow(unused_assignments)]
 async fn run_event_session(
     ctx: &CommandContext,
     debounce_duration: Duration,
@@ -205,7 +204,6 @@ async fn run_event_session(
     let mut lines = reader.lines();
 
     let mut last_avoid_time = Instant::now();
-    let mut avoid_in_progress = false;
 
     info!("Event session started");
 
@@ -218,11 +216,9 @@ async fn run_event_session(
 
                         match event {
                             "workspace" | "activewindow" | "movewindow" | "openwindow" | "closewindow" | "swapwindow" => {
-                                if !avoid_in_progress && last_avoid_time.elapsed() >= debounce_duration {
-                                    avoid_in_progress = true;
+                                if last_avoid_time.elapsed() >= debounce_duration {
                                     trigger_avoid(ctx).await;
                                     last_avoid_time = Instant::now();
-                                    avoid_in_progress = false;
                                 }
                             }
                             _ => {}
@@ -240,12 +236,10 @@ async fn run_event_session(
             }
 
             Some(()) = fifo_rx.recv() => {
-                if !avoid_in_progress && last_avoid_time.elapsed() >= debounce_duration {
+                if last_avoid_time.elapsed() >= debounce_duration {
                     debug!("Processing FIFO trigger");
-                    avoid_in_progress = true;
                     trigger_avoid(ctx).await;
                     last_avoid_time = Instant::now();
-                    avoid_in_progress = false;
                 }
             }
         }
@@ -254,7 +248,10 @@ async fn run_event_session(
 
 /// Run the event loop with automatic reconnection.
 async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load().unwrap_or_else(|e| {
+        warn!("Config load failed ({e}), using defaults");
+        Config::default()
+    });
     let debounce_ms = config.positioning.debounce_ms;
     let ctx = CommandContext::with_config(config.clone())?;
     let debounce_duration = Duration::from_millis(u64::from(debounce_ms));

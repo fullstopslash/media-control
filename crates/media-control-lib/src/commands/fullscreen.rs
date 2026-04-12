@@ -193,27 +193,7 @@ async fn exit_fullscreen(
     // Position the media window to default position and resize
     // The avoider daemon will handle proper positioning after focus is restored
     if media_window.is_some() {
-        let positions = &ctx.config.positions;
-        let positioning = &ctx.config.positioning;
-
-        // Use default position - avoider will adjust if needed after focus restore
-        let target_x = super::resolve_effective_position(ctx, &positioning.default_x)
-            .unwrap_or(positions.x_right);
-        let target_y = super::resolve_effective_position(ctx, &positioning.default_y)
-            .unwrap_or(positions.y_bottom);
-
-        // Move to default position
-        let (ew, eh) = super::effective_dimensions(ctx);
-        ctx.hyprland
-            .batch(&[
-                &format!(
-                    "dispatch movewindowpixel exact {} {},address:{}",
-                    target_x, target_y, addr
-                ),
-                &format!("dispatch resizewindowpixel exact {ew} {eh},address:{addr}"),
-            ])
-            .await?;
-
+        super::reposition_to_default(ctx, addr).await?;
         // Note: Don't suppress here - we want the avoider to run after focus restore
     }
 

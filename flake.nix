@@ -55,8 +55,7 @@
               --replace '%h/.cargo/bin/media-control-daemon' "$out/bin/media-control-daemon"
 
             # Install systemd socket unit
-            substitute ${./systemd/media-control-daemon.socket} $out/lib/systemd/user/media-control-daemon.socket \
-              --replace '%t/media-control-daemon.sock' '%t/media-control-daemon.sock'
+            cp ${./systemd/media-control-daemon.socket} $out/lib/systemd/user/media-control-daemon.socket
           '';
         });
 

@@ -147,20 +147,18 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
         return Ok(());
     };
 
-    // Get effective positions and dimensions (adjusted for minified mode)
-    let resolve = |name: &str| super::resolve_effective_position(ctx, name);
-    let x_left = resolve("x_left").unwrap_or(ctx.config.positions.x_left);
-    let x_right = resolve("x_right").unwrap_or(ctx.config.positions.x_right);
-    let y_top = resolve("y_top").unwrap_or(ctx.config.positions.y_top);
-    let y_bottom = resolve("y_bottom").unwrap_or(ctx.config.positions.y_bottom);
+    // Resolve only the position needed for this direction (avoids unnecessary stat calls)
+    let resolve = |name: &str| {
+        super::resolve_effective_position(ctx, name)
+            .unwrap_or_else(|| ctx.config.resolve_position(name).unwrap_or(0))
+    };
     let (ew, eh) = super::effective_dimensions(ctx);
 
-    // Calculate new position based on direction
     let (new_x, new_y) = match direction {
-        Direction::Left => (x_left, window.y),
-        Direction::Right => (x_right, window.y),
-        Direction::Up => (window.x, y_top),
-        Direction::Down => (window.x, y_bottom),
+        Direction::Left => (resolve("x_left"), window.y),
+        Direction::Right => (resolve("x_right"), window.y),
+        Direction::Up => (window.x, resolve("y_top")),
+        Direction::Down => (window.x, resolve("y_bottom")),
     };
 
     // Execute batch command to move and resize

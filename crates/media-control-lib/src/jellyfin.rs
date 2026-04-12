@@ -564,18 +564,9 @@ impl JellyfinClient {
         Ok(())
     }
 
-    /// Start playing an item in a session.
-    ///
-    /// Uses the `/Sessions/{id}/Playing` endpoint with query parameters,
-    /// which is what jellyfin-mpv-shim responds to (as opposed to the
-    /// `/Sessions/{id}/Command/Play` JSON body endpoint).
+    /// Start playing an item in a session (from the beginning).
     pub async fn play_item(&self, session_id: &str, item_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/Sessions/{}/Playing?PlayCommand=PlayNow&ItemIds={}",
-            self.server_url, session_id, item_id
-        );
-        self.client.post(&url).send().await?.error_for_status()?;
-        Ok(())
+        self.play_item_with_resume(session_id, item_id, 0).await
     }
 
     /// Start playing multiple items in a session.
@@ -628,6 +619,7 @@ impl JellyfinClient {
             .json(&serde_json::json!({}))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
 
@@ -696,21 +688,6 @@ impl JellyfinClient {
         Ok(())
     }
 
-    /// Fetch raw ancestor data as JSON values.
-    ///
-    /// Used by strategy code that needs to check for BoxSet ancestors.
-    pub async fn fetch_ancestors_raw(&self, item_id: &str) -> Result<Vec<serde_json::Value>> {
-        let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
-        let ancestors = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(ancestors)
-    }
 
     /// Get the library that an item belongs to via the Ancestors API.
     pub async fn get_item_library(&self, item_id: &str) -> Result<Option<LibraryInfo>> {
@@ -1118,5 +1095,56 @@ mod tests {
         }"#;
         let detail: ItemDetail = serde_json::from_str(json).unwrap();
         assert_eq!(detail.user_data.unwrap().playback_position_ticks, 0);
+    }
+
+    #[test]
+    fn test_session_current_item_prefers_now_playing() {
+        let json = r#"{
+            "Id": "sess1",
+            "UserId": "user1",
+            "DeviceName": "test",
+            "Client": "mpv-shim",
+            "NowPlayingItem": {
+                "Id": "primary",
+                "Name": "Primary Item",
+                "Type": "Episode"
+            },
+            "NowPlayingQueueFullItems": [{
+                "Id": "fallback",
+                "Name": "Fallback Item",
+                "Type": "Episode"
+            }]
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.current_item().unwrap().id, "primary");
+    }
+
+    #[test]
+    fn test_session_current_item_falls_back_to_queue() {
+        let json = r#"{
+            "Id": "sess1",
+            "UserId": "user1",
+            "DeviceName": "test",
+            "Client": "mpv-shim",
+            "NowPlayingQueueFullItems": [{
+                "Id": "fallback",
+                "Name": "Fallback Item",
+                "Type": "Episode"
+            }]
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.current_item().unwrap().id, "fallback");
+    }
+
+    #[test]
+    fn test_session_current_item_none_when_empty() {
+        let json = r#"{
+            "Id": "sess1",
+            "UserId": "user1",
+            "DeviceName": "test",
+            "Client": "mpv-shim"
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert!(session.current_item().is_none());
     }
 }

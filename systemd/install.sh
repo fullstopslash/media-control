@@ -6,8 +6,9 @@ SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$SYSTEMD_USER_DIR"
 
 cp media-control-daemon.service "$SYSTEMD_USER_DIR/"
+cp media-control-daemon.socket "$SYSTEMD_USER_DIR/"
 
-echo "Installed systemd user service."
+echo "Installed systemd user service and socket."
 echo ""
 echo "To enable and start the daemon:"
 echo "  systemctl --user daemon-reload"

@@ -172,12 +172,12 @@ impl From<crate::hyprland::HyprlandError> for MediaControlError {
                 kind: HyprlandIpcErrorKind::ConnectionFailed,
                 source: Some(e),
             },
-            HyprlandError::JsonParseFailed(_) => Self::HyprlandIpc {
+            HyprlandError::JsonParseFailed(e) => Self::HyprlandIpc {
                 kind: HyprlandIpcErrorKind::ParseError,
-                source: None,
+                source: Some(std::io::Error::other(e.to_string())),
             },
             HyprlandError::CommandFailed(msg) => Self::HyprlandIpc {
-                kind: HyprlandIpcErrorKind::ConnectionFailed,
+                kind: HyprlandIpcErrorKind::ParseError,
                 source: Some(std::io::Error::other(msg)),
             },
         }

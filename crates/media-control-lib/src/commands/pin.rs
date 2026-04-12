@@ -3,7 +3,7 @@
 //! Pins or unpins the media window and applies appropriate positioning
 //! based on the current state and configuration.
 
-use super::CommandContext;
+use super::{CommandContext, suppress_avoider};
 use crate::error::Result;
 
 /// Toggle pinned floating mode for the media window.
@@ -23,19 +23,7 @@ use crate::error::Result;
 ///
 /// Returns an error if Hyprland IPC communication fails.
 pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
-    // Get all clients
-    let clients = ctx.hyprland.get_clients().await?;
-
-    // Find the focused window from the clients list itself to avoid race conditions.
-    // The focused window is the one with focusHistoryID == 0 (most recently focused).
-    let focus_addr = clients
-        .iter()
-        .filter(|c| c.focus_history_id == 0)
-        .map(|c| c.address.as_str())
-        .next();
-
-    // Find media window
-    let Some(media) = ctx.window_matcher.find_media_window(&clients, focus_addr) else {
+    let Some(media) = super::get_media_window(ctx).await? else {
         return Ok(());
     };
 
@@ -80,25 +68,8 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
     }
 
     // Position to configured default corner (adjusted for minified mode)
-    let pos = &ctx.config.positions;
-    let positioning = &ctx.config.positioning;
-    let target_x =
-        super::resolve_effective_position(ctx, &positioning.default_x).unwrap_or(pos.x_right);
-    let target_y =
-        super::resolve_effective_position(ctx, &positioning.default_y).unwrap_or(pos.y_bottom);
-    let (ew, eh) = super::effective_dimensions(ctx);
-    ctx.hyprland
-        .batch(&[
-            &format!(
-                "dispatch resizewindowpixel exact {ew} {eh},address:{}",
-                media.address
-            ),
-            &format!(
-                "dispatch movewindowpixel exact {} {},address:{}",
-                target_x, target_y, media.address
-            ),
-        ])
-        .await?;
+    super::reposition_to_default(ctx, &media.address).await?;
+    suppress_avoider().await.ok();
 
     Ok(())
 }

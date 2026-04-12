@@ -224,15 +224,18 @@ impl HyprlandClient {
         response.is_empty() || response.starts_with("ok")
     }
 
-    pub async fn dispatch(&self, action: &str) -> Result<()> {
-        let cmd = format!("dispatch {action}");
-        let response = self.command(&cmd).await?;
-
+    /// Send a command and require a success response.
+    async fn command_ok(&self, cmd: &str) -> Result<()> {
+        let response = self.command(cmd).await?;
         if Self::is_success(&response) {
             Ok(())
         } else {
             Err(HyprlandError::CommandFailed(response))
         }
+    }
+
+    pub async fn dispatch(&self, action: &str) -> Result<()> {
+        self.command_ok(&format!("dispatch {action}")).await
     }
 
     /// Execute multiple commands in a batch.
@@ -257,15 +260,7 @@ impl HyprlandClient {
         if commands.is_empty() {
             return Ok(());
         }
-
-        let batch_cmd = format!("[[BATCH]]{}", commands.join("; "));
-        let response = self.command(&batch_cmd).await?;
-
-        if Self::is_success(&response) {
-            Ok(())
-        } else {
-            Err(HyprlandError::CommandFailed(response))
-        }
+        self.command_ok(&format!("[[BATCH]]{}", commands.join("; "))).await
     }
 
     /// Get all window clients.
@@ -337,14 +332,7 @@ impl HyprlandClient {
     /// # }
     /// ```
     pub async fn keyword(&self, key: &str, value: &str) -> Result<()> {
-        let cmd = format!("keyword {key} {value}");
-        let response = self.command(&cmd).await?;
-
-        if Self::is_success(&response) {
-            Ok(())
-        } else {
-            Err(HyprlandError::CommandFailed(response))
-        }
+        self.command_ok(&format!("keyword {key} {value}")).await
     }
 }
 
