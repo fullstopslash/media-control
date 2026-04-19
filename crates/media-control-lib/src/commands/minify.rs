@@ -4,15 +4,22 @@
 //! (configurable via `positioning.minified_scale`). All positioning and
 //! avoidance rules still apply — just with smaller dimensions.
 
-use super::{CommandContext, get_media_window, reposition_to_default, toggle_minified};
+use super::{
+    CommandContext, get_media_window, is_minified, reposition_to_default_with_minified,
+    toggle_minified,
+};
 use crate::error::Result;
 
 /// Toggle minified mode, resize, and reposition the media window.
 ///
-/// Performs the actionability checks (media window present, not fullscreen)
-/// BEFORE flipping the persistent minified-state flag. Otherwise a no-op
-/// invocation (no window, or fullscreen) would silently leave the on-disk
-/// state out of sync with what's actually on screen.
+/// Order of operations is load-bearing: dispatch the move/resize FIRST and
+/// only flip the persistent minified-state flag once the dispatch succeeds.
+/// If we flipped the flag first and the dispatch then failed (window gone,
+/// Hyprland down, IPC error) the on-disk state would desync — the user sees
+/// no change on screen but the flag is flipped, requiring two more presses
+/// to recover. By inverting the order we keep the flag in lockstep with the
+/// last successfully-applied geometry: a failed dispatch propagates the
+/// error without the state being partially committed.
 pub async fn minify(ctx: &CommandContext) -> Result<()> {
     let Some(window) = get_media_window(ctx).await? else {
         return Ok(());
@@ -22,13 +29,24 @@ pub async fn minify(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     }
 
-    // Now safe to flip persistent state — we know the reposition will follow.
-    let now_minified = toggle_minified().await?;
+    // Compute the *target* minified state (the inverse of current). The
+    // reposition runs against this target geometry so the move lands the
+    // window where the user expects after the toggle. The on-disk flag is
+    // only flipped once the dispatch returns Ok.
+    let was_minified = is_minified();
+    let target_minified = !was_minified;
 
-    // `reposition_to_default` self-suppresses immediately before its dispatch,
-    // so we don't need a redundant suppress here — the contract is documented
-    // in commands/mod.rs::reposition_to_default.
-    reposition_to_default(ctx, &window.address).await?;
+    // `reposition_to_default_with_minified` self-suppresses immediately
+    // before its dispatch, so we don't need a redundant suppress here — the
+    // contract is documented in commands/mod.rs::reposition_to_default.
+    reposition_to_default_with_minified(ctx, &window.address, target_minified).await?;
+
+    // Dispatch succeeded — now safe to flip persistent state. If
+    // `toggle_minified` itself fails (e.g. read-only $XDG_RUNTIME_DIR), the
+    // window is in the new geometry but the flag still reflects the old
+    // state; we propagate the error so the caller sees the inconsistency.
+    let now_minified = toggle_minified().await?;
+    debug_assert_eq!(now_minified, target_minified);
 
     tracing::debug!(
         "minify: {}",

@@ -23,13 +23,16 @@
 //! # }
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::env;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+use regex::Regex;
 
 /// Errors that can occur during Hyprland IPC operations.
 #[derive(Debug, Error)]
@@ -70,10 +73,62 @@ pub struct Workspace {
     pub name: String,
 }
 
+/// Lazily-compiled validator for Hyprland window addresses.
+///
+/// Hyprland addresses are pointers rendered as `0x` followed by 1–32 hex
+/// digits. Anything else (including a value carrying a `;` to inject a
+/// second IPC command) is rejected at the deserialisation boundary so the
+/// `*_action` helpers — which interpolate the address into batch strings
+/// like `"focuswindow address:{addr}"` — cannot be tricked into dispatching
+/// attacker-controlled commands.
+fn address_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Pre-validated literal — `expect` is sound: this regex is fixed at
+        // build time and exercised by `is_valid_address` tests.
+        Regex::new(r"^0x[0-9A-Fa-f]{1,32}$").expect("address regex must compile")
+    })
+}
+
+/// Returns `true` iff `addr` matches the canonical Hyprland address shape
+/// `^0x[0-9A-Fa-f]{1,32}$`.
+///
+/// Used by the `Client::address` deserialiser and as a debug-assertion
+/// guard inside the `*_action` builders.
+#[must_use]
+pub(crate) fn is_valid_address(addr: &str) -> bool {
+    address_regex().is_match(addr)
+}
+
+/// Custom serde deserialiser for `Client::address`.
+///
+/// Validates the incoming string against [`is_valid_address`]. A non-matching
+/// value is replaced with an empty string and a `tracing::warn!` is emitted —
+/// any subsequent `dispatch focuswindow address:` becomes a harmless no-op
+/// (Hyprland silently ignores an empty address) instead of dispatching the
+/// injected payload.
+fn deserialize_address<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    if is_valid_address(&raw) {
+        Ok(raw)
+    } else {
+        tracing::warn!("Hyprland returned non-hex window address: {raw}; treating as unknown");
+        Ok(String::new())
+    }
+}
+
 /// Window/client data from Hyprland's `j/clients` command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
+    /// Window address. Validated at deserialisation against
+    /// `^0x[0-9A-Fa-f]{1,32}$`; malformed values are replaced with `""` so
+    /// downstream `dispatch focuswindow address:{addr}` interpolation can
+    /// never inject a second IPC command. See [`deserialize_address`].
+    #[serde(deserialize_with = "deserialize_address")]
     pub address: String,
     pub mapped: bool,
     pub hidden: bool,
@@ -181,8 +236,8 @@ pub fn runtime_socket_path(name: &str) -> Result<PathBuf> {
         return Err(HyprlandError::InvalidEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
     }
 
-    let runtime_dir = env::var("XDG_RUNTIME_DIR")
-        .map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
+    let runtime_dir =
+        env::var("XDG_RUNTIME_DIR").map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
     let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")
         .map_err(|_| HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"))?;
 
@@ -313,13 +368,29 @@ impl HyprlandClient {
 
     /// Check if a Hyprland IPC response indicates success.
     ///
-    /// Accepts only an empty body, a bare `"ok"`, or `"ok\n"`-prefixed
-    /// multi-line responses. The previous `starts_with("ok")` check would
-    /// have matched `"oklahoma_failed"` and any other word starting with
-    /// `ok`, masking real failures.
+    /// Accepts an empty body or a body whose every line is exactly `"ok"`
+    /// (one line per command in a `[[BATCH]]` response). This is stricter
+    /// than the previous `starts_with("ok\n")` check, which would accept
+    /// partial-failure batches like `"ok\nerror: bad\nok\n"` because the
+    /// first command happened to succeed. It also rejects substring-style
+    /// false positives like `"oklahoma"` and `"okok"`.
     #[inline]
     fn is_success(response: &str) -> bool {
-        response.is_empty() || response == "ok" || response.starts_with("ok\n")
+        if response.is_empty() {
+            return true;
+        }
+        // `lines()` strips the trailing `\n` and skips an empty trailing
+        // record, so `"ok\n"` and `"ok\nok\n"` both yield only `"ok"` lines.
+        // An empty intermediate line (e.g. `"ok\n\nok\n"`) is treated as
+        // failure — Hyprland never emits that shape for success.
+        let mut had_line = false;
+        for line in response.lines() {
+            if line != "ok" {
+                return false;
+            }
+            had_line = true;
+        }
+        had_line
     }
 
     /// Send a command and require a success response.
@@ -383,7 +454,8 @@ impl HyprlandClient {
         if commands.is_empty() {
             return Ok(());
         }
-        self.command_ok(&format!("[[BATCH]]{}", commands.join("; "))).await
+        self.command_ok(&format!("[[BATCH]]{}", commands.join("; ")))
+            .await
     }
 
     /// Execute multiple dispatch *actions* in a batch.
@@ -744,7 +816,7 @@ mod tests {
     #[test]
     fn test_picture_in_picture_window() {
         let json = r#"{
-            "address": "0xpip123",
+            "address": "0xabc123",
             "mapped": true,
             "hidden": false,
             "at": [1600, 900],
@@ -769,7 +841,7 @@ mod tests {
     #[test]
     fn test_jellyfin_media_player_window() {
         let json = r#"{
-            "address": "0xjelly",
+            "address": "0xdeadbeef",
             "mapped": true,
             "hidden": false,
             "at": [0, 0],
@@ -788,5 +860,118 @@ mod tests {
 
         assert!(client.class.contains("jellyfin"));
         assert_eq!(client.fullscreen, 2);
+    }
+
+    // --- Address validation tests ---
+
+    #[test]
+    fn is_valid_address_accepts_canonical_forms() {
+        assert!(is_valid_address("0x1"));
+        assert!(is_valid_address("0xABCDEF"));
+        assert!(is_valid_address("0xabcdef0123456789"));
+        // Exactly 32 hex digits — the upper bound.
+        assert!(is_valid_address(&format!("0x{}", "f".repeat(32))));
+    }
+
+    #[test]
+    fn is_valid_address_rejects_non_hex_and_injection() {
+        // Empty / missing prefix.
+        assert!(!is_valid_address(""));
+        assert!(!is_valid_address("abc"));
+        assert!(!is_valid_address("0x"));
+        // Non-hex character.
+        assert!(!is_valid_address("0xpip123"));
+        assert!(!is_valid_address("0xjelly"));
+        // 33 hex digits — exceeds the upper bound.
+        assert!(!is_valid_address(&format!("0x{}", "f".repeat(33))));
+        // The canonical injection vector this guard defends against.
+        assert!(!is_valid_address("0xABC;dispatch exec rm ~"));
+        assert!(!is_valid_address("0xABC dispatch exec foo"));
+        assert!(!is_valid_address("0xABC\ndispatch exec foo"));
+    }
+
+    #[test]
+    fn deserialize_address_accepts_valid_hex() {
+        let json = r#"{
+            "address": "0x55a1b2c3d4e5",
+            "mapped": true,
+            "hidden": false,
+            "at": [0, 0],
+            "size": [100, 100],
+            "workspace": {"id": 1, "name": "1"},
+            "floating": false,
+            "pinned": false,
+            "fullscreen": 0,
+            "monitor": 0,
+            "class": "x",
+            "title": "y",
+            "focusHistoryID": 0
+        }"#;
+        let client: Client = serde_json::from_str(json).expect("parse");
+        assert_eq!(client.address, "0x55a1b2c3d4e5");
+    }
+
+    #[test]
+    fn deserialize_address_replaces_injection_payload_with_empty() {
+        // A malicious / buggy compositor that returns an injection payload
+        // must be neutralised at the deserialisation boundary so the bare
+        // address never reaches `format!("focuswindow address:{addr}")`.
+        let json = r#"{
+            "address": "0xABC;dispatch exec rm ~",
+            "mapped": true,
+            "hidden": false,
+            "at": [0, 0],
+            "size": [100, 100],
+            "workspace": {"id": 1, "name": "1"},
+            "floating": false,
+            "pinned": false,
+            "fullscreen": 0,
+            "monitor": 0,
+            "class": "x",
+            "title": "y",
+            "focusHistoryID": 0
+        }"#;
+        let client: Client = serde_json::from_str(json).expect("parse");
+        assert_eq!(client.address, "", "injection payload must be neutralised");
+    }
+
+    // --- is_success tests ---
+
+    #[test]
+    fn is_success_accepts_empty_response() {
+        assert!(HyprlandClient::is_success(""));
+    }
+
+    #[test]
+    fn is_success_accepts_bare_ok() {
+        assert!(HyprlandClient::is_success("ok"));
+        assert!(HyprlandClient::is_success("ok\n"));
+    }
+
+    #[test]
+    fn is_success_accepts_multi_ok_batch_response() {
+        // Hyprland returns one `ok\n` per command in a `[[BATCH]]` response.
+        assert!(HyprlandClient::is_success("ok\nok\nok\n"));
+        assert!(HyprlandClient::is_success("ok\nok"));
+    }
+
+    #[test]
+    fn is_success_rejects_error_text() {
+        assert!(!HyprlandClient::is_success("error: unknown command"));
+    }
+
+    #[test]
+    fn is_success_rejects_substring_false_positives() {
+        // The previous `starts_with("ok")` check would have accepted these.
+        assert!(!HyprlandClient::is_success("oklahoma"));
+        assert!(!HyprlandClient::is_success("okok"));
+        assert!(!HyprlandClient::is_success("ok ok"));
+    }
+
+    #[test]
+    fn is_success_rejects_partial_failure_in_batch() {
+        // Even if the first command succeeded, a later `error: ...` line in
+        // the batch response must surface as a failure.
+        assert!(!HyprlandClient::is_success("ok\nerror: bad\nok\n"));
     }
 }

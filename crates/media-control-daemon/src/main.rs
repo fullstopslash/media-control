@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use media_control_lib::commands::{self, CommandContext, runtime_dir};
 use media_control_lib::config::Config;
+use media_control_lib::error::MediaControlError;
 use media_control_lib::hyprland::{HyprlandError, runtime_socket_path};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -27,6 +28,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Parser)]
 #[command(name = "media-control-daemon")]
 #[command(about = "Event-driven daemon for media window avoidance")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -45,8 +47,13 @@ enum Commands {
 }
 
 /// Get the path to the PID file (in `$XDG_RUNTIME_DIR`, sanitized).
-fn get_pid_file_path() -> PathBuf {
-    runtime_dir().join("media-control-daemon.pid")
+///
+/// Propagates the underlying `runtime_dir` error (typically a missing or
+/// dangerous `XDG_RUNTIME_DIR`) rather than panicking, so the daemon can
+/// fail with a meaningful message instead of crashing on a misconfigured
+/// session.
+fn get_pid_file_path() -> Result<PathBuf, MediaControlError> {
+    Ok(runtime_dir()?.join("media-control-daemon.pid"))
 }
 
 /// Get the path to the trigger FIFO.
@@ -55,8 +62,8 @@ fn get_pid_file_path() -> PathBuf {
 /// systems) rather than world-writable `/tmp`. This defends against symlink
 /// races and pre-creation attacks that would otherwise be possible at a
 /// predictable `/tmp` path on a multi-user host.
-fn get_fifo_path() -> PathBuf {
-    runtime_dir().join("media-avoider-trigger.fifo")
+fn get_fifo_path() -> Result<PathBuf, MediaControlError> {
+    Ok(runtime_dir()?.join("media-avoider-trigger.fifo"))
 }
 
 /// Get the path to Hyprland's socket2 (event stream).
@@ -73,7 +80,7 @@ fn get_socket2_path() -> Result<PathBuf, HyprlandError> {
 /// Rejects non-positive PIDs to avoid accidentally signalling process group 0
 /// or the entire session via `kill(-1, ...)` semantics.
 async fn read_pid_file() -> Option<Pid> {
-    let path = get_pid_file_path();
+    let path = get_pid_file_path().ok()?;
     let content = fs::read_to_string(&path).await.ok()?;
     let pid: i32 = content.trim().parse().ok()?;
     if pid <= 1 {
@@ -82,7 +89,7 @@ async fn read_pid_file() -> Option<Pid> {
     Some(Pid::from_raw(pid))
 }
 
-/// Write current PID to the PID file with restrictive permissions.
+/// Write the given PID to the PID file with restrictive permissions.
 ///
 /// Atomic: writes to `<path>.tmp` first, fsyncs, then `rename()`s into place.
 /// `rename` on the same filesystem is atomic, so a crash mid-write leaves
@@ -91,15 +98,14 @@ async fn read_pid_file() -> Option<Pid> {
 ///
 /// Uses O_CREAT|O_TRUNC|O_WRONLY with mode 0o600 so the temp file cannot be
 /// read by other users on a shared host.
-async fn write_pid_file() -> std::io::Result<()> {
+fn write_pid_file_for(pid: u32) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let path = get_pid_file_path();
+    let path = get_pid_file_path().map_err(std::io::Error::other)?;
     let mut tmp_path = path.clone().into_os_string();
     tmp_path.push(".tmp");
     let tmp_path = PathBuf::from(tmp_path);
-    let pid = std::process::id();
 
     // Write the new PID into a sibling temp file with 0600 perms.
     let mut opts = std::fs::OpenOptions::new();
@@ -119,10 +125,19 @@ async fn write_pid_file() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write the current process's PID to the PID file.
+///
+/// Convenience wrapper around [`write_pid_file_for`]. `async` because
+/// historical callers awaited it; the inner work is synchronous.
+async fn write_pid_file() -> std::io::Result<()> {
+    write_pid_file_for(std::process::id())
+}
+
 /// Remove the PID file.
 async fn remove_pid_file() {
-    let path = get_pid_file_path();
-    let _ = fs::remove_file(&path).await;
+    if let Ok(path) = get_pid_file_path() {
+        let _ = fs::remove_file(&path).await;
+    }
 }
 
 /// Check if a process with the given PID is running AND is plausibly our daemon.
@@ -130,8 +145,16 @@ async fn remove_pid_file() {
 /// A bare `kill(pid, 0)` is racy: PIDs are recycled, so a stale PID file may
 /// reference an unrelated process — possibly even one owned by a different
 /// user. Defend against that by also checking `/proc/<pid>/comm` matches the
-/// expected daemon binary name when available; fall back to signal-0 if
-/// `/proc` is unreadable.
+/// expected daemon binary name.
+///
+/// `/proc/<pid>/comm` outcomes:
+/// - `Ok(comm)`: trusted — match against the expected name.
+/// - `Err(NotFound)`: process is definitively gone, return false.
+/// - `Err(other)`: identity is uncertain (permission denied, /proc not
+///   mounted, transient EIO). Previously this fell back to trusting the
+///   signal-0 check, which on a recycled-PID-owned-by-this-user system
+///   would block daemon startup. Treat unknown identity as stale instead
+///   and emit a `warn!` so operators can see we couldn't confirm.
 ///
 /// Linux truncates `/proc/PID/comm` to 15 chars (TASK_COMM_LEN=16 inc. NUL),
 /// so we accept either the full crate name or the truncated 15-char prefix.
@@ -139,7 +162,6 @@ fn is_process_running(pid: Pid) -> bool {
     if signal::kill(pid, None).is_err() {
         return false;
     }
-    // Best-effort identity check — only trust kill if comm matches.
     let comm_path = format!("/proc/{}/comm", pid.as_raw());
     let full = env!("CARGO_PKG_NAME");
     // /proc/PID/comm is truncated to 15 chars on Linux.
@@ -149,8 +171,11 @@ fn is_process_running(pid: Pid) -> bool {
             let c = comm.trim();
             c == full || c == truncated
         }
-        // /proc not available or unreadable — fall back to signal-0 result.
-        Err(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            warn!("could not verify PID {pid} identity: {e}; assuming stale");
+            false
+        }
     }
 }
 
@@ -201,25 +226,21 @@ fn create_fifo_at(path: &Path) -> std::io::Result<()> {
     // mkfifo creates atomically; mode 0o600 is masked by umask, so a
     // restrictive process umask (say 0o077) is fine but a permissive one
     // (e.g. 0o022) would leave the FIFO group/other-readable. Force the
-    // intended mode with an explicit chmod after creation.
+    // intended mode with an explicit `set_permissions` after creation
+    // so the FIFO is always 0o600 regardless of inherited umask.
     //
     // The previous symlink check + per-user runtime dir means a TOCTOU
     // race here would require write access to $XDG_RUNTIME_DIR, which on
     // systemd systems is the user's own 0700 directory.
     nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))
         .map_err(std::io::Error::other)?;
-    nix::sys::stat::fchmodat(
-        None,
-        path,
-        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        nix::sys::stat::FchmodatFlags::NoFollowSymlink,
-    )
-    .map_err(std::io::Error::other)
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Create the trigger FIFO at the default daemon path.
 fn create_fifo() -> std::io::Result<PathBuf> {
-    let path = get_fifo_path();
+    let path = get_fifo_path().map_err(std::io::Error::other)?;
     create_fifo_at(&path)?;
     info!("Created trigger FIFO at {:?}", path);
     Ok(path)
@@ -231,7 +252,7 @@ fn create_fifo() -> std::io::Result<PathBuf> {
 /// follow a symlink that may have been planted at our path between the
 /// check and the unlink. `remove_file` itself does NOT follow symlinks.
 fn remove_fifo() {
-    let path = get_fifo_path();
+    let Ok(path) = get_fifo_path() else { return };
     if std::fs::symlink_metadata(&path).is_ok() {
         let _ = std::fs::remove_file(&path);
     }
@@ -244,12 +265,27 @@ fn remove_fifo() {
 /// hot spin on persistent failure (e.g. underlying file removed by another
 /// process). EINTR is surfaced by tokio as `Interrupted`; we treat it the same
 /// as any other transient error and reopen.
+///
+/// Sends are non-blocking via `try_send` and coalesce on `Full`: every FIFO
+/// line is an idempotent "re-evaluate placement" trigger, so a flooding
+/// writer can't stall the listener — if there's already a pending event in
+/// the channel a second won't change behaviour. `await`ing `tx.send` here
+/// would let a flood backpressure the listener and drop events behind a
+/// queue we don't actually need.
 async fn fifo_listener(tx: mpsc::Sender<()>) {
+    use tokio::sync::mpsc::error::TrySendError;
+
     /// Backoff applied after any read or open error. Bounded so a missing
     /// or broken FIFO can't burn CPU.
     const FIFO_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-    let path = get_fifo_path();
+    let path = match get_fifo_path() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("FIFO listener cannot resolve path: {e}");
+            return;
+        }
+    };
 
     loop {
         // Open FIFO for reading (blocks until a writer connects)
@@ -270,8 +306,15 @@ async fn fifo_listener(tx: mpsc::Sender<()>) {
             match lines.next_line().await {
                 Ok(Some(_)) => {
                     debug!("Received FIFO trigger");
-                    if tx.send(()).await.is_err() {
-                        return; // Channel closed, shutdown
+                    match tx.try_send(()) {
+                        Ok(()) => {}
+                        // Coalesce: a pending event already exists in the
+                        // channel and will be processed; the duplicate is
+                        // semantically identical so we drop it silently.
+                        Err(TrySendError::Full(())) => {
+                            debug!("FIFO trigger coalesced (channel full)");
+                        }
+                        Err(TrySendError::Closed(())) => return,
                     }
                 }
                 Ok(None) => break, // EOF — writer closed, reopen
@@ -339,21 +382,22 @@ fn is_avoid_trigger(line: &str) -> bool {
 
 /// Run a single session of the event loop (until socket disconnect).
 /// Returns Ok(true) to signal reconnect, Ok(false) for clean shutdown.
+///
+/// Returns the typed [`MediaControlError`] rather than `Box<dyn Error>` so
+/// the caller (and the log line in `run_event_loop`) can pattern-match the
+/// failure mode (`HyprlandIpc` connection vs `Io` etc) and so source chains
+/// remain inspectable end-to-end.
 async fn run_event_session(
     ctx: &CommandContext,
     debounce_duration: Duration,
     fifo_rx: &mut mpsc::Receiver<()>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, MediaControlError> {
     let stream = connect_hyprland_socket().await?;
     let mut lines = BufReader::new(stream).lines();
     let mut last_avoid_time = Instant::now();
 
     // Helper closure: apply debounce-and-trigger logic uniformly.
-    async fn maybe_trigger(
-        ctx: &CommandContext,
-        last: &mut Instant,
-        debounce: Duration,
-    ) {
+    async fn maybe_trigger(ctx: &CommandContext, last: &mut Instant, debounce: Duration) {
         if last.elapsed() >= debounce {
             trigger_avoid(ctx).await;
             *last = Instant::now();
@@ -390,12 +434,39 @@ async fn run_event_session(
     }
 }
 
+/// RAII guard that aborts a spawned task when dropped.
+///
+/// Without this, dropping a `JoinHandle` only releases our handle — the
+/// task continues running. We need active abort so that when
+/// `run_event_loop` is cancelled by the outer `tokio::select!` (SIGINT /
+/// SIGTERM) the FIFO listener cannot still be inside `File::open` against
+/// a path we are about to `unlink`. That race produced a noisy error log
+/// on every clean shutdown.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Take the inner handle, suppressing the abort-on-drop. Used when
+    /// caller wants to manage abort timing explicitly.
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 /// Run the event loop with automatic reconnection.
-async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::load().unwrap_or_else(|e| {
-        warn!("Config load failed ({e}), using defaults");
-        Config::default()
-    });
+async fn run_event_loop() -> Result<(), MediaControlError> {
+    let config = Config::load_or_warn(None);
     let debounce_ms = config.positioning.debounce_ms;
     let ctx = CommandContext::with_config(config)?;
     let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
@@ -404,11 +475,14 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
     create_fifo()?;
 
     // Channel for FIFO triggers — persists across reconnections.
-    // We retain the listener's `JoinHandle` so we can `abort()` it on
-    // unrecoverable FIFO failure, instead of letting it hot-spin against
-    // a non-existent FIFO path.
+    // The listener's `JoinHandle` is held in an RAII abort-guard so that
+    // any cancellation of this future (SIGTERM/SIGINT in the outer
+    // select!) actively aborts the listener before its drop. Without the
+    // active abort, the listener could still be mid-`File::open` on the
+    // FIFO path that `remove_fifo()` is about to unlink, producing a
+    // spurious error log every clean shutdown.
     let (fifo_tx, mut fifo_rx) = mpsc::channel::<()>(16);
-    let mut fifo_listener_handle = Some(tokio::spawn(fifo_listener(fifo_tx)));
+    let mut fifo_listener_handle = AbortOnDrop::new(tokio::spawn(fifo_listener(fifo_tx)));
 
     info!("Event loop started");
 
@@ -424,9 +498,14 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
                 // planted at our path doesn't trick us into skipping the
                 // recreate; `create_fifo_at` will then reject the symlink
                 // explicitly with a clear error.
-                if std::fs::symlink_metadata(get_fifo_path()).is_err()
-                    && let Err(e) = create_fifo()
-                {
+                let fifo_missing = match get_fifo_path() {
+                    Ok(p) => std::fs::symlink_metadata(&p).is_err(),
+                    // Path resolution itself failed — treat as missing so
+                    // we attempt recreation (which will surface the same
+                    // error from `create_fifo`).
+                    Err(_) => true,
+                };
+                if fifo_missing && let Err(e) = create_fifo() {
                     error!("Failed to recreate FIFO after reconnect: {e}");
                     // Stop the listener so it doesn't burn CPU repeatedly
                     // failing to open a FIFO we can't recreate. The main
@@ -453,16 +532,26 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_foreground() -> ExitCode {
     info!("Starting media-control-daemon in foreground mode");
 
-    // Write PID file
-    if let Err(e) = write_pid_file().await {
+    // Write PID file only if it doesn't already contain our PID. When the
+    // daemon was started via `cmd_start`, the parent has already written
+    // the PID file and dropped the start lock; rewriting it here is
+    // redundant churn (and an unnecessary atomic-rename). When the daemon
+    // is launched directly (systemd, debugging, foreground subcommand by
+    // hand) the file will be missing or hold a different value, so we
+    // need to claim it.
+    let our_pid = std::process::id();
+    let already_ours = read_pid_file()
+        .await
+        .map(|p| p.as_raw() == our_pid as i32)
+        .unwrap_or(false);
+    if !already_ours && let Err(e) = write_pid_file().await {
         error!("Failed to write PID file: {}", e);
         return ExitCode::FAILURE;
     }
 
     // Run event loop with graceful shutdown
-    let mut sigterm = match tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    ) {
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
         Ok(s) => s,
         Err(e) => {
             error!("failed to register SIGTERM handler: {e}");
@@ -500,8 +589,8 @@ async fn run_foreground() -> ExitCode {
 }
 
 /// Path of the start-lock file (single source of truth).
-fn start_lock_path() -> PathBuf {
-    runtime_dir().join("media-control-daemon.start.lock")
+fn start_lock_path() -> Result<PathBuf, MediaControlError> {
+    Ok(runtime_dir()?.join("media-control-daemon.start.lock"))
 }
 
 /// Acquire an exclusive start-lock to prevent concurrent `cmd_start` invocations
@@ -512,16 +601,19 @@ fn start_lock_path() -> PathBuf {
 /// with respect to other processes.
 fn acquire_start_lock() -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
+    let path = start_lock_path().map_err(std::io::Error::other)?;
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(start_lock_path())
+        .open(path)
 }
 
 /// Release the start lock by removing the lock file.
 fn release_start_lock() {
-    let _ = std::fs::remove_file(start_lock_path());
+    if let Ok(path) = start_lock_path() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// RAII guard that removes the on-disk start-lock sentinel on drop.
@@ -567,7 +659,26 @@ async fn acquire_or_recover_start_lock() -> Result<std::fs::File, ExitCode> {
 }
 
 /// Spawn the daemon's foreground worker as a detached background process.
+///
+/// Two important pieces of session/PID hygiene happen here:
+///
+/// 1. `process_group(0)` puts the child into its own process group, so a
+///    SIGHUP delivered to the parent's controlling terminal (e.g. when the
+///    user closes the shell that ran `media-control-daemon start`) does
+///    not propagate to the daemon. Mirrors the launch path in
+///    `commands::focus`.
+///
+/// 2. The parent writes the PID file from `child.id()` *before* returning
+///    (and therefore before the start-lock guard releases). Previously the
+///    child wrote its own PID asynchronously inside `run_foreground`,
+///    which left a window where a second `cmd_start` could run, see no
+///    PID file, and conclude the daemon was not running — racing into a
+///    second spawn. Writing from the parent closes that window: by the
+///    time the lock releases, any subsequent `read_pid_file` either sees
+///    our PID or the start lock is still held.
 fn spawn_foreground_worker() -> ExitCode {
+    use std::os::unix::process::CommandExt;
+
     let exe = match env::current_exe() {
         Ok(path) => path,
         Err(e) => {
@@ -576,24 +687,37 @@ fn spawn_foreground_worker() -> ExitCode {
         }
     };
 
-    match std::process::Command::new(&exe)
+    let mut command = std::process::Command::new(&exe);
+    command
         .arg("foreground")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            // `info!` (not `println!`): user-facing status flows through the
-            // tracing subscriber so it can be silenced/redirected uniformly.
-            info!("Daemon started (PID {})", child.id());
-            ExitCode::SUCCESS
-        }
+        .process_group(0);
+
+    let child = match command.spawn() {
+        Ok(c) => c,
         Err(e) => {
             error!("Failed to start daemon: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+
+    let pid = child.id();
+    if let Err(e) = write_pid_file_for(pid) {
+        // Couldn't claim the PID file — the child is already running but
+        // we have no way for `cmd_stop`/`cmd_status` to find it. Best
+        // effort: SIGTERM the child so we don't leak it, then surface the
+        // error.
+        error!("Failed to write PID file for spawned daemon (PID {pid}): {e}");
+        let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        return ExitCode::FAILURE;
     }
+
+    // `info!` (not `println!`): user-facing status flows through the
+    // tracing subscriber so it can be silenced/redirected uniformly.
+    info!("Daemon started (PID {pid})");
+    ExitCode::SUCCESS
 }
 
 /// Start the daemon in background mode.
@@ -846,7 +970,7 @@ mod tests {
             env::set_var("XDG_RUNTIME_DIR", dir.path());
         }
 
-        let pid_path = get_pid_file_path();
+        let pid_path = get_pid_file_path().expect("pid path resolves with XDG set");
         for bad in &["0", "1", "-1", "-9999", "not a number", ""] {
             tokio::fs::write(&pid_path, bad).await.unwrap();
             assert!(read_pid_file().await.is_none(), "pid {bad:?} must reject");

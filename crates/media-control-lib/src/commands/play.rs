@@ -53,9 +53,31 @@ impl PlayTarget {
             name => Self::Store(name.to_string()),
         }
     }
+
+    /// Parse from an owned `String`, moving rather than cloning when the
+    /// caller already owns the buffer. Equivalent to [`Self::parse`] for a
+    /// borrowed `&str` but avoids the second allocation in the `ItemId` /
+    /// `Store` branches.
+    #[must_use]
+    pub fn parse_owned(s: String) -> Self {
+        match s.as_str() {
+            "next-up" => Self::NextUp,
+            id if (32..=ITEM_ID_MAX_LEN).contains(&id.len())
+                && id.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                Self::ItemId(s)
+            }
+            _ => Self::Store(s),
+        }
+    }
 }
 
 /// Start playback via mpv-shim IPC.
+///
+/// Accepts an owned `String` so the parsed `ItemId` / `Store` variant can
+/// move the buffer instead of re-allocating from a `&str`. CLI callers that
+/// already hold a `String` should pass it through directly; tests and code
+/// that only have a borrowed `&str` can `.to_string()` at the call site.
 ///
 /// All playback delegation goes through the shim — media-control is just
 /// the control plane, not the resolution engine.
@@ -65,13 +87,17 @@ impl PlayTarget {
 /// - Returns [`crate::error::MediaControlError::MpvIpc`] with kind `NoSocket`
 ///   if the mpv IPC socket is unavailable.
 /// - Returns [`crate::error::MediaControlError::InvalidArgument`] if the
-///   parsed `Store` name exceeds [`STORE_NAME_MAX_LEN`] (defends the IPC
-///   path against unbounded CLI input). `ItemId` is bounded at parse time
-///   by [`ITEM_ID_MAX_LEN`] and so cannot trigger this path.
-pub async fn play(target_str: &str) -> crate::error::Result<()> {
-    match PlayTarget::parse(target_str) {
+///   parsed `Store` name is empty or exceeds [`STORE_NAME_MAX_LEN`]
+///   (defends the IPC path against unbounded or malformed CLI input).
+///   `ItemId` is bounded at parse time by [`ITEM_ID_MAX_LEN`] and so
+///   cannot trigger the length branch.
+pub async fn play(target: String) -> crate::error::Result<()> {
+    match PlayTarget::parse_owned(target) {
         PlayTarget::NextUp => send_mpv_script_message("play-next-up").await,
         PlayTarget::Store(name) => {
+            // Empty store name is rejected here (validate_ipc_token_len
+            // refuses empty values) so we never ship `script-message play-`
+            // to mpv with a trailing dash.
             validate_ipc_token_len("play target", &name, STORE_NAME_MAX_LEN)?;
             send_mpv_script_message(&format!("play-{name}")).await
         }
@@ -159,7 +185,7 @@ mod tests {
         use crate::error::MediaControlError;
         // 65+ char non-hex string parses as Store and exceeds STORE_NAME_MAX_LEN.
         let huge = "z".repeat(STORE_NAME_MAX_LEN + 1);
-        let err = play(&huge).await.expect_err("must reject");
+        let err = play(huge).await.expect_err("must reject");
         // Input validation must surface as InvalidArgument, never as a
         // misleading IPC connection failure.
         match err {
@@ -180,8 +206,42 @@ mod tests {
         // length check itself must not fire — so we must NOT see
         // InvalidArgument for input at the boundary.
         let max = "z".repeat(STORE_NAME_MAX_LEN);
-        if let Err(MediaControlError::InvalidArgument(msg)) = play(&max).await {
+        if let Err(MediaControlError::InvalidArgument(msg)) = play(max).await {
             panic!("length-check should not fire at the boundary: {msg}");
+        }
+    }
+
+    /// Empty store name must be rejected — interpolating `""` would ship
+    /// `script-message play-` (trailing dash) to mpv. The empty-string
+    /// guard inside `validate_ipc_token_len` catches this; we lock in the
+    /// surface here so a future caller can't accidentally relax it.
+    #[tokio::test]
+    async fn play_rejects_empty_store_name() {
+        use crate::error::MediaControlError;
+        let err = play(String::new()).await.expect_err("must reject empty");
+        match err {
+            MediaControlError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("empty"),
+                    "message should mention emptiness: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument empty-check error, got: {other:?}"),
+        }
+    }
+
+    /// `parse_owned` should yield the same enum variants as `parse` while
+    /// moving the buffer into `ItemId` / `Store` rather than re-allocating.
+    #[test]
+    fn parse_owned_matches_parse() {
+        for s in [
+            "next-up".to_string(),
+            "twitch".to_string(),
+            "jellyfin".to_string(),
+            "a5c0a87b1d058d1b7e70f5406ee274e2".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(PlayTarget::parse_owned(s.clone()), PlayTarget::parse(&s));
         }
     }
 }

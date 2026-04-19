@@ -155,6 +155,14 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
         return Ok(());
     };
 
+    // Fullscreen guard — mirrors `pin.rs` and `minify.rs`. Dispatching
+    // `movewindowpixel` against a fullscreen window is a wasted round-trip
+    // (Hyprland ignores geometry on fullscreen) and would emit a spurious
+    // `movewindow` event that consumes a debounce cycle in the avoider.
+    if window.fullscreen > 0 {
+        return Ok(());
+    }
+
     // Resolve only the position needed for this direction (avoids unnecessary stat calls).
     // The `resolve_position_or` helper centralises the `.unwrap_or(default)` pattern
     // shared with `avoid.rs`; here `0` is the canonical fallback for an unknown name.
@@ -176,7 +184,9 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
     // daemon's debounce window, so we have to beat it to the suppress file.
     suppress_avoider().await;
 
-    ctx.hyprland.dispatch_batch(&[&move_cmd, &resize_cmd]).await?;
+    ctx.hyprland
+        .dispatch_batch(&[&move_cmd, &resize_cmd])
+        .await?;
 
     Ok(())
 }
@@ -277,7 +287,7 @@ mod tests {
     fn mpv_at(x: i32, y: i32) -> String {
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -290,7 +300,7 @@ mod tests {
                 [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -405,7 +415,7 @@ mod tests {
     async fn move_no_media_window_is_noop() {
         let mock = MockHyprland::start().await;
         let clients = vec![make_test_client_full(
-            "0xfirefox",
+            "0xb1",
             "firefox",
             "Browser",
             false,

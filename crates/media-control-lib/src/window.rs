@@ -28,12 +28,16 @@ use crate::config::Pattern;
 use crate::error::{MediaControlError, Result};
 use crate::hyprland::Client;
 
-/// Maximum compiled-NFA size (bytes) for user-supplied class/title regex.
+/// Maximum compiled-NFA size (bytes) for any user-supplied regex compiled in
+/// the daemon hot path (window-matching patterns *and* override title
+/// regexes).
 ///
-/// Bounds catastrophic-backtracking surface area for the daemon hot path —
-/// `WindowMatcher::matches` runs on every focus event for every client.
-/// Mirrors the cap used in `config.rs` for override title regexes.
-const PATTERN_REGEX_SIZE_LIMIT: usize = 64 * 1024;
+/// Centralised here — `config.rs` re-exports this constant rather than
+/// keeping its own duplicate so a future tuning of the cap only has to
+/// touch one site. Bounds catastrophic-backtracking surface area for the
+/// daemon hot path: `WindowMatcher::matches` runs on every focus event for
+/// every client.
+pub(crate) const REGEX_NFA_SIZE_LIMIT: usize = 64 * 1024;
 
 /// Compile a user-supplied pattern regex with the size cap applied.
 ///
@@ -43,7 +47,7 @@ const PATTERN_REGEX_SIZE_LIMIT: usize = 64 * 1024;
 /// in the configured pattern value.
 fn compile_pattern_regex(pattern: &str) -> std::result::Result<Regex, regex::Error> {
     RegexBuilder::new(pattern)
-        .size_limit(PATTERN_REGEX_SIZE_LIMIT)
+        .size_limit(REGEX_NFA_SIZE_LIMIT)
         .build()
 }
 
@@ -84,7 +88,12 @@ pub struct CompiledPattern {
     pub key: PatternKey,
     /// Compiled regex pattern.
     pub regex: Regex,
-    /// Only match pinned or fullscreen windows.
+    /// When true, only match windows that are pinned OR in fullscreen state.
+    ///
+    /// The name is historical (matches the legacy bash config field) — the
+    /// fullscreen check exists because a fullscreen media window is
+    /// conceptually pinned-to-screen even if `pinned == false` in Hyprland.
+    /// See the implementation in [`CompiledPattern::matches`].
     pub pinned_only: bool,
     /// Automatically pin windows matching this pattern.
     pub always_pin: bool,
@@ -112,12 +121,48 @@ pub struct MatchResult {
     pub always_pin: bool,
 }
 
-/// Pinned media window — highest match priority.
-pub const PRIORITY_PINNED: u8 = 1;
-/// Focused media window — second priority.
-pub const PRIORITY_FOCUSED: u8 = 2;
-/// Any matching media window — lowest priority.
-pub const PRIORITY_ANY: u8 = 3;
+/// Match priority for a discovered media window.
+///
+/// Lower discriminants mean higher priority — `Pinned < Focused < Any`.
+/// The `u8` repr is retained so the on-wire / debug representation is a
+/// small integer matching the historical convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Priority {
+    /// Pinned media window — highest priority.
+    Pinned = 1,
+    /// Focused media window — second priority.
+    Focused = 2,
+    /// Any matching media window — lowest priority.
+    Any = 3,
+}
+
+impl Priority {
+    /// Numeric form of the priority. Useful for tests and for any caller
+    /// that still wants a plain `u8` comparison.
+    #[inline]
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl From<Priority> for u8 {
+    #[inline]
+    fn from(p: Priority) -> Self {
+        p as Self
+    }
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pinned => f.write_str("pinned"),
+            Self::Focused => f.write_str("focused"),
+            Self::Any => f.write_str("any"),
+        }
+    }
+}
 
 /// A media window with all relevant metadata.
 #[derive(Debug, Clone)]
@@ -148,8 +193,11 @@ pub struct MediaWindow {
     pub workspace_id: i32,
     /// From matching pattern's always_pin field.
     pub always_pin: bool,
-    /// Match priority — see [`PRIORITY_PINNED`], [`PRIORITY_FOCUSED`], [`PRIORITY_ANY`].
-    pub priority: u8,
+    /// Match priority — see [`Priority`]. Compare directly against the enum
+    /// (e.g. `window.priority == Priority::Pinned` or
+    /// `window.priority <= Priority::Focused`); for numeric interop use
+    /// [`Priority::as_u8`].
+    pub priority: Priority,
     /// Focus history ID from Hyprland (lower = more recently focused).
     pub focus_history_id: i32,
     /// Process ID of the window.
@@ -158,7 +206,7 @@ pub struct MediaWindow {
 
 impl MediaWindow {
     /// Create a MediaWindow from a Client and match result.
-    fn from_client(client: &Client, match_result: &MatchResult, priority: u8) -> Self {
+    fn from_client(client: &Client, match_result: &MatchResult, priority: Priority) -> Self {
         Self {
             address: client.address.clone(),
             class: client.class.clone(),
@@ -174,8 +222,8 @@ impl MediaWindow {
             workspace_id: client.workspace.id,
             always_pin: match_result.always_pin,
             priority,
-            pid: client.pid,
             focus_history_id: client.focus_history_id,
+            pid: client.pid,
         }
     }
 }
@@ -204,8 +252,9 @@ impl WindowMatcher {
 
     /// Create a new matcher from config patterns.
     ///
-    /// Invalid patterns are logged and skipped — the matcher is best-effort.
-    /// Use [`Self::new_strict`] when you want hard failure on invalid regex.
+    /// Invalid patterns are logged via `tracing` and skipped — the matcher is
+    /// best-effort. Use [`Self::new_strict`] when you want hard failure on
+    /// invalid regex.
     ///
     /// Each pattern regex is compiled with a 64 KiB NFA size cap to bound
     /// catastrophic-backtracking surface area in the daemon hot path. A
@@ -215,12 +264,12 @@ impl WindowMatcher {
             .iter()
             .filter_map(|p| {
                 let key = PatternKey::from_str(&p.key).or_else(|| {
-                    eprintln!("media-control: unknown pattern key {:?}, skipping", p.key);
+                    tracing::warn!(key = %p.key, "unknown pattern key, skipping");
                     None
                 })?;
                 let regex = compile_pattern_regex(&p.value)
                     .map_err(|e| {
-                        eprintln!("media-control: invalid regex {:?}: {e}, skipping", p.value);
+                        tracing::warn!(value = %p.value, error = %e, "invalid pattern regex, skipping");
                     })
                     .ok()?;
                 Some(Self::build(p, key, regex))
@@ -232,12 +281,18 @@ impl WindowMatcher {
 
     /// Create a matcher that validates all patterns, returning error on first
     /// invalid regex. Same NFA size cap as [`Self::new`].
+    ///
+    /// Unknown pattern keys are still skipped (matching the lenient behavior
+    /// of [`Self::new`]); only invalid *regex* patterns produce an error,
+    /// because an unknown key is a config-schema concern that the lenient
+    /// variant deliberately tolerates for forward compatibility.
     pub fn new_strict(patterns: &[Pattern]) -> Result<Self> {
         let mut compiled = Vec::with_capacity(patterns.len());
 
         for p in patterns {
             let Some(key) = PatternKey::from_str(&p.key) else {
-                continue; // Skip unknown keys
+                tracing::warn!(key = %p.key, "unknown pattern key in strict mode, skipping");
+                continue;
             };
             let regex = compile_pattern_regex(&p.value).map_err(MediaControlError::from)?;
             compiled.push(Self::build(p, key, regex));
@@ -268,18 +323,31 @@ impl WindowMatcher {
     /// 2. Focused window matching any pattern (if focus_addr provided)
     /// 3. Any window matching any pattern
     ///
+    /// Within a tier, ties are broken by `focus_history_id` (lower = more
+    /// recently focused, so the most recently interacted-with window wins).
+    /// `focus_history_id < 0` means "never focused" and sorts last regardless
+    /// of magnitude — Hyprland's `clients` array order is *creation* order,
+    /// not focus order, so we cannot rely on positional iteration.
+    ///
     /// Returns the highest priority match, or None if no media window found.
     pub fn find_media_window(
         &self,
         clients: &[Client],
         focus_addr: Option<&str>,
     ) -> Option<MediaWindow> {
+        // Tie-break key: `(never_focused, focus_history_id)`. `false < true`
+        // means "ever focused" sorts before "never focused"; within each
+        // group the lower id (more recent) wins.
+        let key = |c: &Client| (!c.has_focus_history(), c.focus_history_id);
+
         let mut pinned: Option<(&Client, MatchResult)> = None;
         let mut focused: Option<(&Client, MatchResult)> = None;
         let mut any: Option<(&Client, MatchResult)> = None;
 
-        for client in clients.iter().filter(|c| c.mapped && !c.hidden) {
-            let Some(match_result) = self.matches(client) else { continue };
+        for client in clients.iter().filter(|c| c.is_visible()) {
+            let Some(match_result) = self.matches(client) else {
+                continue;
+            };
 
             let slot = if client.pinned {
                 &mut pinned
@@ -289,16 +357,23 @@ impl WindowMatcher {
                 &mut any
             };
 
-            if slot.is_none() {
-                *slot = Some((client, match_result));
+            // Within a tier, prefer the candidate with the lower
+            // focus_history_id (most recently focused). Replacing on strict
+            // `<` keeps the first-seen winner stable when keys are equal.
+            match slot {
+                None => *slot = Some((client, match_result)),
+                Some((existing, _)) if key(client) < key(existing) => {
+                    *slot = Some((client, match_result));
+                }
+                _ => {}
             }
         }
 
         // Highest priority wins.
         pinned
-            .map(|(c, m)| (c, m, PRIORITY_PINNED))
-            .or_else(|| focused.map(|(c, m)| (c, m, PRIORITY_FOCUSED)))
-            .or_else(|| any.map(|(c, m)| (c, m, PRIORITY_ANY)))
+            .map(|(c, m)| (c, m, Priority::Pinned))
+            .or_else(|| focused.map(|(c, m)| (c, m, Priority::Focused)))
+            .or_else(|| any.map(|(c, m)| (c, m, Priority::Any)))
             .map(|(c, m, p)| MediaWindow::from_client(c, &m, p))
     }
 
@@ -308,28 +383,27 @@ impl WindowMatcher {
     pub fn find_media_windows(&self, clients: &[Client], monitor: i32) -> Vec<MediaWindow> {
         let mut windows: Vec<_> = clients
             .iter()
-            .filter(|c| c.monitor == monitor)
-            .filter(|c| c.mapped && !c.hidden)
+            .filter(|c| c.monitor == monitor && c.is_visible())
             .filter_map(|client| {
                 let match_result = self.matches(client)?;
                 let priority = if client.pinned {
-                    PRIORITY_PINNED
+                    Priority::Pinned
                 } else {
-                    PRIORITY_ANY
+                    Priority::Any
                 };
                 Some(MediaWindow::from_client(client, &match_result, priority))
             })
             .collect();
 
-        // Sort by priority, then by focus history (lower ID = more recent)
-        // focus_history_id -1 means never focused; sort those last
+        // Sort by priority, then by focus history (lower ID = more recent).
+        // `focus_history_id < 0` means "never focused"; those sort last
+        // regardless of magnitude. Using `(never_focused, id)` as the key
+        // collapses the previous explicit match arms to a single tuple
+        // comparison — `false < true` makes "ever focused" sort first.
         windows.sort_by(|a, b| {
             a.priority.cmp(&b.priority).then_with(|| {
-                match (a.focus_history_id < 0, b.focus_history_id < 0) {
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    _ => a.focus_history_id.cmp(&b.focus_history_id),
-                }
+                let key = |w: &MediaWindow| (w.focus_history_id < 0, w.focus_history_id);
+                key(a).cmp(&key(b))
             })
         });
 
@@ -342,6 +416,12 @@ impl WindowMatcher {
     /// - Is on the same workspace as the media window (or specified workspace)
     /// - Is not the media window itself
     /// - Has the lowest focus_history_id (most recently focused)
+    ///
+    /// **Important**: Hyprland's `clients` array is in *creation order*, not
+    /// focus order — positional iteration cannot answer "which window is
+    /// currently focused?". The reliable signal is `focus_history_id == 0`,
+    /// which marks the currently focused window. We sort by `focus_history_id`
+    /// here precisely because positional order is meaningless for this query.
     pub fn find_previous_focus(
         &self,
         clients: &[Client],
@@ -360,10 +440,12 @@ impl WindowMatcher {
         // and windows that were never focused (focus_history_id < 0)
         clients
             .iter()
-            .filter(|c| c.workspace.id == target_workspace)
-            .filter(|c| c.address != media_addr)
-            .filter(|c| c.mapped && !c.hidden)
-            .filter(|c| c.focus_history_id >= 0)
+            .filter(|c| {
+                c.workspace.id == target_workspace
+                    && c.address != media_addr
+                    && c.is_visible()
+                    && c.has_focus_history()
+            })
             .min_by_key(|c| c.focus_history_id)
             .map(|c| c.address.clone())
     }
@@ -372,8 +454,17 @@ impl WindowMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hyprland::Workspace;
+    use crate::test_helpers::{make_test_client, make_test_client_full};
 
+    /// Default geometry shared by both `make_client` and `make_client_full`.
+    /// Mirrors the previous local helpers so existing assertions still hold.
+    const DEFAULT_AT: [i32; 2] = [100, 100];
+    const DEFAULT_SIZE: [i32; 2] = [640, 360];
+
+    /// Thin wrapper around `test_helpers::make_test_client` for the legacy
+    /// 5-arg signature this module's tests expect. Delegates to keep the test
+    /// fixture surface in one place.
+    #[inline]
     fn make_client(
         address: &str,
         class: &str,
@@ -381,28 +472,14 @@ mod tests {
         pinned: bool,
         floating: bool,
     ) -> Client {
-        Client {
-            address: address.to_string(),
-            mapped: true,
-            hidden: false,
-            at: [100, 100],
-            size: [640, 360],
-            workspace: Workspace {
-                id: 1,
-                name: "1".to_string(),
-            },
-            floating,
-            pinned,
-            fullscreen: 0,
-            monitor: 0,
-            class: class.to_string(),
-            title: title.to_string(),
-            focus_history_id: 0,
-            pid: 0,
-        }
+        make_test_client(address, class, title, pinned, floating)
     }
 
+    /// Wrapper preserving the 9-arg signature local to this module's tests
+    /// (no explicit `at` / `size`). Forwards to `test_helpers::make_test_client_full`
+    /// with the same default geometry the previous inline helper used.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     fn make_client_full(
         address: &str,
         class: &str,
@@ -414,25 +491,40 @@ mod tests {
         monitor: i32,
         focus_history_id: i32,
     ) -> Client {
-        Client {
-            address: address.to_string(),
-            mapped: true,
-            hidden: false,
-            at: [100, 100],
-            size: [640, 360],
-            workspace: Workspace {
-                id: workspace_id,
-                name: workspace_id.to_string(),
-            },
-            floating,
+        make_test_client_full(
+            address,
+            class,
+            title,
             pinned,
+            floating,
             fullscreen,
+            workspace_id,
             monitor,
-            pid: 0,
-            class: class.to_string(),
-            title: title.to_string(),
             focus_history_id,
-        }
+            DEFAULT_AT,
+            DEFAULT_SIZE,
+        )
+    }
+
+    // --- Priority enum tests ---
+
+    #[test]
+    fn priority_ordering_is_pinned_then_focused_then_any() {
+        // The enum's `Ord` impl must order Pinned < Focused < Any so
+        // `>=` / `<=` comparisons on the field keep working.
+        assert!(Priority::Pinned < Priority::Focused);
+        assert!(Priority::Focused < Priority::Any);
+        assert_eq!(Priority::Pinned.as_u8(), 1);
+        assert_eq!(Priority::Focused.as_u8(), 2);
+        assert_eq!(Priority::Any.as_u8(), 3);
+        assert_eq!(u8::from(Priority::Pinned), 1);
+    }
+
+    #[test]
+    fn priority_display_renders_lowercase() {
+        assert_eq!(Priority::Pinned.to_string(), "pinned");
+        assert_eq!(Priority::Focused.to_string(), "focused");
+        assert_eq!(Priority::Any.to_string(), "any");
     }
 
     // Pattern matching tests
@@ -581,7 +673,7 @@ mod tests {
 
         let result = matcher.find_media_window(&clients, None).unwrap();
         assert_eq!(result.address, "0x2");
-        assert_eq!(result.priority, 1);
+        assert_eq!(result.priority, Priority::Pinned);
     }
 
     #[test]
@@ -601,7 +693,7 @@ mod tests {
 
         let result = matcher.find_media_window(&clients, Some("0x2")).unwrap();
         assert_eq!(result.address, "0x2");
-        assert_eq!(result.priority, 2);
+        assert_eq!(result.priority, Priority::Focused);
     }
 
     #[test]
@@ -620,7 +712,7 @@ mod tests {
 
         let result = matcher.find_media_window(&clients, None).unwrap();
         assert_eq!(result.address, "0x1");
-        assert_eq!(result.priority, 3);
+        assert_eq!(result.priority, Priority::Any);
     }
 
     #[test]
@@ -640,7 +732,7 @@ mod tests {
         // Even with focus_addr pointing to 0x1, pinned window should win
         let result = matcher.find_media_window(&clients, Some("0x1")).unwrap();
         assert_eq!(result.address, "0x2");
-        assert_eq!(result.priority, 1);
+        assert_eq!(result.priority, Priority::Pinned);
     }
 
     #[test]
@@ -826,7 +918,7 @@ mod tests {
         assert_eq!(windows.len(), 3);
         // First should be pinned (priority 1)
         assert_eq!(windows[0].address, "0x2");
-        assert_eq!(windows[0].priority, 1);
+        assert_eq!(windows[0].priority, Priority::Pinned);
         // Remaining sorted by focus history
         assert_eq!(windows[1].address, "0x3"); // focus_history_id 0
         assert_eq!(windows[2].address, "0x1"); // focus_history_id 2
@@ -864,7 +956,7 @@ mod tests {
         assert_eq!(window.monitor, 1);
         assert_eq!(window.workspace_id, 3);
         assert!(window.always_pin);
-        assert_eq!(window.priority, 1); // Pinned
+        assert_eq!(window.priority, Priority::Pinned);
     }
 
     // Edge cases
@@ -962,10 +1054,7 @@ mod tests {
         ];
 
         let result = matcher.find_previous_focus(&clients, "0x1", None);
-        assert!(
-            result.is_none(),
-            "should not return never-focused windows"
-        );
+        assert!(result.is_none(), "should not return never-focused windows");
     }
 
     #[test]
@@ -980,7 +1069,7 @@ mod tests {
         let clients = vec![
             make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 3),
             make_client_full("0x2", "firefox", "browser", false, false, 0, 1, 0, -1), // never focused
-            make_client_full("0x3", "kitty", "terminal", false, false, 0, 1, 0, 1), // was focused
+            make_client_full("0x3", "kitty", "terminal", false, false, 0, 1, 0, 1),   // was focused
         ];
 
         let result = matcher.find_previous_focus(&clients, "0x1", None);
@@ -1054,7 +1143,7 @@ mod tests {
         ];
         let result = matcher.find_media_window(&clients, None).unwrap();
         assert_eq!(result.address, "0x1");
-        assert_eq!(result.priority, PRIORITY_PINNED);
+        assert_eq!(result.priority, Priority::Pinned);
     }
 
     #[test]

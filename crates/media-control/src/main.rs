@@ -186,13 +186,20 @@ async fn main() {
     // Setup logging. Default to `warn` so things like a broken config file
     // are visible without `-v`; `-v` flips us up to `debug`. Done BEFORE
     // the status branch so `-v media-control status` is also instrumented.
-    let log_filter = if cli.verbose {
-        "media_control=debug"
-    } else {
-        "media_control=warn"
-    };
+    //
+    // `RUST_LOG`, when set, overrides the verbose flag — gives operators a
+    // direct escape hatch matching the daemon's behavior, e.g.
+    // `RUST_LOG=media_control=trace,reqwest=info media-control status`.
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(if cli.verbose {
+            "media_control=debug"
+        } else {
+            "media_control=warn"
+        })
+    });
     tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
+        .with_env_filter(filter)
         .with_target(false)
         .init();
 
@@ -217,21 +224,23 @@ async fn main() {
 
 /// Emit a desktop notification for a fatal error.
 ///
-/// We poll `try_wait` (not `wait`) so the notification has actually been
-/// dispatched to dbus before we exit — a bare `spawn()` followed by an
-/// immediate `process::exit` can drop the notification on slower systems
-/// because the parent's exit reaps the child before notify-send completes
-/// its dbus call. `notify-send` typically returns within a few ms, but we
-/// still cap the total wait so we never block exit indefinitely if dbus is
-/// wedged.
+/// We `await child.wait()` (under a timeout) so the notification has
+/// actually been dispatched to dbus before we exit — a bare `spawn()`
+/// followed by an immediate `process::exit` can drop the notification on
+/// slower systems because the parent's exit reaps the child before
+/// notify-send completes its dbus call. `notify-send` typically returns
+/// within a few ms, but we still cap the total wait so we never block exit
+/// indefinitely if dbus is wedged.
 ///
-/// `async` so we can use `tokio::time::sleep` instead of `std::thread::sleep`
-/// — the latter would park a tokio worker thread and could starve other
-/// tasks during the polling window.
+/// Uses `tokio::process::Command` end-to-end: `child.kill()` and
+/// `child.wait()` on the std API are blocking syscalls and would park a
+/// tokio worker thread for the full timeout. The async variants integrate
+/// with the runtime so other tasks keep making progress while we wait.
 async fn notify_error(message: &str) {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::process::Command;
 
-    let mut child = match std::process::Command::new("notify-send")
+    let mut child = match Command::new("notify-send")
         .args(["-u", "critical", "media-control", message])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -242,38 +251,23 @@ async fn notify_error(message: &str) {
         Err(_) => return,
     };
 
-    // Bounded wait: poll try_wait until done or 500ms elapses.
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) if Instant::now() >= deadline => {
-                // Don't block exit forever — notify-send is hung. Reap the
-                // child after killing so it doesn't linger as a zombie until
-                // our own exit cleans up the process table entry.
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
-            }
-            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
-            Err(_) => return,
+    // Bounded wait: a single timeout instead of a polling loop. If we hit
+    // the deadline notify-send is wedged — kill it and reap so it does not
+    // linger as a zombie after we exit.
+    match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // Load config (use override path if provided)
-    let config = match &cli.config {
-        Some(path) => Config::load_from_path(path)?,
-        None => Config::load().unwrap_or_else(|e| {
-            // `warn!` (not `debug!`): if the user has a config file that
-            // fails to parse, they should see *something* without needing
-            // `-v`. `Config::load` already returns `Ok(default)` for plain
-            // ENOENT, so reaching this branch means a real parse error.
-            tracing::warn!("Config load failed ({e}), using defaults");
-            Config::default()
-        }),
-    };
+    // Load config (use override path if provided). `load_or_warn` keeps
+    // the CLI usable even when the user's config is broken — emits a
+    // `warn!` and falls back to defaults instead of refusing to start.
+    let config = Config::load_or_warn(cli.config.as_deref());
 
     let ctx = CommandContext::with_config(config)?;
 
@@ -345,15 +339,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::seek::seek(percent).await?;
         }
         Commands::Chapter { direction } => {
-            let dir = match direction.as_str() {
-                "next" => commands::chapter::ChapterDirection::Next,
-                "prev" => commands::chapter::ChapterDirection::Prev,
-                _ => return Err("Direction must be 'next' or 'prev'".into()),
-            };
+            let dir = commands::chapter::ChapterDirection::parse(&direction)
+                .ok_or_else(|| format!("unknown chapter direction: {direction}"))?;
             commands::chapter::chapter(dir).await?;
         }
         Commands::Play { target } => {
-            commands::play::play(&target).await?;
+            // Pass the owned String so `PlayTarget::parse_owned` can move
+            // the buffer into the `Store` / `ItemId` variant instead of
+            // re-allocating from a borrowed slice.
+            commands::play::play(target).await?;
         }
         Commands::Random { random_type } => {
             commands::random::random(random_type.as_deref()).await?;

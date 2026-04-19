@@ -3,16 +3,20 @@
 use super::send_mpv_ipc_command;
 use crate::error::Result;
 
-/// Build the seek IPC payload. Percent is clamped to 0..=100 (defense in depth;
-/// the CLI parser already enforces this range).
+/// Build the seek IPC payload.
+///
+/// Percent in range 0–100; callers must validate. The single CLI entry
+/// point at `commands::seek::seek` is fed by clap's `range(0..=100)`
+/// parser, so by the time we reach this function the value is already
+/// constrained — a runtime clamp here would be dead code.
 fn build_payload(percent: u8) -> String {
-    let pct = percent.min(100);
-    serde_json::json!({"command": ["seek", pct, "absolute-percent"]}).to_string()
+    serde_json::json!({"command": ["seek", percent, "absolute-percent"]}).to_string()
 }
 
 /// Seek to an absolute percentage position in mpv.
 ///
-/// `percent` should be 0–100; values above 100 are clamped.
+/// `percent` must be in 0–100; the CLI layer enforces this via
+/// `clap::value_parser!(u8).range(0..=100)`.
 ///
 /// # Errors
 ///
@@ -33,12 +37,6 @@ mod tests {
         assert_eq!(cmd[0], "seek");
         assert_eq!(cmd[1], 50);
         assert_eq!(cmd[2], "absolute-percent");
-    }
-
-    #[test]
-    fn seek_clamps_over_100() {
-        let parsed: serde_json::Value = serde_json::from_str(&build_payload(255)).unwrap();
-        assert_eq!(parsed["command"][1], 100);
     }
 
     #[test]

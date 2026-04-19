@@ -47,6 +47,8 @@ use tokio::time::timeout;
 use crate::config::Config;
 use crate::error::Result;
 use crate::hyprland::{Client, HyprlandClient};
+#[cfg(test)]
+use crate::window::Priority;
 use crate::window::{MediaWindow, WindowMatcher};
 
 /// Shared context for command execution.
@@ -141,6 +143,44 @@ pub async fn get_media_window(ctx: &CommandContext) -> Result<Option<MediaWindow
 
     let focus_addr = find_focused_address(&clients);
     Ok(ctx.window_matcher.find_media_window(&clients, focus_addr))
+}
+
+/// Run `op` against the current media window, doing nothing when no media
+/// window is found.
+///
+/// Captures the recurring command shape:
+///
+/// ```text
+///     get_media_window(ctx).await? -> Some(w) or return Ok(()) -> dispatch
+/// ```
+///
+/// Most dispatch commands (focus, pin, fullscreen, close, ...) follow this
+/// exact pattern. Routing through this helper keeps the "no media window
+/// is a silent success" decision in one place — callers that want a hard
+/// error on missing media should call [`get_media_window`] directly.
+///
+/// # Example
+///
+/// ```ignore
+/// with_media_window(ctx, |w| async move {
+///     ctx.hyprland.dispatch(&pin_action(&w.address)).await
+/// }).await
+/// ```
+// Allow until existing callers are migrated in a follow-up pass — the
+// helper is documented and ready for adoption but not yet wired in here.
+#[allow(dead_code)]
+pub(crate) async fn with_media_window<F, Fut>(
+    ctx: &CommandContext,
+    op: F,
+) -> crate::error::Result<()>
+where
+    F: FnOnce(crate::window::MediaWindow) -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    let Some(window) = get_media_window(ctx).await? else {
+        return Ok(());
+    };
+    op(window).await
 }
 
 /// Find media window from pre-fetched clients.
@@ -305,39 +345,65 @@ pub(crate) fn async_env_test_mutex() -> &'static tokio::sync::Mutex<()> {
 // dispatch sites.
 // ---------------------------------------------------------------------------
 
+/// Debug-only assertion: `addr` must be empty or pass the canonical
+/// `^0x[0-9A-Fa-f]{1,32}$` shape enforced by
+/// [`crate::hyprland::is_valid_address`].
+///
+/// Production callers receive addresses through the `Client::address`
+/// deserialiser which already replaces malformed values with `""`; the
+/// assert exists to catch regressions in tests where a stray literal could
+/// otherwise smuggle `;dispatch exec ...` into an interpolated IPC string.
+///
+/// We do NOT short-circuit the dispatch when the address is empty —
+/// Hyprland treats `address:` with no value as a no-op, which is the same
+/// behaviour the deserialiser-side validation guarantees for hostile input.
+#[inline]
+fn assert_valid_addr(addr: &str) {
+    debug_assert!(
+        addr.is_empty() || crate::hyprland::is_valid_address(addr),
+        "window address must be empty or match ^0x[0-9A-Fa-f]{{1,32}}$: {addr}"
+    );
+}
+
 /// `focuswindow address:<addr>` action.
 #[inline]
 pub(crate) fn focus_window_action(addr: &str) -> String {
+    assert_valid_addr(addr);
     format!("focuswindow address:{addr}")
 }
 
 /// `pin address:<addr>` action.
 #[inline]
 pub(crate) fn pin_action(addr: &str) -> String {
+    assert_valid_addr(addr);
     format!("pin address:{addr}")
 }
 
 /// `togglefloating address:<addr>` action.
 #[inline]
 pub(crate) fn toggle_floating_action(addr: &str) -> String {
+    assert_valid_addr(addr);
     format!("togglefloating address:{addr}")
 }
 
 /// `closewindow address:<addr>` action.
 #[inline]
 pub(crate) fn close_window_action(addr: &str) -> String {
+    assert_valid_addr(addr);
     format!("closewindow address:{addr}")
 }
 
 /// `movewindowpixel exact <x> <y>,address:<addr>` action.
 #[inline]
 pub(crate) fn move_pixel_action(addr: &str, x: i32, y: i32) -> String {
+    assert_valid_addr(addr);
     format!("movewindowpixel exact {x} {y},address:{addr}")
 }
 
 /// `resizewindowpixel exact <w> <h>,address:<addr>` action.
 #[inline]
 pub(crate) fn resize_pixel_action(addr: &str, w: i32, h: i32) -> String {
+    assert_valid_addr(addr);
     format!("resizewindowpixel exact {w} {h},address:{addr}")
 }
 
@@ -400,11 +466,7 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
         // element is the right primitive: `keyword …` is NOT a dispatch
         // action, so the `dispatch_batch` / `dispatch` helpers (which
         // auto-prefix `dispatch `) would mangle it.
-        if let Err(e) = ctx
-            .hyprland
-            .batch(&["keyword cursor:no_warps false"])
-            .await
-        {
+        if let Err(e) = ctx.hyprland.batch(&["keyword cursor:no_warps false"]).await {
             tracing::debug!("modern cursor:no_warps reset on fallback failed: {e}");
         }
 
@@ -439,9 +501,7 @@ pub fn get_minify_state_path() -> Result<PathBuf> {
 /// default, since minified is an opt-in mode and we never want a missing
 /// env var to silently flip the window into the scaled branch.
 pub fn is_minified() -> bool {
-    get_minify_state_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    get_minify_state_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// Toggle minified mode on/off. Returns the new state.
@@ -563,21 +623,47 @@ pub(crate) fn resolve_effective_position_with_minified(
 /// file. Callers may still suppress earlier to cover additional dispatches
 /// they issue in the same operation; this internal suppression is a safety
 /// net so a caller can never forget the contract.
+///
+/// Stats the minified marker file once and forwards to
+/// [`reposition_to_default_with_minified`]. Callers that need to control the
+/// minified flag explicitly (e.g. `commands::minify`, which moves the window
+/// to its **post-toggle** geometry before flipping the on-disk flag) should
+/// call the `_with_minified` variant directly.
 pub(crate) async fn reposition_to_default(ctx: &CommandContext, addr: &str) -> Result<()> {
-    let positioning = &ctx.config.positioning;
     // Compute the minified flag once: each `resolve_effective_position` /
     // `effective_dimensions` call would otherwise stat the same minify
     // marker file. With four reads in this function alone, the redundant
     // syscalls are non-trivial — the `_with_minified` variants thread the
     // bool through so we pay for one stat instead of four.
-    let minified = is_minified();
+    reposition_to_default_with_minified(ctx, addr, is_minified()).await
+}
+
+/// Variant of [`reposition_to_default`] that takes an explicit `minified`
+/// flag instead of stat'ing the marker file.
+///
+/// Required by `commands::minify` which needs to reposition to the
+/// **post-toggle** geometry while the on-disk flag still reflects the
+/// pre-toggle state — only flipping the flag once the dispatch succeeds.
+/// Passing the bool through avoids both the redundant stat and the
+/// pre/post-toggle ambiguity.
+pub(crate) async fn reposition_to_default_with_minified(
+    ctx: &CommandContext,
+    addr: &str,
+    minified: bool,
+) -> Result<()> {
+    let positioning = &ctx.config.positioning;
     // Fall back through `resolve_effective_position_with_minified` so the
     // fallback name is also adjusted for minified mode — using the raw
     // config value here would bypass the minified offset and place the
     // window incorrectly.
     let target_x = resolve_effective_position_with_minified(ctx, &positioning.default_x, minified)
         .unwrap_or_else(|| {
-            resolve_position_or_with_minified(ctx, "x_right", ctx.config.positions.x_right, minified)
+            resolve_position_or_with_minified(
+                ctx,
+                "x_right",
+                ctx.config.positions.x_right,
+                minified,
+            )
         });
     let target_y = resolve_effective_position_with_minified(ctx, &positioning.default_y, minified)
         .unwrap_or_else(|| {
@@ -794,9 +880,7 @@ async fn mpv_ipc_exchange(
     match read_result {
         Ok(Ok(val)) => Ok(Some(val)),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            tracing::debug!(
-                "mpv {socket_path}: EOF before response (mpv closed the connection)"
-            );
+            tracing::debug!("mpv {socket_path}: EOF before response (mpv closed the connection)");
             Ok(None)
         }
         Ok(Err(e)) => {
@@ -831,15 +915,27 @@ pub async fn send_mpv_script_message_with_args(message: &str, args: &[&str]) -> 
     send_mpv_ipc_command(&payload).await
 }
 
-/// Validate that a CLI-supplied IPC token does not exceed `max_len` bytes.
+/// Validate that a CLI-supplied IPC token is non-empty and does not exceed
+/// `max_len` bytes.
 ///
 /// Returns [`crate::error::MediaControlError::InvalidArgument`] (not
-/// `MpvIpc/ConnectionFailed`) when the cap is exceeded — the connection was
-/// never attempted, the input was rejected. Centralised so every IPC-bound
-/// CLI argument enforces the cap identically and emits the same error shape
-/// for callers/tests.
+/// `MpvIpc/ConnectionFailed`) when the cap is exceeded or the value is
+/// empty — the connection was never attempted, the input was rejected.
+/// Centralised so every IPC-bound CLI argument enforces the cap identically
+/// and emits the same error shape for callers/tests.
+///
+/// Empty values are rejected because they would interpolate into a
+/// malformed IPC payload (e.g. `script-message play-` with a trailing `-`,
+/// or `script-message random ` with a trailing empty arg). Treating
+/// "missing" as a distinct case is the caller's job — pass an `Option` and
+/// branch before calling this.
 #[inline]
 pub(crate) fn validate_ipc_token_len(label: &str, value: &str, max_len: usize) -> Result<()> {
+    if value.is_empty() {
+        return Err(crate::error::MediaControlError::invalid_argument(format!(
+            "{label} must not be empty"
+        )));
+    }
     if value.len() > max_len {
         return Err(crate::error::MediaControlError::invalid_argument(format!(
             "{label} too long: {} bytes (max {max_len})",
@@ -908,7 +1004,10 @@ where
 /// avoids blocking on mpv's event flood during rapid-fire commands.
 pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
     let ok = try_mpv_paths(1, |path| async move {
-        mpv_ipc_exchange(&path, payload, false).await.ok().map(|_| ())
+        mpv_ipc_exchange(&path, payload, false)
+            .await
+            .ok()
+            .map(|_| ())
     })
     .await;
 
@@ -959,7 +1058,10 @@ pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
         Ok(resp.get("data").cloned().unwrap_or(serde_json::Value::Null))
     } else {
         Err(crate::error::MediaControlError::mpv_connection_failed(
-            format!("mpv error for {property:?}: {}", err_str.unwrap_or("unknown")),
+            format!(
+                "mpv error for {property:?}: {}",
+                err_str.unwrap_or("unknown")
+            ),
         ))
     }
 }
@@ -1317,7 +1419,7 @@ mod tests {
         let media = result.unwrap();
         assert_eq!(media.address, "0x2");
         assert_eq!(media.class, "mpv");
-        assert_eq!(media.priority, 1); // Pinned beats focused non-media
+        assert_eq!(media.priority, Priority::Pinned); // Pinned beats focused non-media
     }
 
     #[test]
@@ -1473,8 +1575,10 @@ mod tests {
 
         // is_unix_socket uses lstat; a symlink (even pointing at a real
         // socket) must NOT pass.
-        assert!(!is_unix_socket(&symlink_path),
-            "symlink to socket must be rejected by lstat-based check");
+        assert!(
+            !is_unix_socket(&symlink_path),
+            "symlink to socket must be rejected by lstat-based check"
+        );
         // The real socket (no symlink in the path) should pass.
         assert!(is_unix_socket(&real_sock));
     }
@@ -1639,16 +1743,18 @@ mod tests {
         // Clear any prior suppression from sibling tests.
         clear_suppression().await;
 
-        reposition_to_default(&ctx, "0xtest").await.unwrap();
+        reposition_to_default(&ctx, "0xdead").await.unwrap();
 
         // Both move + resize must have been dispatched.
         let cmds = mock.captured_commands().await;
         assert!(
-            cmds.iter().any(|c| c.contains("resizewindowpixel") && c.contains("0xtest")),
+            cmds.iter()
+                .any(|c| c.contains("resizewindowpixel") && c.contains("0xdead")),
             "expected resize dispatch: {cmds:?}"
         );
         assert!(
-            cmds.iter().any(|c| c.contains("movewindowpixel") && c.contains("0xtest")),
+            cmds.iter()
+                .any(|c| c.contains("movewindowpixel") && c.contains("0xdead")),
             "expected move dispatch: {cmds:?}"
         );
 
@@ -1696,7 +1802,10 @@ mod tests {
         let original = env::var("MPV_IPC_SOCKET").ok();
         // SAFETY: single-threaded test
         unsafe {
-            set_env("MPV_IPC_SOCKET", "/tmp/definitely-nonexistent-mpv-socket-xyz");
+            set_env(
+                "MPV_IPC_SOCKET",
+                "/tmp/definitely-nonexistent-mpv-socket-xyz",
+            );
         }
         let result: Option<()> = try_mpv_paths(0, |_path| async { None }).await;
         assert!(result.is_none());

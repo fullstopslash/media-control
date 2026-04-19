@@ -25,24 +25,40 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use super::{
-    CommandContext, clear_suppression, get_media_window, suppress_avoider,
-};
+use super::{CommandContext, focus_window_action, get_media_window, suppress_avoider};
 use crate::error::Result;
 
 /// Focus the media window, or launch a command if no media window exists.
 ///
 /// This command:
 /// 1. Searches for a media window matching the configured patterns
-/// 2. If found, focuses it via Hyprland IPC
+/// 2. If found, suppresses the avoider then focuses it via Hyprland IPC
+///    (suppression is scoped to the actual dispatch so a transient lookup
+///    failure does not silence the next legitimate avoid event)
 /// 3. If not found and a launch command is provided, spawns that command
-/// 4. Suppresses the avoider to prevent repositioning during focus
 ///
 /// # Arguments
 ///
 /// * `ctx` - The command context
 /// * `launch_cmd` - Optional command to run if no media window is found.
 ///   The command is executed via `sh -c` for shell expansion.
+///
+/// # Safety
+///
+/// `launch_cmd` is executed via `/bin/sh -c` with full shell expansion.
+/// Never pass untrusted input — this is only safe with hardcoded config values.
+/// Any unescaped metacharacters in `launch_cmd` (`;`, `|`, `$(...)`, backticks,
+/// redirections) will be interpreted by the shell.
+///
+/// **Concrete failure mode**: callers wrapping `media-control` (Hyprland
+/// keybinds, helper scripts, IPC daemons, GUI launchers) MUST NOT thread
+/// user-controlled data into this argument. Examples of unsafe sources include
+/// browser/window titles (an attacker-controlled page title becomes shell
+/// input), clipboard contents, filenames from the filesystem, environment
+/// variables sourced from untrusted contexts, and anything read from a
+/// socket. A title like `Picture-in-Picture; rm -rf ~` would execute the
+/// trailing command. Build the launch string from a fixed allowlist of
+/// commands defined in your own config, never from runtime data.
 ///
 /// # Returns
 ///
@@ -73,33 +89,43 @@ use crate::error::Result;
 /// # }
 /// ```
 pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> Result<bool> {
-    // Suppress avoider BEFORE the focus dispatch — the activewindow event
-    // arrives within the daemon's debounce window, so we must beat it.
-    suppress_avoider().await;
-
-    // Try to find a media window
+    // Look up the media window FIRST. Suppressing before the lookup means a
+    // transient `get_media_window` failure leaks the suppression for the
+    // configured window (worst case: the avoider misses its next event). By
+    // suppressing only when we know we're about to dispatch we keep
+    // suppression scoped to operations that actually move/focus windows.
     if let Some(window) = get_media_window(ctx).await? {
+        // Suppress avoider BEFORE the focus dispatch — the activewindow event
+        // arrives within the daemon's debounce window, so we must beat it.
+        suppress_avoider().await;
+
         // Focus the window (dispatch prepends "dispatch", so pass bare command)
-        ctx.hyprland.dispatch(&format!("focuswindow address:{}", window.address)).await?;
+        ctx.hyprland
+            .dispatch(&focus_window_action(&window.address))
+            .await?;
 
         return Ok(true);
     }
 
-    // No media window — clear the suppression we set above so the next
-    // legitimate event isn't dropped. Launch command (if any) won't generate
-    // the events we were guarding against.
-    clear_suppression().await;
-
-    // Launch command if provided
+    // Launch command if provided. No suppression needed — `sh -c <cmd>`
+    // doesn't itself generate Hyprland events; the launched app's `openwindow`
+    // is precisely the event we want the avoider to react to.
     if let Some(cmd) = launch_cmd {
-        // Spawn in background (don't wait for it)
-        Command::new("sh")
+        // Spawn in background (don't wait for it). `process_group(0)` puts the
+        // child in its own process group so it survives if `media-control`
+        // exits — without it, a SIGHUP/SIGINT delivered to our process group
+        // (e.g. when launched from a terminal that closes) would kill the
+        // newly-launched media app too.
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        command.spawn()?;
     }
 
     Ok(false)
@@ -116,7 +142,7 @@ mod tests {
 
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -129,7 +155,7 @@ mod tests {
                 [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -150,7 +176,7 @@ mod tests {
         assert!(result, "should return true when media window found");
 
         let cmds = mock.captured_commands().await;
-        let has_focus = cmds.iter().any(|c| c.contains("focuswindow address:0xmpv"));
+        let has_focus = cmds.iter().any(|c| c.contains("focuswindow address:0xd1"));
         assert!(has_focus, "should dispatch focuswindow: {cmds:?}");
     }
 
@@ -159,7 +185,7 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xfirefox",
+            "0xb1",
             "firefox",
             "Browser",
             false,

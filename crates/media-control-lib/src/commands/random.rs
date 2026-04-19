@@ -74,4 +74,24 @@ mod tests {
             panic!("length-check should not fire at the boundary: {msg}");
         }
     }
+
+    /// `Some("")` must be rejected: `script-message random ` (trailing
+    /// empty arg) would silently no-op on the shim side. The empty-string
+    /// guard inside `validate_ipc_token_len` catches this; locked in here
+    /// so a regression at that layer is caught by this command's own
+    /// test surface.
+    #[tokio::test]
+    async fn random_rejects_empty_type() {
+        use crate::error::MediaControlError;
+        let err = random(Some("")).await.expect_err("must reject empty type");
+        match err {
+            MediaControlError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("empty"),
+                    "message should mention emptiness: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument empty-check error, got: {other:?}"),
+        }
+    }
 }

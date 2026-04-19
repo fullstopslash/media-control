@@ -49,9 +49,9 @@ use serde::Deserialize;
 /// or accidental large file is symlinked at the config path.
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
-/// Maximum compiled-NFA size for a user-supplied title regex (bytes).
-/// Caps catastrophic-backtracking surface area for daemon-hot regexes.
-const TITLE_REGEX_SIZE_LIMIT: usize = 64 * 1024;
+/// Re-export of the canonical NFA size cap from `window.rs` so the override
+/// title regexes here share one source of truth with the runtime matcher.
+use crate::window::REGEX_NFA_SIZE_LIMIT as TITLE_REGEX_SIZE_LIMIT;
 
 /// Error type for configuration operations.
 #[derive(Debug, thiserror::Error)]
@@ -72,10 +72,7 @@ pub enum ConfigError {
     ///
     /// `field` names the offending key; `reason` describes the constraint.
     #[error("invalid value for {field}: {reason}")]
-    InvalidValue {
-        field: &'static str,
-        reason: String,
-    },
+    InvalidValue { field: &'static str, reason: String },
 
     /// A user-supplied regex failed to compile.
     ///
@@ -149,6 +146,32 @@ impl Config {
     pub fn load() -> Result<Self> {
         let path = Self::default_path()?;
         Self::load_from_path(&path)
+    }
+
+    /// Load configuration, falling back to defaults on any error.
+    ///
+    /// Used by binaries that should never refuse to start because of a
+    /// malformed user config — they emit a `warn!` and continue with
+    /// `Config::default()`. Centralises the pattern that was duplicated
+    /// across both the CLI and daemon main entry points.
+    ///
+    /// If `path` is `Some`, loads from that explicit path; otherwise uses
+    /// [`Config::load`] (the default `~/.config/...` location).
+    ///
+    /// `warn!` (not `debug!`) so a broken config file is visible in
+    /// production logs without needing a verbose flag. The warn fires for
+    /// any error including a missing file; if you want to silently fall
+    /// back when no user config exists, check existence before calling.
+    #[must_use]
+    pub fn load_or_warn(path: Option<&Path>) -> Self {
+        let result = match path {
+            Some(p) => Self::load_from_path(p),
+            None => Self::load(),
+        };
+        result.unwrap_or_else(|e| {
+            tracing::warn!("Config load failed ({e}), using defaults");
+            Self::default()
+        })
     }
 
     /// Load configuration from a specific path.
@@ -994,10 +1017,7 @@ pref_x = "x_left"
         for bad in [-0.5_f32, f32::NAN, f32::INFINITY, 2.0] {
             let mut config = Config::default();
             config.positioning.minified_scale = bad;
-            assert!(
-                config.validate().is_err(),
-                "scale={bad} should be rejected"
-            );
+            assert!(config.validate().is_err(), "scale={bad} should be rejected");
         }
     }
 
@@ -1043,14 +1063,20 @@ pref_x = "x_left"
         config.positions.width = 0;
         assert!(matches!(
             config.validate().unwrap_err(),
-            ConfigError::InvalidValue { field: "positions.width", .. }
+            ConfigError::InvalidValue {
+                field: "positions.width",
+                ..
+            }
         ));
 
         let mut config = Config::default();
         config.positions.height = -1;
         assert!(matches!(
             config.validate().unwrap_err(),
-            ConfigError::InvalidValue { field: "positions.height", .. }
+            ConfigError::InvalidValue {
+                field: "positions.height",
+                ..
+            }
         ));
     }
 
@@ -1065,7 +1091,10 @@ pref_x = "x_left"
         });
         assert!(matches!(
             config.validate().unwrap_err(),
-            ConfigError::InvalidRegex { field: "patterns[].value", .. }
+            ConfigError::InvalidRegex {
+                field: "patterns[].value",
+                ..
+            }
         ));
     }
 

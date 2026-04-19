@@ -214,7 +214,10 @@ async fn move_media_window(
     suppress_avoider().await;
 
     ctx.hyprland
-        .dispatch_batch(&[&move_pixel_action(addr, x, y), &resize_pixel_action(addr, w, h)])
+        .dispatch_batch(&[
+            &move_pixel_action(addr, x, y),
+            &resize_pixel_action(addr, w, h),
+        ])
         .await?;
 
     Ok(())
@@ -341,12 +344,26 @@ impl<'a> FocusedWindow<'a> {
     }
 }
 
-/// Counts all visible non-media windows on `workspace_id`, including the currently focused window.
-fn count_non_media_windows(clients: &[Client], workspace_id: i32, ctx: &CommandContext) -> usize {
+/// Counts all visible non-media windows on `workspace_id` AND `monitor_id`,
+/// including the currently focused window.
+///
+/// The monitor filter matters on multi-monitor setups: workspaces with the
+/// same id can exist on different monitors, and a non-media window on
+/// monitor 2's workspace 1 should not influence avoidance behaviour for a
+/// media window on monitor 1's workspace 1. Without this, the
+/// "single-window" heuristic (`<= 1` non-media peer) would mis-classify a
+/// monitor as crowded based on windows the user can't even see from here.
+fn count_non_media_windows(
+    clients: &[Client],
+    workspace_id: i32,
+    monitor_id: i32,
+    ctx: &CommandContext,
+) -> usize {
     clients
         .iter()
         .filter(|c| {
             c.workspace.id == workspace_id
+                && c.monitor == monitor_id
                 && c.is_visible()
                 && ctx.window_matcher.matches(c).is_none()
         })
@@ -384,12 +401,17 @@ fn classify_case<'a>(
         return None;
     }
 
-    match (is_single_workspace, focused.is_media, focused.fullscreen > 0) {
+    match (
+        is_single_workspace,
+        focused.is_media,
+        focused.fullscreen > 0,
+    ) {
         // Single-workspace, non-media fullscreen: leave the user alone.
         (true, false, true) => None,
         // Single-workspace mouseover: needs a previous window to know which
         // pair-position to toggle to.
-        (true, true, _) => ctx.window_matcher
+        (true, true, _) => ctx
+            .window_matcher
             .find_previous_focus(clients, focused.address, Some(focused.workspace_id))
             .and_then(|addr| clients.iter().find(|c| c.address == addr))
             .map(|prev| AvoidCase::MouseoverToggle { prev_window: prev }),
@@ -418,7 +440,8 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     };
 
-    let non_media_count = count_non_media_windows(&clients, focused.workspace_id, ctx);
+    let non_media_count =
+        count_non_media_windows(&clients, focused.workspace_id, focused.monitor, ctx);
     // "Single-workspace" here means at most one non-media peer alongside
     // the media windows — see `count_non_media_windows` for what this
     // includes (the focused window itself is counted).
@@ -487,7 +510,16 @@ async fn handle_move_to_primary(
     let pair_h = pair.height.unwrap_or(eh);
 
     let overlaps_focused = |x, y, w, h| {
-        rectangles_overlap(x, y, w, h, focused.x, focused.y, focused.width, focused.height)
+        rectangles_overlap(
+            x,
+            y,
+            w,
+            h,
+            focused.x,
+            focused.y,
+            focused.width,
+            focused.height,
+        )
     };
 
     for window in media_windows {
@@ -517,7 +549,15 @@ async fn handle_move_to_primary(
         };
 
         tracing::debug!("avoid: moving to {label} ({dest_x}, {dest_y})");
-        move_media_window(ctx, &window.address, dest_x, dest_y, pair.width, pair.height).await?;
+        move_media_window(
+            ctx,
+            &window.address,
+            dest_x,
+            dest_y,
+            pair.width,
+            pair.height,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -595,11 +635,10 @@ async fn handle_mouseover_geometry(
     // move_media_window call inside try_move_clear_of warmed the suppress
     // file, but the restore_focus batch below issues 3 more dispatches and
     // we don't want a tight `suppress_ms` to elapse between them.
-    if let Some(prev_addr) = ctx.window_matcher.find_previous_focus(
-        clients,
-        focused.address,
-        Some(focused.workspace_id),
-    ) {
+    if let Some(prev_addr) =
+        ctx.window_matcher
+            .find_previous_focus(clients, focused.address, Some(focused.workspace_id))
+    {
         suppress_avoider().await;
         if let Err(e) = restore_focus(ctx, &prev_addr).await {
             tracing::warn!("media-control: failed to restore focus: {e}");
@@ -628,7 +667,16 @@ async fn handle_geometry_overlap(
     media_windows: &[MediaWindow],
 ) -> Result<()> {
     let overlaps_focused = |x, y, w, h| {
-        rectangles_overlap(x, y, w, h, focused.x, focused.y, focused.width, focused.height)
+        rectangles_overlap(
+            x,
+            y,
+            w,
+            h,
+            focused.x,
+            focused.y,
+            focused.width,
+            focused.height,
+        )
     };
 
     for window in media_windows {
@@ -645,8 +693,8 @@ async fn handle_geometry_overlap(
         // also blocked; that's a per-window decision, not a reason to
         // stop processing siblings. We propagate hard errors (`?`) and
         // continue on soft "couldn't relocate this one" outcomes.
-        let _ = try_move_clear_of(ctx, &window.address, target_x, target_y, &overlaps_focused)
-            .await?;
+        let _ =
+            try_move_clear_of(ctx, &window.address, target_x, target_y, &overlaps_focused).await?;
     }
     Ok(())
 }
@@ -698,12 +746,24 @@ mod tests {
         // Adversarial socket payloads must not overflow the i32 edge math.
         // Pre-fix this would wrap and silently flip the comparison.
         assert!(rectangles_overlap(
-            i32::MAX - 100, 0, 200, 100,
-            i32::MAX - 50, 0, 100, 100,
+            i32::MAX - 100,
+            0,
+            200,
+            100,
+            i32::MAX - 50,
+            0,
+            100,
+            100,
         ));
         assert!(!rectangles_overlap(
-            i32::MAX - 100, 0, 50, 50,
-            0, 0, 100, 100,
+            i32::MAX - 100,
+            0,
+            50,
+            50,
+            0,
+            0,
+            100,
+            100,
         ));
     }
 
@@ -737,8 +797,14 @@ mod tests {
         // Touching but not overlapping → false. Pre-i64-widening this would
         // overflow during `x2 + w2`.
         assert!(!rectangles_overlap(
-            i32::MAX - 200, 0, 100, 100,
-            i32::MAX - 100, 0, 100, 100,
+            i32::MAX - 200,
+            0,
+            100,
+            100,
+            i32::MAX - 100,
+            0,
+            100,
+            100,
         ));
         // Top edge of B touches bottom edge of A.
         assert!(!rectangles_overlap(0, 0, 100, 100, 0, 100, 100, 100));
@@ -772,7 +838,7 @@ mod tests {
     fn scenario_single_workspace(mpv_at: [i32; 2]) -> String {
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -785,7 +851,7 @@ mod tests {
                 [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -808,7 +874,7 @@ mod tests {
         // mpv at [0, 0], firefox at [0, 400] with small size (doesn't overlap primary)
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -821,7 +887,7 @@ mod tests {
                 [800, 300],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -855,7 +921,7 @@ mod tests {
         // mpv at primary, firefox small and not overlapping primary
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -868,7 +934,7 @@ mod tests {
                 [800, 600],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -902,7 +968,7 @@ mod tests {
         // mpv at primary (1272, 712), floating firefox focused and overlapping that position
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -915,7 +981,7 @@ mod tests {
                 [1020, 580], // overlaps primary position
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -955,7 +1021,7 @@ mod tests {
         // mpv at some random position, floating firefox overlaps the primary position
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -968,7 +1034,7 @@ mod tests {
                 [1020, 580], // overlaps primary (1272, 712)
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -1004,7 +1070,7 @@ mod tests {
         // Firefox is fullscreen
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -1017,7 +1083,7 @@ mod tests {
                 [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -1053,7 +1119,7 @@ mod tests {
         // Single workspace (only 1 non-media window)
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -1066,7 +1132,7 @@ mod tests {
                 [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -1099,7 +1165,7 @@ mod tests {
         let focus_cmd = cmds.iter().find(|c| c.contains("focuswindow"));
         assert!(focus_cmd.is_some(), "expected focus restore: {cmds:?}");
         assert!(
-            focus_cmd.unwrap().contains("0xfirefox"),
+            focus_cmd.unwrap().contains("0xb1"),
             "expected focus restore to firefox"
         );
     }
@@ -1110,7 +1176,7 @@ mod tests {
 
         // Only mpv on workspace, no previous focus candidate
         let clients = vec![make_test_client_full(
-            "0xmpv",
+            "0xd1",
             "mpv",
             "video.mp4",
             true,
@@ -1141,7 +1207,7 @@ mod tests {
         // Firefox focused, overlapping with mpv
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -1154,7 +1220,7 @@ mod tests {
                 [800, 600], // overlaps mpv
             ),
             make_test_client_full(
-                "0xkitty",
+                "0xc1",
                 "kitty",
                 "Terminal",
                 false,
@@ -1167,7 +1233,7 @@ mod tests {
                 [800, 600],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -1198,7 +1264,7 @@ mod tests {
         // Multi-workspace: 2 non-media windows + mpv, no overlap
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -1211,7 +1277,7 @@ mod tests {
                 [800, 600],
             ),
             make_test_client_full(
-                "0xkitty",
+                "0xc1",
                 "kitty",
                 "Terminal",
                 false,
@@ -1224,7 +1290,7 @@ mod tests {
                 [800, 400],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -1254,7 +1320,7 @@ mod tests {
 
         // No window has focus_history_id == 0
         let clients = vec![make_test_client_full(
-            "0xmpv",
+            "0xd1",
             "mpv",
             "video.mp4",
             true,
@@ -1282,7 +1348,7 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xfirefox",
+            "0xb1",
             "firefox",
             "Browser",
             false,
@@ -1388,21 +1454,45 @@ mod tests {
         let clients = vec![
             // Fullscreen firefox (non-media)
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser",
-                false, false, 2, 1, 0, 0,
-                [0, 0], [1920, 1080],
+                "0xb1",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                2,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
             ),
             // Second non-media window so we are NOT in single-workspace mode.
             make_test_client_full(
-                "0xkitty", "kitty", "Terminal",
-                false, false, 0, 1, 0, 2,
-                [0, 0], [800, 600],
+                "0xc1",
+                "kitty",
+                "Terminal",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [0, 0],
+                [800, 600],
             ),
             // mpv currently far from primary
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 1,
-                [500, 500], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [500, 500],
+                [640, 360],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -1425,21 +1515,45 @@ mod tests {
         let clients = vec![
             // mpv focused (focus_history_id = 0) and overlapping firefox
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 0,
-                [200, 200], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                0,
+                [200, 200],
+                [640, 360],
             ),
             // firefox previously focused, overlapping mpv
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser",
-                false, false, 0, 1, 0, 1,
-                [100, 100], [800, 600],
+                "0xb1",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [100, 100],
+                [800, 600],
             ),
             // second non-media so we are NOT in single-workspace mode
             make_test_client_full(
-                "0xkitty", "kitty", "Terminal",
-                false, false, 0, 1, 0, 2,
-                [1500, 0], [200, 200],
+                "0xc1",
+                "kitty",
+                "Terminal",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [1500, 0],
+                [200, 200],
             ),
         ];
         mock.set_response("j/clients", &make_clients_json(&clients))
@@ -1455,7 +1569,7 @@ mod tests {
         let focus_cmd = cmds.iter().find(|c| c.contains("focuswindow"));
         assert!(focus_cmd.is_some(), "expected focus restore: {cmds:?}");
         assert!(
-            focus_cmd.unwrap().contains("0xfirefox"),
+            focus_cmd.unwrap().contains("0xb1"),
             "expected focus restore to firefox"
         );
     }
@@ -1551,7 +1665,8 @@ mod tests {
 
         let cmds = mock.captured_commands().await;
         assert!(
-            cmds.iter().any(|c| c.contains("movewindowpixel exact 200 300")),
+            cmds.iter()
+                .any(|c| c.contains("movewindowpixel exact 200 300")),
             "expected move dispatch: {cmds:?}"
         );
     }
@@ -1569,7 +1684,9 @@ mod tests {
         let mock = MockHyprland::start().await;
         let ctx = mock.context(test_config());
 
-        move_media_window(&ctx, "0xabc", 0, 0, None, None).await.unwrap();
+        move_media_window(&ctx, "0xabc", 0, 0, None, None)
+            .await
+            .unwrap();
 
         let cmds = mock.captured_commands().await;
         assert!(
@@ -1628,7 +1745,10 @@ mod tests {
         )
         .unwrap_or(u64::MAX);
         let suppressed = now.saturating_sub(timestamp_ms) < 60_000;
-        assert!(!suppressed, "0 timestamp must not suppress for any positive timeout");
+        assert!(
+            !suppressed,
+            "0 timestamp must not suppress for any positive timeout"
+        );
     }
 
     #[tokio::test]
@@ -1638,22 +1758,47 @@ mod tests {
         let mock = MockHyprland::start().await;
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser",
-                false, true, 0, 1, 0, 0,
-                [500, 500], [0, 0],
+                "0xb1",
+                "firefox",
+                "Browser",
+                false,
+                true,
+                0,
+                1,
+                0,
+                0,
+                [500, 500],
+                [0, 0],
             ),
             make_test_client_full(
-                "0xkitty", "kitty", "Term",
-                false, false, 0, 1, 0, 2,
-                [0, 0], [800, 600],
+                "0xc1",
+                "kitty",
+                "Term",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 1,
-                [1272, 712], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
 
         let ctx = mock.context(test_config());
         // Must not panic. Move may or may not happen depending on classify.
@@ -1666,22 +1811,47 @@ mod tests {
         let mock = MockHyprland::start().await;
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser",
-                false, false, 0, 1, 0, 0,
-                [-1920, -100], [800, 600],
+                "0xb1",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [-1920, -100],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xkitty", "kitty", "Term",
-                false, false, 0, 1, 0, 2,
-                [0, 0], [800, 600],
+                "0xc1",
+                "kitty",
+                "Term",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 1,
-                [1272, 712], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
 
         let ctx = mock.context(test_config());
         avoid(&ctx).await.unwrap();
@@ -1708,7 +1878,8 @@ mod tests {
         let (tx_wide, ty_wide) = calculate_target_position(&ctx, 0, 100, avail_w);
 
         assert_ne!(
-            (tx_narrow, ty_narrow), (tx_wide, ty_wide),
+            (tx_narrow, ty_narrow),
+            (tx_wide, ty_wide),
             "boundary should switch direction"
         );
         assert_eq!(tx_wide, 0, "wide should preserve media_x");
@@ -1731,22 +1902,47 @@ mod tests {
         let mock = MockHyprland::start().await;
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser",
-                false, false, 0, 1, 0, 0,
-                [900, 500], [800, 600],
+                "0xb1",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [900, 500],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xkitty", "kitty", "Term",
-                false, false, 0, 1, 0, 2,
-                [0, 0], [800, 600],
+                "0xc1",
+                "kitty",
+                "Term",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 1,
-                [1272, 712], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [1272, 712],
+                [640, 360],
             ),
         ];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
 
         let ctx = mock.context(test_config());
         avoid(&ctx).await.unwrap();
@@ -1832,14 +2028,30 @@ mod tests {
         // immediately before restore_focus regardless of the move branch.
         let clients = vec![
             make_test_client_full(
-                "0xfx", "firefox", "Browser",
-                false, false, 0, 1, 0, 1,
-                [0, 0], [800, 600],
+                "0xb2",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 0,
-                [1272, 712], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                0,
+                [1272, 712],
+                [640, 360],
             ),
         ];
         assert_handler_warms_suppression(clients, "movewindowpixel", "focuswindow").await;
@@ -1852,19 +2064,43 @@ mod tests {
         // suppression here keeps the avoider quiet until the dust settles.
         let clients = vec![
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 0,
-                [200, 200], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                0,
+                [200, 200],
+                [640, 360],
             ),
             make_test_client_full(
-                "0xfx", "firefox", "Browser",
-                false, false, 0, 1, 0, 1,
-                [100, 100], [800, 600],
+                "0xb2",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                1,
+                [100, 100],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xkitty", "kitty", "Term",
-                false, false, 0, 1, 0, 2,
-                [1500, 0], [200, 200],
+                "0xc1",
+                "kitty",
+                "Term",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [1500, 0],
+                [200, 200],
             ),
         ];
         assert_handler_warms_suppression(clients, "movewindowpixel", "focuswindow").await;
@@ -1878,22 +2114,47 @@ mod tests {
         // algorithm picks will also overlap.
         let clients = vec![
             make_test_client_full(
-                "0xfirefox", "firefox", "Browser",
-                false, false, 0, 1, 0, 0,
-                [-10_000, -10_000], [40_000, 40_000],
+                "0xb1",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [-10_000, -10_000],
+                [40_000, 40_000],
             ),
             make_test_client_full(
-                "0xkitty", "kitty", "Term",
-                false, false, 0, 1, 0, 2,
-                [0, 0], [800, 600],
+                "0xc1",
+                "kitty",
+                "Term",
+                false,
+                false,
+                0,
+                1,
+                0,
+                2,
+                [0, 0],
+                [800, 600],
             ),
             make_test_client_full(
-                "0xmpv", "mpv", "video.mp4",
-                true, true, 0, 1, 0, 1,
-                [500, 500], [640, 360],
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [500, 500],
+                [640, 360],
             ),
         ];
-        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
 
         let ctx = mock.context(test_config());
         avoid(&ctx).await.unwrap();

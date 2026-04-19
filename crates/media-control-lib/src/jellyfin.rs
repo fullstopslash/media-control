@@ -4,11 +4,14 @@
 //! supporting session management, playback control, and watched status.
 
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::redirect;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
+use url::Url;
 
 /// Maximum size accepted for the Jellyfin credentials file.
 ///
@@ -33,6 +36,23 @@ pub enum JellyfinError {
 
     #[error("invalid HTTP header value for {0}")]
     InvalidHeader(&'static str),
+
+    /// The `server` field in `cred.json` is not a usable HTTP(S) base URL.
+    ///
+    /// Without this guard, a hostile cred file with `"server":
+    /// "http://attacker.example/"` would exfiltrate the bearer token to an
+    /// attacker-controlled host on every API call. We reject non-`http(s)`
+    /// schemes, missing/empty hosts, and `user:pass@` userinfo at construction
+    /// time.
+    #[error("invalid server URL {value:?}: {reason}")]
+    InvalidServerUrl { value: String, reason: &'static str },
+
+    #[error("failed to build request URL for {path:?}: {source}")]
+    BuildUrl {
+        path: String,
+        #[source]
+        source: url::ParseError,
+    },
 
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -88,13 +108,62 @@ fn validate_id(kind: &'static str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse and validate the `server` field of a credential file as an HTTP(S)
+/// base URL.
+///
+/// Rejects anything that could redirect a bearer token to an unintended host:
+///
+/// - non-`http`/`https` schemes (e.g. `file://`, `gopher://`, `javascript:`)
+/// - missing or empty host
+/// - URLs containing user-info (`https://user:pass@host`), which would
+///   otherwise be silently merged into outgoing requests
+///
+/// On success, returns the parsed `Url` with any trailing slash present —
+/// `Url::join` handles relative-path resolution correctly without manual
+/// trimming.
+fn validate_server_url(raw: &str) -> Result<Url> {
+    let parsed = Url::parse(raw).map_err(|_| JellyfinError::InvalidServerUrl {
+        value: raw.to_string(),
+        reason: "not a valid URL",
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err(JellyfinError::InvalidServerUrl {
+                value: raw.to_string(),
+                reason: "scheme must be http or https",
+            });
+        }
+    }
+    match parsed.host_str() {
+        Some(h) if !h.is_empty() => {}
+        _ => {
+            return Err(JellyfinError::InvalidServerUrl {
+                value: raw.to_string(),
+                reason: "missing or empty host",
+            });
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(JellyfinError::InvalidServerUrl {
+            value: raw.to_string(),
+            reason: "must not contain user:pass@ credentials",
+        });
+    }
+    Ok(parsed)
+}
+
 pub type Result<T> = std::result::Result<T, JellyfinError>;
 
 /// Credentials loaded from `~/.config/jellyfin-mpv-shim/cred.json`.
 ///
 /// The credential file format is an array of server credentials.
 /// We use the first entry.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is implemented manually to redact secrets — the auto-derived form
+/// would print `token` and `device_id` verbatim, leaking them through any
+/// `tracing::error!(?creds, ...)` call or panic backtrace.
+#[derive(Clone, Deserialize)]
 pub struct Credentials {
     /// Server URL (called "address" in cred.json)
     #[serde(alias = "address")]
@@ -111,6 +180,17 @@ pub struct Credentials {
     /// Device ID for session identification (called "uuid" in cred.json)
     #[serde(alias = "uuid", default = "default_device_id")]
     pub device_id: String,
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("server", &self.server)
+            .field("user_id", &self.user_id)
+            .field("token", &"[REDACTED]")
+            .field("device_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Stable fallback device ID used when `cred.json` lacks a `uuid`.
@@ -211,6 +291,15 @@ pub struct PlayState {
     /// Whether seeking is supported
     #[serde(default)]
     pub can_seek: bool,
+
+    /// Per-occurrence queue identifier for the currently playing item.
+    ///
+    /// Distinct from `NowPlayingItem.Id`: when the same media item appears
+    /// multiple times in a queue, every occurrence gets a unique
+    /// `PlaylistItemId`. Matching the queue position by `Id` alone breaks on
+    /// repeat items (it always finds the *first* occurrence).
+    #[serde(default, rename = "PlaylistItemId")]
+    pub playlist_item_id: Option<String>,
 }
 
 /// Item in the playback queue.
@@ -219,6 +308,10 @@ pub struct PlayState {
 pub struct QueueItem {
     /// Item ID
     pub id: String,
+
+    /// Per-occurrence queue identifier — see `PlayState::playlist_item_id`.
+    #[serde(default, rename = "PlaylistItemId")]
+    pub playlist_item_id: Option<String>,
 }
 
 /// Response from the NextUp endpoint.
@@ -336,12 +429,29 @@ struct PlayCommand {
 }
 
 /// Jellyfin API client for session control.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually to redact `device_id` and `user_id` —
+/// either is enough to deanonymise a user, and the auto-derived form would
+/// leak them through any `tracing::error!(?client, ...)` or panic backtrace.
+#[derive(Clone)]
 pub struct JellyfinClient {
-    server_url: String,
+    /// Validated server base URL. Stored as a `Url` (not `String`) so every
+    /// outgoing request resolves against a host we vetted at construction
+    /// time — preventing token exfiltration via a hostile cred.json.
+    server_url: Url,
     user_id: String,
     device_id: String,
     client: reqwest::Client,
+}
+
+impl fmt::Debug for JellyfinClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JellyfinClient")
+            .field("server_url", &self.server_url.as_str())
+            .field("user_id", &"[REDACTED]")
+            .field("device_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl JellyfinClient {
@@ -435,16 +545,27 @@ impl JellyfinClient {
     /// sanitised before interpolation so a hostile `gethostname()` cannot
     /// inject quoting characters into the auth header.
     ///
-    /// `token` and `device_id` are checked for `"`, `\`, CR, LF, and NUL
-    /// before interpolation into the quoted MediaBrowser auth header format.
-    /// `HeaderValue::from_str` would reject CR/LF/NUL anyway, but we want a
-    /// typed error (`InvalidHeader`) — and to specifically rule out `"` /
-    /// `\` which could close the quoted string and smuggle additional
-    /// `Key="value"` pairs into the auth header.
+    /// `token` and `device_id` are checked for `"`, `\`, `,`, `=`, CR, LF,
+    /// and NUL before interpolation into the quoted MediaBrowser auth header
+    /// format. `HeaderValue::from_str` would reject CR/LF/NUL anyway, but we
+    /// want a typed error (`InvalidHeader`) — and to specifically rule out:
+    ///
+    /// - `"` / `\` — could close the quoted string and inject extra fields
+    /// - `,` — the MediaBrowser scheme uses `, ` to separate `Key="value"`
+    ///   pairs, so a literal `,` in a value smuggles new fields
+    /// - `=` — combined with `,` lets a payload like `, AdminToken="x"`
+    ///   forge an auth field; rejected even alone for defence in depth
     fn build_default_headers(credentials: &Credentials, hostname: &str) -> Result<HeaderMap> {
         fn header_quote_safe(s: &str) -> bool {
-            s.bytes()
-                .all(|b| b != b'"' && b != b'\\' && b != b'\r' && b != b'\n' && b != 0)
+            s.bytes().all(|b| {
+                b != b'"'
+                    && b != b'\\'
+                    && b != b','
+                    && b != b'='
+                    && b != b'\r'
+                    && b != b'\n'
+                    && b != 0
+            })
         }
         if !header_quote_safe(&credentials.device_id) {
             return Err(JellyfinError::InvalidHeader("authorization (device_id)"));
@@ -461,8 +582,11 @@ impl JellyfinClient {
         );
 
         // Single helper to convert a borrowed string into a sensitive header value.
-        let mk = |name: &'static str, value: &str| -> Result<(reqwest::header::HeaderName, HeaderValue)> {
-            let mut hv = HeaderValue::from_str(value).map_err(|_| JellyfinError::InvalidHeader(name))?;
+        let mk = |name: &'static str,
+                  value: &str|
+         -> Result<(reqwest::header::HeaderName, HeaderValue)> {
+            let mut hv =
+                HeaderValue::from_str(value).map_err(|_| JellyfinError::InvalidHeader(name))?;
             hv.set_sensitive(true);
             Ok((reqwest::header::HeaderName::from_static(name), hv))
         };
@@ -489,9 +613,11 @@ impl JellyfinClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP client can't be built, a header value is
-    /// invalid, or `credentials.user_id` / `credentials.device_id` contain
-    /// characters unsafe for a URL path segment or HTTP header value.
+    /// Returns an error if `credentials.server` is not a valid `http`/`https`
+    /// URL with a host (and no embedded user-info), the HTTP client can't be
+    /// built, a header value is invalid, or `credentials.user_id` /
+    /// `credentials.device_id` contain characters unsafe for a URL path
+    /// segment or HTTP header value.
     pub fn new(credentials: Credentials) -> Result<Self> {
         // user_id is interpolated into URL paths in many endpoints; device_id
         // rides in headers. Validate both up front so a broken cred.json is
@@ -499,20 +625,45 @@ impl JellyfinClient {
         validate_id("user", &credentials.user_id)?;
         validate_id("device", &credentials.device_id)?;
 
+        // Validate the server URL **before** building any headers — a
+        // hostile cred.json with `"server": "http://attacker.example/"` would
+        // otherwise leak the bearer token to an attacker-controlled host on
+        // every request.
+        let server_url = validate_server_url(&credentials.server)?;
+
         // Lossy is fine: hostname is identification, not a security boundary.
         // `to_string_lossy()` returns a `Cow` that borrows the OsString when
         // it's already UTF-8 — only an invalid sequence triggers an alloc.
         let hostname = gethostname::gethostname();
         let headers = Self::build_default_headers(&credentials, &hostname.to_string_lossy())?;
 
+        // Strip cross-host redirects so the auth headers (which reqwest's
+        // default redirect policy preserves on same-origin hops) can never be
+        // forwarded to a different host. Without this, a misconfigured server
+        // returning `Location: http://attacker.example/` would exfiltrate the
+        // bearer token.
+        let redirect_policy = redirect::Policy::custom(|attempt| {
+            let previous = attempt.previous();
+            // `previous` is non-empty inside this callback (the current attempt
+            // is always preceded by at least one prior URL), but defensively
+            // fall back to "stop" if that ever changes.
+            let prev_host = previous.first().and_then(|u| u.host());
+            if attempt.url().host() != prev_host {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        });
+
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
+            .redirect(redirect_policy)
             .build()?;
 
         Ok(Self {
-            server_url: credentials.server.trim_end_matches('/').to_string(),
+            server_url,
             user_id: credentials.user_id,
             device_id: credentials.device_id,
             client,
@@ -530,42 +681,93 @@ impl JellyfinClient {
     /// Build a fully-qualified endpoint URL from a path fragment.
     ///
     /// `path` should be the API path without a leading `/` (e.g. `Sessions`,
-    /// `Users/abc/Items`). This avoids per-call `format!("{}/...", server_url)`
-    /// repetition.
-    fn endpoint(&self, path: &str) -> String {
-        let mut url = String::with_capacity(self.server_url.len() + 1 + path.len());
-        url.push_str(&self.server_url);
-        url.push('/');
-        url.push_str(path);
-        url
+    /// `Users/abc/Items`). Uses `Url::join` so the parsed base URL governs
+    /// host/scheme — `format!("{server}/{path}")` would let a future change
+    /// to the path silently change the host (e.g. an absolute `//evil/x`).
+    ///
+    /// `Url::join` requires the base to have a trailing slash to treat
+    /// itself as a directory; we handle bases without one transparently here
+    /// so callers don't have to think about it.
+    fn endpoint(&self, path: &str) -> Result<Url> {
+        // Ensure the base ends with `/` so `join` resolves `path` *under* the
+        // base rather than replacing the base's last segment.
+        let base = if self.server_url.path().ends_with('/') {
+            self.server_url.clone()
+        } else {
+            let mut b = self.server_url.clone();
+            b.set_path(&format!("{}/", b.path()));
+            b
+        };
+        base.join(path).map_err(|e| JellyfinError::BuildUrl {
+            path: path.to_string(),
+            source: e,
+        })
+    }
+
+    /// Core HTTP transport: build, dispatch, error-check, and deserialise a
+    /// JSON response.
+    ///
+    /// All public Jellyfin endpoints route through this so the
+    /// build/query/body/`error_for_status`/`json` chain lives in exactly one
+    /// place. Pair with `request_empty` when the endpoint has no response
+    /// body (or when ignoring it is intentional).
+    async fn request<R, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&B>,
+    ) -> Result<R>
+    where
+        R: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let mut req = self
+            .client
+            .request(method, self.endpoint(path)?)
+            .query(query);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        Ok(req.send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Variant of `request` that doesn't deserialise a response body.
+    ///
+    /// We still call `.send().await?.error_for_status()?` so HTTP errors
+    /// surface as `JellyfinError::Http` rather than silently succeeding.
+    async fn request_empty<B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&B>,
+    ) -> Result<()>
+    where
+        B: Serialize + ?Sized,
+    {
+        let mut req = self
+            .client
+            .request(method, self.endpoint(path)?)
+            .query(query);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        req.send().await?.error_for_status()?;
+        Ok(())
     }
 
     /// GET an endpoint and deserialise the JSON body.
-    async fn get_json<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        query: &[(&str, &str)],
-    ) -> Result<T> {
-        Ok(self
-            .client
-            .get(self.endpoint(path))
-            .query(query)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+    async fn get_json<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
+        // `()` is a placeholder body type — `None` means no body is sent.
+        self.request::<T, ()>(reqwest::Method::GET, path, query, None)
+            .await
     }
 
     /// POST to an endpoint with no body, ignoring the response.
     async fn post_empty(&self, path: &str, query: &[(&str, &str)]) -> Result<()> {
-        self.client
-            .post(self.endpoint(path))
-            .query(query)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        self.request_empty::<()>(reqwest::Method::POST, path, query, None)
+            .await
     }
 
     /// POST a JSON body to an endpoint, deserialising the response.
@@ -575,16 +777,8 @@ impl JellyfinClient {
         query: &[(&str, &str)],
         body: &B,
     ) -> Result<R> {
-        Ok(self
-            .client
-            .post(self.endpoint(path))
-            .query(query)
-            .json(body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        self.request(reqwest::Method::POST, path, query, Some(body))
+            .await
     }
 
     /// POST a JSON body to an endpoint, ignoring the response.
@@ -594,14 +788,8 @@ impl JellyfinClient {
         query: &[(&str, &str)],
         body: &B,
     ) -> Result<()> {
-        self.client
-            .post(self.endpoint(path))
-            .query(query)
-            .json(body)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        self.request_empty(reqwest::Method::POST, path, query, Some(body))
+            .await
     }
 
     /// Fetch all active sessions from the server.
@@ -703,49 +891,58 @@ impl JellyfinClient {
         self.post_empty(&path, &[]).await
     }
 
+    /// Fetch the active MPV session and its currently playing item.
+    ///
+    /// Centralises the "require session, require playing item" preamble used
+    /// by every "act on what's currently playing" entry point. Returns the
+    /// session by value (callers usually need its `id`) and a *clone* of the
+    /// now-playing item — `current_item()` borrows from `session`, and
+    /// returning a borrow alongside the owner forces awkward lifetime gymnastics
+    /// at every call site.
+    async fn current_session_and_item(&self) -> Result<(Session, NowPlayingItem)> {
+        let session = self.require_mpv_session().await?;
+        let item = session
+            .current_item()
+            .ok_or(JellyfinError::NoPlayingItem)?
+            .clone();
+        Ok((session, item))
+    }
+
     /// Mark the currently playing item as watched.
     pub async fn mark_current_watched(&self) -> Result<()> {
-        let session = self.require_mpv_session().await?;
-        let item = session.current_item().ok_or(JellyfinError::NoPlayingItem)?;
+        let (_session, item) = self.current_session_and_item().await?;
         self.mark_watched(&item.id).await
     }
 
     /// Mark the current item as watched and stop playback.
     pub async fn mark_watched_and_stop(&self) -> Result<()> {
-        let session = self.require_mpv_session().await?;
-        let item = session.current_item().ok_or(JellyfinError::NoPlayingItem)?;
-        let item_id = item.id.clone();
-
-        self.mark_watched(&item_id).await?;
+        let (session, item) = self.current_session_and_item().await?;
+        self.mark_watched(&item.id).await?;
         self.stop(&session.id).await
     }
 
-    /// Get the next episode in a series (NextUp).
+    /// Get the next-up item.
+    ///
+    /// `series_id = Some(id)` returns the next episode for that series; `None`
+    /// returns the first global NextUp item across all shows. The two cases
+    /// share the same response shape, so we keep one method instead of two.
     ///
     /// # Errors
     ///
-    /// Returns an error if `series_id` contains characters unsafe for a URL
-    /// path segment, or the HTTP request fails.
-    pub async fn get_next_up(&self, series_id: &str) -> Result<Option<String>> {
-        validate_id("series", series_id)?;
-        let path = format!("Shows/{series_id}/NextUp");
-        let response: NextUpResponse = self
-            .get_json(&path, &[("UserId", &self.user_id)])
-            .await?;
-        Ok(response.items.into_iter().next().map(|item| item.id))
-    }
-
-    /// Get the global next-up item across all shows.
-    ///
-    /// Unlike `get_next_up()` which is per-series, this returns the first
-    /// NextUp item across all shows.
-    pub async fn get_global_next_up(&self) -> Result<Option<String>> {
-        let response: NextUpResponse = self
-            .get_json(
-                "Shows/NextUp",
-                &[("UserId", &self.user_id), ("Limit", "1")],
-            )
-            .await?;
+    /// Returns an error if `series_id` is `Some` and contains characters
+    /// unsafe for a URL path segment, or the HTTP request fails.
+    pub async fn get_next_up(&self, series_id: Option<&str>) -> Result<Option<String>> {
+        let response: NextUpResponse = match series_id {
+            Some(sid) => {
+                validate_id("series", sid)?;
+                let path = format!("Shows/{sid}/NextUp");
+                self.get_json(&path, &[("UserId", &self.user_id)]).await?
+            }
+            None => {
+                self.get_json("Shows/NextUp", &[("UserId", &self.user_id), ("Limit", "1")])
+                    .await?
+            }
+        };
         Ok(response.items.into_iter().next().map(|item| item.id))
     }
 
@@ -782,16 +979,16 @@ impl JellyfinClient {
         start_ticks: i64,
     ) -> Result<()> {
         validate_id("session", session_id)?;
-        // `item_id` rides in the query string, but a hostile value with `&`
-        // or `=` could still smuggle extra parameters, and it ultimately
-        // identifies a path entity downstream — validate it the same way.
+        // `item_id` rides in the query string. `reqwest`'s `.query()`
+        // percent-encodes `&` and `=`, so query-string injection is *not* the
+        // concern here — validation ensures the value is a well-formed
+        // Jellyfin ID (path-segment safe), since the same ID is used as a path
+        // entity by other endpoints (`mark_watched`, `get_item_resume_ticks`)
+        // and a hostile value would otherwise sneak past those.
         validate_id("item", item_id)?;
         let path = format!("Sessions/{session_id}/Playing");
         let start_ticks_str;
-        let mut query: Vec<(&str, &str)> = vec![
-            ("PlayCommand", "PlayNow"),
-            ("ItemIds", item_id),
-        ];
+        let mut query: Vec<(&str, &str)> = vec![("PlayCommand", "PlayNow"), ("ItemIds", item_id)];
         if start_ticks > 0 {
             start_ticks_str = start_ticks.to_string();
             query.push(("StartPositionTicks", &start_ticks_str));
@@ -814,10 +1011,14 @@ impl JellyfinClient {
     /// Returns an error if `session_id` or any element of `item_ids` contains
     /// characters unsafe for a URL path segment, or the HTTP request fails.
     pub async fn play_items(&self, session_id: &str, item_ids: Vec<String>) -> Result<()> {
+        // Validate the session ID **before** the empty-list short-circuit so a
+        // malformed `session_id` always surfaces as `InvalidId` — even when the
+        // caller happens to pass an empty queue. Otherwise a bug calling
+        // `play_items("../admin", vec![])` would silently succeed.
+        validate_id("session", session_id)?;
         if item_ids.is_empty() {
             return Ok(());
         }
-        validate_id("session", session_id)?;
         for id in &item_ids {
             validate_id("item", id)?;
         }
@@ -866,10 +1067,33 @@ impl JellyfinClient {
     }
 
     /// Get remaining queue item IDs after the current item.
+    ///
+    /// Prefers matching the current position by `PlaylistItemId` (which is
+    /// unique per queue occurrence) over the raw media `Id`. `Id`-based
+    /// matching is only correct when the current item appears at most once in
+    /// the queue; a queue with repeated items (e.g. a season where the same
+    /// trailer is inserted between episodes) would otherwise always resume
+    /// from the *first* occurrence.
+    ///
+    /// Falls back to `Id`-matching only when either side lacks a
+    /// `PlaylistItemId` — older Jellyfin servers, and some code paths that
+    /// synthesise a `Session`, don't populate the field.
     pub fn get_remaining_queue_ids(session: &Session, current_item_id: &str) -> Vec<String> {
         let queue = &session.now_playing_queue;
+        let current_playlist_item_id = session
+            .play_state
+            .as_ref()
+            .and_then(|ps| ps.playlist_item_id.as_deref());
 
-        let current_idx = queue.iter().position(|item| item.id == current_item_id);
+        let current_idx = queue.iter().position(|item| {
+            // Both sides present → match by playlist position (unique).
+            if let (Some(a), Some(b)) = (item.playlist_item_id.as_deref(), current_playlist_item_id)
+            {
+                return a == b;
+            }
+            // Either side missing → fall back to raw item id (legacy path).
+            item.id == current_item_id
+        });
 
         match current_idx {
             Some(idx) if idx + 1 < queue.len() => queue[idx + 1..]
@@ -924,7 +1148,7 @@ impl JellyfinClient {
         // Silently swallowing the `Err` would make a misconfigured server look
         // like "no next episode" forever, so we warn.
         if let Some(sid) = series_id {
-            match self.get_next_up(&sid).await {
+            match self.get_next_up(Some(&sid)).await {
                 Ok(Some(next_id)) => {
                     return self.play_item(&session_id, &next_id).await;
                 }
@@ -1034,9 +1258,13 @@ impl JellyfinClient {
         format!("Users/{user_id}/Items")
     }
 
-    /// Get the server URL.
+    /// Get the server URL as a string slice.
+    ///
+    /// Returns the canonical form produced by `Url::parse`, which may differ
+    /// slightly from the raw `cred.json` value (e.g. trailing slash, lowercase
+    /// scheme/host). Internal call sites should use the typed `Url` directly.
     pub fn server_url(&self) -> &str {
-        &self.server_url
+        self.server_url.as_str()
     }
 
     /// Get the user ID.
@@ -1053,6 +1281,20 @@ impl JellyfinClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `Credentials` literal with placeholder fields.
+    ///
+    /// Five-plus tests previously open-coded the same struct literal. Putting
+    /// it here keeps the test bodies focused on the actual behaviour under
+    /// test, and means a future field addition only updates one place.
+    fn fake_creds() -> Credentials {
+        Credentials {
+            server: "http://example.com".into(),
+            user_id: "u1".into(),
+            token: "tok".into(),
+            device_id: "did".into(),
+        }
+    }
 
     #[test]
     fn test_credentials_parsing() {
@@ -1164,15 +1406,19 @@ mod tests {
             now_playing_queue: vec![
                 QueueItem {
                     id: "a".to_string(),
+                    playlist_item_id: None,
                 },
                 QueueItem {
                     id: "b".to_string(),
+                    playlist_item_id: None,
                 },
                 QueueItem {
                     id: "c".to_string(),
+                    playlist_item_id: None,
                 },
                 QueueItem {
                     id: "d".to_string(),
+                    playlist_item_id: None,
                 },
             ],
             now_playing_queue_full_items: Vec::new(),
@@ -1198,10 +1444,9 @@ mod tests {
     #[test]
     fn build_default_headers_populates_all_fields() {
         let creds = Credentials {
-            server: "http://example.com".into(),
-            user_id: "u1".into(),
             token: "secret-token".into(),
             device_id: "device-id-1".into(),
+            ..fake_creds()
         };
         let headers = JellyfinClient::build_default_headers(&creds, "test-host")
             .expect("headers should build");
@@ -1222,11 +1467,15 @@ mod tests {
             Some("secret-token")
         );
         assert_eq!(
-            headers.get("x-emby-device-id").and_then(|v| v.to_str().ok()),
+            headers
+                .get("x-emby-device-id")
+                .and_then(|v| v.to_str().ok()),
             Some("device-id-1")
         );
         assert_eq!(
-            headers.get("x-emby-device-name").and_then(|v| v.to_str().ok()),
+            headers
+                .get("x-emby-device-name")
+                .and_then(|v| v.to_str().ok()),
             Some("test-host")
         );
         assert_eq!(
@@ -1241,12 +1490,7 @@ mod tests {
 
     #[test]
     fn build_default_headers_sanitises_hostile_hostname() {
-        let creds = Credentials {
-            server: "http://example.com".into(),
-            user_id: "u1".into(),
-            token: "tok".into(),
-            device_id: "did".into(),
-        };
+        let creds = fake_creds();
         // Hostname contains quote, backslash and newline — characters that
         // would either be rejected by `HeaderValue::from_str` or smuggle into
         // the `Authorization` header as quoting-corrupting characters.
@@ -1260,10 +1504,7 @@ mod tests {
 
     #[test]
     fn sanitize_header_value_falls_back_for_empty_input() {
-        assert_eq!(
-            JellyfinClient::sanitize_header_value(""),
-            "media-control"
-        );
+        assert_eq!(JellyfinClient::sanitize_header_value(""), "media-control");
         assert_eq!(
             JellyfinClient::sanitize_header_value("!!!@@@"),
             "media-control"
@@ -1550,8 +1791,8 @@ mod tests {
             "\0null",
             "abc\nnewline",
         ] {
-            let err = validate_id("item", evil)
-                .expect_err(&format!("expected reject for {evil:?}"));
+            let err =
+                validate_id("item", evil).expect_err(&format!("expected reject for {evil:?}"));
             assert!(matches!(err, JellyfinError::InvalidId { .. }));
         }
     }
@@ -1581,10 +1822,8 @@ mod tests {
         // A hostile cred.json with a path-traversal user_id must be rejected
         // at construction time, not on first API call.
         let creds = Credentials {
-            server: "http://example.com".into(),
             user_id: "../admin".into(),
-            token: "tok".into(),
-            device_id: "did".into(),
+            ..fake_creds()
         };
         let err = JellyfinClient::new(creds).unwrap_err();
         assert!(matches!(err, JellyfinError::InvalidId { kind: "user", .. }));
@@ -1595,10 +1834,8 @@ mod tests {
         // A token with a literal `"` could close the auth header's quoted
         // section and smuggle additional `Key="value"` pairs.
         let creds = Credentials {
-            server: "http://example.com".into(),
-            user_id: "u1".into(),
             token: "tok\"injected".into(),
-            device_id: "did".into(),
+            ..fake_creds()
         };
         let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
         assert!(matches!(err, JellyfinError::InvalidHeader(s) if s.contains("token")));
@@ -1607,10 +1844,8 @@ mod tests {
     #[test]
     fn build_default_headers_rejects_backslash_in_device_id() {
         let creds = Credentials {
-            server: "http://example.com".into(),
-            user_id: "u1".into(),
-            token: "tok".into(),
             device_id: "did\\\"smuggle".into(),
+            ..fake_creds()
         };
         let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
         assert!(matches!(err, JellyfinError::InvalidHeader(s) if s.contains("device_id")));
@@ -1620,25 +1855,236 @@ mod tests {
     fn build_default_headers_rejects_crlf_in_token() {
         // CRLF in a header value could smuggle a whole new HTTP header.
         let creds = Credentials {
-            server: "http://example.com".into(),
-            user_id: "u1".into(),
             token: "tok\r\nX-Admin: yes".into(),
-            device_id: "did".into(),
+            ..fake_creds()
         };
         let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
         assert!(matches!(err, JellyfinError::InvalidHeader(_)));
     }
 
     #[test]
+    fn build_default_headers_rejects_comma_in_token() {
+        // A `,` in the token would inject a new MediaBrowser auth field
+        // (e.g. `, AdminToken="x"`).
+        let creds = Credentials {
+            token: "tok, AdminToken=\"x\"".into(),
+            ..fake_creds()
+        };
+        let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidHeader(s) if s.contains("token")));
+    }
+
+    #[test]
+    fn build_default_headers_rejects_equals_in_device_id() {
+        // Defence in depth: even on its own, `=` shouldn't appear in a value
+        // since the auth scheme uses `Key=value` syntax.
+        let creds = Credentials {
+            device_id: "did=injected".into(),
+            ..fake_creds()
+        };
+        let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidHeader(s) if s.contains("device_id")));
+    }
+
+    #[test]
     fn jellyfin_client_new_rejects_invalid_device_id() {
         let creds = Credentials {
-            server: "http://example.com".into(),
-            user_id: "u1".into(),
-            token: "tok".into(),
             device_id: "evil/id".into(),
+            ..fake_creds()
         };
         let err = JellyfinClient::new(creds).unwrap_err();
-        assert!(matches!(err, JellyfinError::InvalidId { kind: "device", .. }));
+        assert!(matches!(
+            err,
+            JellyfinError::InvalidId { kind: "device", .. }
+        ));
+    }
+
+    #[test]
+    fn jellyfin_client_new_rejects_non_http_scheme() {
+        // file://, gopher://, javascript: — anything but http(s) must fail.
+        for evil in [
+            "file:///etc/passwd",
+            "gopher://example.com",
+            "javascript:alert(1)",
+            "ftp://example.com",
+        ] {
+            let creds = Credentials {
+                server: evil.into(),
+                ..fake_creds()
+            };
+            let err = JellyfinClient::new(creds).unwrap_err();
+            assert!(
+                matches!(err, JellyfinError::InvalidServerUrl { .. }),
+                "expected InvalidServerUrl for {evil:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jellyfin_client_new_rejects_userinfo_in_url() {
+        // user:pass@ embedded in the URL would be silently merged into every
+        // request — block it so a hostile cred.json can't smuggle credentials.
+        let creds = Credentials {
+            server: "http://attacker:pw@example.com".into(),
+            ..fake_creds()
+        };
+        let err = JellyfinClient::new(creds).unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidServerUrl { .. }));
+    }
+
+    #[test]
+    fn jellyfin_client_new_rejects_garbage_url() {
+        let creds = Credentials {
+            server: "not a url at all".into(),
+            ..fake_creds()
+        };
+        let err = JellyfinClient::new(creds).unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidServerUrl { .. }));
+    }
+
+    #[test]
+    fn jellyfin_client_new_accepts_valid_https_url() {
+        // Sanity check: the validator must not over-reject normal inputs.
+        let creds = Credentials {
+            server: "https://jellyfin.example.com:8920/".into(),
+            ..fake_creds()
+        };
+        JellyfinClient::new(creds).expect("https with trailing slash should parse");
+    }
+
+    #[test]
+    fn endpoint_join_resolves_under_base_path() {
+        let creds = Credentials {
+            server: "http://example.com/jellyfin".into(),
+            ..fake_creds()
+        };
+        let client = JellyfinClient::new(creds).expect("client builds");
+        let url = client.endpoint("Sessions").expect("endpoint joins");
+        // The base lacks a trailing `/`, but `endpoint` adds one so the API
+        // path lands *under* the base, not replacing the last segment.
+        assert_eq!(url.as_str(), "http://example.com/jellyfin/Sessions");
+    }
+
+    #[test]
+    fn credentials_debug_redacts_token_and_device_id() {
+        // The whole point of the manual `Debug` impl: a `tracing::error!(?creds)`
+        // or panic backtrace must not leak the bearer token.
+        let dbg = format!("{:?}", fake_creds());
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "redaction marker missing: {dbg}"
+        );
+        assert!(!dbg.contains("\"tok\""), "token leaked in debug: {dbg}");
+        assert!(!dbg.contains("\"did\""), "device_id leaked in debug: {dbg}");
+        // server and user_id are *not* secret — they should still appear so
+        // logs remain useful for diagnosis.
+        assert!(dbg.contains("example.com"), "server elided: {dbg}");
+        assert!(dbg.contains("u1"), "user_id elided: {dbg}");
+    }
+
+    #[test]
+    fn jellyfin_client_debug_redacts_user_and_device_ids() {
+        let client = JellyfinClient::new(fake_creds()).expect("client builds");
+        let dbg = format!("{client:?}");
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "redaction marker missing: {dbg}"
+        );
+        assert!(!dbg.contains("\"u1\""), "user_id leaked in debug: {dbg}");
+        assert!(!dbg.contains("\"did\""), "device_id leaked in debug: {dbg}");
+    }
+
+    #[test]
+    fn get_remaining_queue_ids_disambiguates_repeats_via_playlist_item_id() {
+        // The same media item appears twice; without `PlaylistItemId` the
+        // helper would always resume from the first occurrence.
+        let session = Session {
+            id: "s1".into(),
+            user_id: "u1".into(),
+            device_name: "test".into(),
+            client: "test".into(),
+            device_id: "d1".into(),
+            now_playing_item: None,
+            play_state: Some(PlayState {
+                position_ticks: None,
+                is_paused: false,
+                can_seek: false,
+                playlist_item_id: Some("p2".into()),
+            }),
+            now_playing_queue: vec![
+                QueueItem {
+                    id: "a".into(),
+                    playlist_item_id: Some("p1".into()),
+                },
+                QueueItem {
+                    id: "b".into(),
+                    playlist_item_id: Some("p2".into()),
+                },
+                QueueItem {
+                    id: "a".into(), // repeat of the first item
+                    playlist_item_id: Some("p3".into()),
+                },
+                QueueItem {
+                    id: "c".into(),
+                    playlist_item_id: Some("p4".into()),
+                },
+            ],
+            now_playing_queue_full_items: Vec::new(),
+        };
+
+        // `current_item_id` is `"a"` (which appears twice); without
+        // playlist_item_id matching we'd return `["b", "a", "c"]` (resuming
+        // from the first occurrence). With it, the position is unambiguously
+        // queue index 1 (`p2`), and the remainder is `["a", "c"]`.
+        let remaining = JellyfinClient::get_remaining_queue_ids(&session, "a");
+        assert_eq!(remaining, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn get_remaining_queue_ids_falls_back_to_id_when_playlist_id_absent() {
+        // Older servers don't populate PlaylistItemId — the helper must still
+        // work via raw id matching.
+        let session = Session {
+            id: "s1".into(),
+            user_id: "u1".into(),
+            device_name: "test".into(),
+            client: "test".into(),
+            device_id: "d1".into(),
+            now_playing_item: None,
+            play_state: None,
+            now_playing_queue: vec![
+                QueueItem {
+                    id: "a".into(),
+                    playlist_item_id: None,
+                },
+                QueueItem {
+                    id: "b".into(),
+                    playlist_item_id: None,
+                },
+            ],
+            now_playing_queue_full_items: Vec::new(),
+        };
+        let remaining = JellyfinClient::get_remaining_queue_ids(&session, "a");
+        assert_eq!(remaining, vec!["b"]);
+    }
+
+    #[test]
+    fn play_state_parses_playlist_item_id() {
+        let json = r#"{
+            "PositionTicks": 0,
+            "IsPaused": false,
+            "CanSeek": true,
+            "PlaylistItemId": "playlistItem9"
+        }"#;
+        let state: PlayState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.playlist_item_id.as_deref(), Some("playlistItem9"));
+    }
+
+    #[test]
+    fn queue_item_parses_playlist_item_id() {
+        let json = r#"{"Id": "abc", "PlaylistItemId": "qi-1"}"#;
+        let item: QueueItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.id, "abc");
+        assert_eq!(item.playlist_item_id.as_deref(), Some("qi-1"));
     }
 }
-

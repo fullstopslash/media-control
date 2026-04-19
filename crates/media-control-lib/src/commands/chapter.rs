@@ -23,6 +23,26 @@ impl ChapterDirection {
             Self::Prev => -1,
         }
     }
+
+    /// Parse a chapter direction from a string.
+    ///
+    /// Accepts `next`/`Next` for [`Self::Next`] and
+    /// `prev`/`Prev`/`previous`/`Previous` for [`Self::Prev`].
+    /// Mirrors [`super::move_window::Direction::parse`] so CLI dispatch in
+    /// both subcommands stays consistent.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(ChapterDirection)` for valid input
+    /// - `None` otherwise
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "next" | "Next" => Some(Self::Next),
+            "prev" | "Prev" | "previous" | "Previous" => Some(Self::Prev),
+            _ => None,
+        }
+    }
 }
 
 /// Build the chapter-navigation IPC payload.
@@ -65,6 +85,42 @@ mod tests {
     fn chapter_direction_offset() {
         assert_eq!(ChapterDirection::Next.offset(), 1);
         assert_eq!(ChapterDirection::Prev.offset(), -1);
+    }
+
+    #[test]
+    fn parse_accepts_documented_inputs() {
+        assert_eq!(
+            ChapterDirection::parse("next"),
+            Some(ChapterDirection::Next)
+        );
+        assert_eq!(
+            ChapterDirection::parse("Next"),
+            Some(ChapterDirection::Next)
+        );
+        assert_eq!(
+            ChapterDirection::parse("prev"),
+            Some(ChapterDirection::Prev)
+        );
+        assert_eq!(
+            ChapterDirection::parse("Prev"),
+            Some(ChapterDirection::Prev)
+        );
+        assert_eq!(
+            ChapterDirection::parse("previous"),
+            Some(ChapterDirection::Prev)
+        );
+        assert_eq!(
+            ChapterDirection::parse("Previous"),
+            Some(ChapterDirection::Prev)
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_inputs() {
+        assert_eq!(ChapterDirection::parse(""), None);
+        assert_eq!(ChapterDirection::parse("NEXT"), None);
+        assert_eq!(ChapterDirection::parse("forward"), None);
+        assert_eq!(ChapterDirection::parse("n"), None);
     }
 
     #[test]

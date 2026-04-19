@@ -46,7 +46,21 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
     // final reposition.
     suppress_avoider().await;
 
-    // If both enabled, disable them (unpin then unfloat)
+    // State matrix — four entry combinations, two outcomes:
+    //
+    // | floating | pinned | branch                                          |
+    // |----------|--------|-------------------------------------------------|
+    // | true     | true   | DISABLE: unpin + unfloat (return early)         |
+    // | true     | false  | ENABLE: focus + pin            → reposition     |
+    // | false    | true   | ENABLE: focus + float          → reposition     |
+    // | false    | false  | ENABLE: focus + float + pin    → reposition     |
+    //
+    // The toggle is "all-on ↔ all-off": only the (floating + pinned) cell
+    // disables; every other cell drives the window TO the (floating + pinned)
+    // state and then repositions to the configured corner. The two `if !was_*`
+    // checks below skip the dispatcher action when that bit is already set,
+    // since `togglefloating` / `dispatch pin` would otherwise *flip* it the
+    // wrong direction.
     if was_floating && was_pinned {
         ctx.hyprland
             .dispatch_batch(&[&pin_action(addr), &toggle_floating_action(addr)])
@@ -92,7 +106,7 @@ mod tests {
         // mpv is not floating, not pinned
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -105,7 +119,7 @@ mod tests {
                 [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 false,
@@ -141,7 +155,7 @@ mod tests {
         // mpv is floating + pinned → toggle off
         let clients = vec![
             make_test_client_full(
-                "0xfirefox",
+                "0xb1",
                 "firefox",
                 "Browser",
                 false,
@@ -154,7 +168,7 @@ mod tests {
                 [1920, 1080],
             ),
             make_test_client_full(
-                "0xmpv",
+                "0xd1",
                 "mpv",
                 "video.mp4",
                 true,
@@ -195,7 +209,7 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xmpv",
+            "0xd1",
             "mpv",
             "video.mp4",
             false,
@@ -227,7 +241,7 @@ mod tests {
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
-            "0xfirefox",
+            "0xb1",
             "firefox",
             "Browser",
             false,
