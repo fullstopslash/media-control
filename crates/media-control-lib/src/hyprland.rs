@@ -109,6 +109,43 @@ pub struct HyprlandClient {
     socket_path: PathBuf,
 }
 
+/// Build the absolute path to one of Hyprland's per-instance Unix sockets
+/// (e.g. `.socket.sock` for commands, `.socket2.sock` for events).
+///
+/// Sanitizes both env vars to defend against path-traversal injection: the
+/// runtime dir must be absolute and free of `..`; the instance signature must
+/// be a single non-empty component free of separators and `..`.
+///
+/// # Errors
+///
+/// Returns [`HyprlandError::MissingEnvVar`] if `XDG_RUNTIME_DIR` or
+/// `HYPRLAND_INSTANCE_SIGNATURE` are unset or contain unsafe components.
+pub fn runtime_socket_path(name: &str) -> Result<PathBuf> {
+    let runtime_dir = env::var("XDG_RUNTIME_DIR")
+        .map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
+    let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .map_err(|_| HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"))?;
+
+    let runtime = PathBuf::from(&runtime_dir);
+    if !runtime.is_absolute()
+        || runtime
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"));
+    }
+    if instance_sig.is_empty()
+        || instance_sig.contains('/')
+        || instance_sig.contains('\\')
+        || instance_sig.contains("..")
+        || instance_sig.starts_with('.')
+    {
+        return Err(HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
+    }
+
+    Ok(runtime.join("hypr").join(instance_sig).join(name))
+}
+
 impl HyprlandClient {
     /// Create a new client from environment variables.
     ///
@@ -116,17 +153,9 @@ impl HyprlandClient {
     ///
     /// Returns an error if `XDG_RUNTIME_DIR` or `HYPRLAND_INSTANCE_SIGNATURE` are not set.
     pub fn new() -> Result<Self> {
-        let runtime_dir = env::var("XDG_RUNTIME_DIR")
-            .map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
-        let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")
-            .map_err(|_| HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"))?;
-
-        let socket_path = PathBuf::from(runtime_dir)
-            .join("hypr")
-            .join(instance_sig)
-            .join(".socket.sock");
-
-        Ok(Self { socket_path })
+        Ok(Self {
+            socket_path: runtime_socket_path(".socket.sock")?,
+        })
     }
 
     /// Create a client with a custom socket path.

@@ -5,7 +5,7 @@
 //! - `<store-name>`: switch to that store and play its next-up (twitch, jellyfin, pinchflat, etc.)
 //! - `<item-id>`: play a specific item by hex ID (shim auto-detects store)
 
-use super::{CommandContext, send_mpv_script_message, send_mpv_script_message_with_args};
+use super::{send_mpv_script_message, send_mpv_script_message_with_args};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,28 +36,14 @@ impl PlayTarget {
 ///
 /// All playback delegation goes through the shim — media-control is just
 /// the control plane, not the resolution engine.
-pub async fn play(
-    _ctx: &CommandContext,
-    target_str: &str,
-) -> crate::error::Result<()> {
-    let target = PlayTarget::parse(target_str);
-
-    match target {
-        PlayTarget::NextUp => {
-            send_mpv_script_message("play-next-up").await?;
-        }
-        PlayTarget::Store(name) => {
-            // Send play-{name} to the shim. Each store/context handles its own
-            // play logic (e.g., play-twitch, play-jellyfin, play-pinchflat).
-            let cmd = format!("play-{}", name);
-            send_mpv_script_message(&cmd).await?;
-        }
+pub async fn play(target_str: &str) -> crate::error::Result<()> {
+    match PlayTarget::parse(target_str) {
+        PlayTarget::NextUp => send_mpv_script_message("play-next-up").await,
+        PlayTarget::Store(name) => send_mpv_script_message(&format!("play-{name}")).await,
         PlayTarget::ItemId(id) => {
-            send_mpv_script_message_with_args("play-item", &[&id]).await?;
+            send_mpv_script_message_with_args("play-item", &[id.as_str()]).await
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

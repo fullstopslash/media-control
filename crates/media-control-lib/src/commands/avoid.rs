@@ -29,6 +29,10 @@ use crate::hyprland::Client;
 use crate::window::MediaWindow;
 
 /// Check if two rectangles overlap.
+///
+/// All edge arithmetic is performed in `i64` to defend against pathological
+/// geometry coming from the Hyprland socket — adding two `i32`s near the
+/// limits would overflow and silently flip the comparison result.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn rectangles_overlap(
@@ -44,7 +48,15 @@ fn rectangles_overlap(
     if w1 <= 0 || h1 <= 0 || w2 <= 0 || h2 <= 0 {
         return false;
     }
+    let (x1, y1, x2, y2) = (i64::from(x1), i64::from(y1), i64::from(x2), i64::from(y2));
+    let (w1, h1, w2, h2) = (i64::from(w1), i64::from(h1), i64::from(w2), i64::from(h2));
     !(x1 >= x2 + w2 || x2 >= x1 + w1 || y1 >= y2 + h2 || y2 >= y1 + h1)
+}
+
+/// Helper: check if a rectangle (using `MediaWindow`-like fields) overlaps another.
+#[inline]
+fn rect_overlaps_xywh(ax: i32, ay: i32, aw: i32, ah: i32, b: &Client) -> bool {
+    rectangles_overlap(ax, ay, aw, ah, b.at[0], b.at[1], b.size[0], b.size[1])
 }
 
 /// Position pair for single-workspace mode (primary + secondary for toggle).
@@ -69,43 +81,26 @@ fn get_position_pair(
     let positions = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
     let resolve = |name: &str| super::resolve_effective_position(ctx, name);
+    let resolve_or = |name: &str, default: i32| resolve(name).unwrap_or(default);
 
     // Default positions (adjusted for minified mode)
-    let default_primary_x = resolve(&positioning.default_x).unwrap_or(positions.x_right);
-    let default_primary_y = resolve(&positioning.default_y).unwrap_or(positions.y_bottom);
-    let default_secondary_x = resolve(&positioning.secondary_x).unwrap_or(positions.x_left);
-    let default_secondary_y = resolve(&positioning.secondary_y).unwrap_or(positions.y_bottom);
+    let default_primary_x = resolve_or(&positioning.default_x, positions.x_right);
+    let default_primary_y = resolve_or(&positioning.default_y, positions.y_bottom);
+    let default_secondary_x = resolve_or(&positioning.secondary_x, positions.x_left);
+    let default_secondary_y = resolve_or(&positioning.secondary_y, positions.y_bottom);
 
     // Check for class/title override (case-insensitive class, regex title)
-    if let Some(override_cfg) = positioning.get_override(focused_class, focused_title) {
-        let primary_x = override_cfg
-            .pref_x
-            .as_ref()
-            .and_then(|s| resolve(s))
-            .unwrap_or(default_primary_x);
-        let primary_y = override_cfg
-            .pref_y
-            .as_ref()
-            .and_then(|s| resolve(s))
-            .unwrap_or(default_primary_y);
-        let secondary_x = override_cfg
-            .secondary_x
-            .as_ref()
-            .and_then(|s| resolve(s))
-            .unwrap_or(default_secondary_x);
-        let secondary_y = override_cfg
-            .secondary_y
-            .as_ref()
-            .and_then(|s| resolve(s))
-            .unwrap_or(default_secondary_y);
-
+    if let Some(o) = positioning.get_override(focused_class, focused_title) {
+        let override_or = |field: &Option<String>, default: i32| -> i32 {
+            field.as_ref().and_then(|s| resolve(s)).unwrap_or(default)
+        };
         return PositionPair {
-            primary_x,
-            primary_y,
-            secondary_x,
-            secondary_y,
-            width: override_cfg.pref_width,
-            height: override_cfg.pref_height,
+            primary_x: override_or(&o.pref_x, default_primary_x),
+            primary_y: override_or(&o.pref_y, default_primary_y),
+            secondary_x: override_or(&o.secondary_x, default_secondary_x),
+            secondary_y: override_or(&o.secondary_y, default_secondary_y),
+            width: o.pref_width,
+            height: o.pref_height,
         };
     }
 
@@ -132,22 +127,28 @@ fn calculate_target_position(
     focus_w: i32,
 ) -> (i32, i32) {
     let positioning = &ctx.config.positioning;
-    let resolve = |name: &str| super::resolve_effective_position(ctx, name);
+    let positions = &ctx.config.positions;
+    let resolve_or = |name: &str, default: i32| {
+        super::resolve_effective_position(ctx, name).unwrap_or(default)
+    };
 
     // Use effective positions (adjusted for minified mode)
-    let x_left = resolve("x_left").unwrap_or(48);
-    let x_right = resolve("x_right").unwrap_or(1272);
-    let y_top = resolve("y_top").unwrap_or(48);
-    let y_bottom = resolve("y_bottom").unwrap_or(712);
+    let x_left = resolve_or("x_left", positions.x_left);
+    let x_right = resolve_or("x_right", positions.x_right);
+    let y_top = resolve_or("y_top", positions.y_top);
+    let y_bottom = resolve_or("y_bottom", positions.y_bottom);
 
     let (media_width, _) = super::effective_dimensions(ctx);
-    let available_width = x_right + media_width - x_left;
-    let screen_center_x = (x_left + x_right) / 2;
-    let screen_center_y = (y_top + y_bottom) / 2;
+    // Widen to i64: socket-provided geometry could push these sums past i32::MAX.
+    let available_width =
+        i64::from(x_right) + i64::from(media_width) - i64::from(x_left);
+    let screen_center_x = x_left + (x_right - x_left) / 2;
+    let screen_center_y = y_top + (y_bottom - y_top) / 2;
 
-    let wide_threshold = i32::from(positioning.wide_window_threshold);
+    let wide_threshold = i64::from(positioning.wide_window_threshold);
+    let wide_cutoff = available_width.saturating_mul(wide_threshold) / 100;
 
-    if focus_w >= available_width * wide_threshold / 100 {
+    if i64::from(focus_w) >= wide_cutoff {
         let target_y = if media_y >= screen_center_y {
             y_top
         } else {
@@ -186,9 +187,7 @@ async fn move_media_window(
         ])
         .await?;
 
-    if let Err(e) = suppress_avoider().await {
-        eprintln!("media-control: failed to suppress avoider: {e}");
-    }
+    suppress_avoider().await;
     Ok(())
 }
 
@@ -204,18 +203,24 @@ async fn should_suppress(suppress_timeout_ms: u64) -> bool {
         return false;
     };
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
 
     now.saturating_sub(timestamp_ms) < suppress_timeout_ms
 }
 
 /// Check if a position is within tolerance of target.
+///
+/// Widens to `i64` so neither the subtraction nor `.abs()` can overflow on
+/// adversarial socket input (e.g. `i32::MIN`).
 #[inline]
 fn within_tolerance(actual: i32, target: i32, tolerance: i32) -> bool {
-    (actual - target).abs() <= tolerance
+    (i64::from(actual) - i64::from(target)).abs() <= i64::from(tolerance)
 }
 
 /// Data about the focused window.
@@ -269,21 +274,6 @@ fn count_other_windows(clients: &[Client], workspace_id: i32, ctx: &CommandConte
         .count()
 }
 
-/// Find the previous window to restore focus to.
-fn find_previous_focus(
-    clients: &[Client],
-    workspace_id: i32,
-    ctx: &CommandContext,
-) -> Option<String> {
-    clients
-        .iter()
-        .filter(|c| c.workspace.id == workspace_id)
-        .filter(|c| c.mapped && !c.hidden)
-        .filter(|c| ctx.window_matcher.matches(c).is_none())
-        .min_by_key(|c| c.focus_history_id)
-        .map(|c| c.address.clone())
-}
-
 /// Which avoidance strategy to apply.
 enum AvoidCase<'a> {
     /// Single workspace, non-media focused: move media to primary position.
@@ -307,7 +297,7 @@ fn classify_case<'a>(
     ctx: &CommandContext,
 ) -> Option<AvoidCase<'a>> {
     // Fullscreen media: never interfere
-    if focused.is_media && focused.fullscreen != 0 {
+    if focused.is_media && focused.fullscreen > 0 {
         return None;
     }
 
@@ -319,12 +309,13 @@ fn classify_case<'a>(
     // Single workspace cases
     if is_single_workspace {
         // Fullscreen non-media in single workspace: don't interfere
-        if focused.fullscreen != 0 && !focused.is_media {
+        if focused.fullscreen > 0 && !focused.is_media {
             return None;
         }
         if focused.is_media {
             // Mouseover: find previous window to determine toggle positions
-            let prev_window = find_previous_focus(clients, focused.workspace_id, ctx)
+            let prev_window = ctx.window_matcher
+                .find_previous_focus(clients, focused.address, Some(focused.workspace_id))
                 .and_then(|addr| clients.iter().find(|c| c.address == addr));
             return prev_window.map(|prev| AvoidCase::MouseoverToggle { prev_window: prev });
         }
@@ -336,7 +327,7 @@ fn classify_case<'a>(
         return Some(AvoidCase::MouseoverGeometry);
     }
     // Fullscreen non-media in multi-workspace: move media away
-    if focused.fullscreen != 0 {
+    if focused.fullscreen > 0 {
         return Some(AvoidCase::FullscreenNonMedia);
     }
     Some(AvoidCase::GeometryOverlap)
@@ -417,6 +408,13 @@ async fn handle_move_to_primary(
 ) -> Result<()> {
     let pair = get_position_pair(ctx, focused.class, focused.title);
     let tolerance = i32::from(ctx.config.positioning.position_tolerance);
+    let (ew, eh) = super::effective_dimensions(ctx);
+    let pair_w = pair.width.unwrap_or(ew);
+    let pair_h = pair.height.unwrap_or(eh);
+
+    let overlaps_focused = |x, y, w, h| {
+        rectangles_overlap(x, y, w, h, focused.x, focused.y, focused.width, focused.height)
+    };
 
     for window in media_windows {
         let at_primary = within_tolerance(window.x, pair.primary_x, tolerance)
@@ -424,85 +422,29 @@ async fn handle_move_to_primary(
 
         // Only check overlap with floating windows — tiled windows always overlap
         // the pinned media window and that's by design.
-        if focused.floating {
-            if at_primary {
-                let overlaps = rectangles_overlap(
-                    window.x,
-                    window.y,
-                    window.width,
-                    window.height,
-                    focused.x,
-                    focused.y,
-                    focused.width,
-                    focused.height,
-                );
-                if overlaps {
-                    tracing::debug!(
-                        "avoid: at primary but overlapping floating focused, moving to secondary ({}, {})",
-                        pair.secondary_x,
-                        pair.secondary_y
-                    );
-                    move_media_window(
-                        ctx,
-                        &window.address,
-                        pair.secondary_x,
-                        pair.secondary_y,
-                        pair.width,
-                        pair.height,
-                    )
-                    .await?;
-                    continue;
-                }
+        // If at primary, check actual geometry; otherwise check hypothetical primary placement.
+        let primary_clashes = focused.floating && {
+            let (x, y, w, h) = if at_primary {
+                (window.x, window.y, window.width, window.height)
             } else {
-                let (ew, eh) = super::effective_dimensions(ctx);
-                let media_w = pair.width.unwrap_or(ew);
-                let media_h = pair.height.unwrap_or(eh);
-                let primary_overlaps = rectangles_overlap(
-                    pair.primary_x,
-                    pair.primary_y,
-                    media_w,
-                    media_h,
-                    focused.x,
-                    focused.y,
-                    focused.width,
-                    focused.height,
-                );
-                if primary_overlaps {
-                    tracing::debug!(
-                        "avoid: primary would overlap floating focused, moving to secondary ({}, {})",
-                        pair.secondary_x,
-                        pair.secondary_y
-                    );
-                    move_media_window(
-                        ctx,
-                        &window.address,
-                        pair.secondary_x,
-                        pair.secondary_y,
-                        pair.width,
-                        pair.height,
-                    )
-                    .await?;
-                    continue;
-                }
-            }
-        }
+                (pair.primary_x, pair.primary_y, pair_w, pair_h)
+            };
+            overlaps_focused(x, y, w, h)
+        };
 
-        // Default: move to primary (or stay if already there)
-        if !at_primary {
+        if primary_clashes {
             tracing::debug!(
-                "avoid: moving to primary ({}, {})",
-                pair.primary_x,
-                pair.primary_y
+                "avoid: primary overlaps floating focused, moving to secondary ({}, {})",
+                pair.secondary_x, pair.secondary_y
             );
             move_media_window(
-                ctx,
-                &window.address,
-                pair.primary_x,
-                pair.primary_y,
-                pair.width,
-                pair.height,
-            )
-            .await?;
+                ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height,
+            ).await?;
+        } else if !at_primary {
+            tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
+            move_media_window(
+                ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height,
+            ).await?;
         }
     }
     Ok(())
@@ -542,7 +484,7 @@ async fn handle_mouseover_toggle(
 
     // Restore focus so subsequent mouseovers trigger new events
     if let Err(e) = restore_focus(ctx, &prev_window.address).await {
-        eprintln!("media-control: failed to restore focus: {e}");
+        tracing::warn!("media-control: failed to restore focus: {e}");
     }
     Ok(())
 }
@@ -553,56 +495,37 @@ async fn handle_mouseover_geometry(
     focused: &FocusedWindow<'_>,
     clients: &[Client],
 ) -> Result<()> {
-    let has_overlap = clients.iter().any(|c| {
-        c.address != focused.address
-            && c.workspace.id == focused.workspace_id
-            && c.mapped
-            && !c.hidden
-            && rectangles_overlap(
-                focused.x,
-                focused.y,
-                focused.width,
-                focused.height,
-                c.at[0],
-                c.at[1],
-                c.size[0],
-                c.size[1],
-            )
-    });
+    // Check if a rect overlaps any workspace peer (excluding the focused media window)
+    let overlaps_peer = |x, y, w, h| {
+        clients.iter().any(|c| {
+            c.address != focused.address
+                && c.workspace.id == focused.workspace_id
+                && c.mapped
+                && !c.hidden
+                && rect_overlaps_xywh(x, y, w, h, c)
+        })
+    };
 
-    if !has_overlap {
+    if !overlaps_peer(focused.x, focused.y, focused.width, focused.height) {
         return Ok(());
     }
 
     let (target_x, target_y) = calculate_target_position(ctx, focused.x, focused.y, focused.width);
     let (media_w, media_h) = super::effective_dimensions(ctx);
 
-    // Verify target doesn't overlap with any non-media window on the workspace
-    let target_overlaps = clients.iter().any(|c| {
-        c.address != focused.address
-            && c.workspace.id == focused.workspace_id
-            && c.mapped
-            && !c.hidden
-            && rectangles_overlap(
-                target_x, target_y, media_w, media_h, c.at[0], c.at[1], c.size[0], c.size[1],
-            )
-    });
-
-    if target_overlaps {
+    if overlaps_peer(target_x, target_y, media_w, media_h) {
         tracing::debug!(
-            "avoid: target ({}, {}) also overlaps, skipping",
-            target_x,
-            target_y
+            "avoid: target ({target_x}, {target_y}) also overlaps, skipping"
         );
         return Ok(());
     }
 
     move_media_window(ctx, focused.address, target_x, target_y, None, None).await?;
 
-    if let Some(prev_addr) = find_previous_focus(clients, focused.workspace_id, ctx)
+    if let Some(prev_addr) = ctx.window_matcher.find_previous_focus(clients, focused.address, Some(focused.workspace_id))
         && let Err(e) = restore_focus(ctx, &prev_addr).await
     {
-        eprintln!("media-control: failed to restore focus: {e}");
+        tracing::warn!("media-control: failed to restore focus: {e}");
     }
     Ok(())
 }
@@ -615,48 +538,29 @@ async fn handle_geometry_overlap(
 ) -> Result<()> {
     let (media_w, media_h) = super::effective_dimensions(ctx);
 
+    // Closure: does the rectangle overlap the focused window?
+    let overlaps_focused = |x, y, w, h| {
+        rectangles_overlap(x, y, w, h, focused.x, focused.y, focused.width, focused.height)
+    };
+
     for window in media_windows {
-        if rectangles_overlap(
-            window.x,
-            window.y,
-            window.width,
-            window.height,
-            focused.x,
-            focused.y,
-            focused.width,
-            focused.height,
-        ) {
-            let (target_x, target_y) =
-                calculate_target_position(ctx, window.x, window.y, focused.width);
+        if !overlaps_focused(window.x, window.y, window.width, window.height) {
+            continue;
+        }
 
-            // Verify the target position doesn't also overlap with the focused window.
-            // Without this check, the avoider bounces the window back and forth.
-            if rectangles_overlap(
-                target_x,
-                target_y,
-                media_w,
-                media_h,
-                focused.x,
-                focused.y,
-                focused.width,
-                focused.height,
-            ) {
-                tracing::debug!(
-                    "avoid: target ({}, {}) also overlaps, skipping",
-                    target_x,
-                    target_y
-                );
-                return Ok(());
-            }
+        let (target_x, target_y) =
+            calculate_target_position(ctx, window.x, window.y, focused.width);
 
-            tracing::debug!(
-                "avoid: overlap detected, moving to ({}, {})",
-                target_x,
-                target_y
-            );
-            move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
+        // Verify the target position doesn't also overlap — otherwise the
+        // avoider bounces the window back and forth.
+        if overlaps_focused(target_x, target_y, media_w, media_h) {
+            tracing::debug!("avoid: target ({target_x}, {target_y}) also overlaps, skipping");
             return Ok(());
         }
+
+        tracing::debug!("avoid: overlap detected, moving to ({target_x}, {target_y})");
+        move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
+        return Ok(());
     }
     Ok(())
 }
@@ -703,12 +607,34 @@ mod tests {
     }
 
     #[test]
+    fn rectangles_overlap_no_overflow_on_extreme_geometry() {
+        // Adversarial socket payloads must not overflow the i32 edge math.
+        // Pre-fix this would wrap and silently flip the comparison.
+        assert!(rectangles_overlap(
+            i32::MAX - 100, 0, 200, 100,
+            i32::MAX - 50, 0, 100, 100,
+        ));
+        assert!(!rectangles_overlap(
+            i32::MAX - 100, 0, 50, 50,
+            0, 0, 100, 100,
+        ));
+    }
+
+    #[test]
     fn within_tolerance_works() {
         assert!(within_tolerance(100, 100, 5));
         assert!(within_tolerance(103, 100, 5));
         assert!(within_tolerance(97, 100, 5));
         assert!(!within_tolerance(106, 100, 5));
         assert!(!within_tolerance(94, 100, 5));
+    }
+
+    #[test]
+    fn within_tolerance_no_overflow_on_extreme_inputs() {
+        // i32::MIN - i32::MAX would wrap; .abs() on i32::MIN would panic.
+        assert!(!within_tolerance(i32::MIN, i32::MAX, 5));
+        assert!(!within_tolerance(i32::MAX, i32::MIN, 5));
+        assert!(within_tolerance(i32::MAX, i32::MAX, 0));
     }
 
     // --- E2E tests using mock Hyprland ---

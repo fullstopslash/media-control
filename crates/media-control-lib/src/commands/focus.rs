@@ -72,11 +72,11 @@ use crate::error::Result;
 /// ```
 pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> Result<bool> {
     // Suppress avoider first to prevent repositioning during focus
-    let _ = suppress_avoider().await;
+    suppress_avoider().await;
 
     // Try to find a media window
     if let Some(window) = get_media_window(ctx).await? {
-        // Focus the window
+        // Focus the window (dispatch prepends "dispatch", so pass bare command)
         ctx.hyprland
             .dispatch(&format!("focuswindow address:{}", window.address))
             .await?;

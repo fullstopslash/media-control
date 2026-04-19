@@ -16,7 +16,7 @@
 //!     Pattern { key: "title".into(), value: "Picture-in-Picture".into(), always_pin: true, ..Default::default() },
 //! ];
 //!
-//! let matcher = WindowMatcher::new(&patterns)?;
+//! let matcher = WindowMatcher::new(&patterns);
 //! // Use matcher.find_media_window() with clients from HyprlandClient
 //! # Ok(())
 //! # }
@@ -40,10 +40,12 @@ pub enum PatternKey {
 impl PatternKey {
     /// Parse pattern key from string.
     fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "class" => Some(Self::Class),
-            "title" => Some(Self::Title),
-            _ => None,
+        if s.eq_ignore_ascii_case("class") {
+            Some(Self::Class)
+        } else if s.eq_ignore_ascii_case("title") {
+            Some(Self::Title)
+        } else {
+            None
         }
     }
 
@@ -163,36 +165,39 @@ pub struct WindowMatcher {
 }
 
 impl WindowMatcher {
+    /// Build a `CompiledPattern` from a config `Pattern`, given a precompiled regex.
+    #[inline]
+    fn build(p: &Pattern, key: PatternKey, regex: Regex) -> CompiledPattern {
+        CompiledPattern {
+            key,
+            regex,
+            pinned_only: p.pinned_only,
+            always_pin: p.always_pin,
+        }
+    }
+
     /// Create a new matcher from config patterns.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if any pattern's regex is invalid.
-    pub fn new(patterns: &[Pattern]) -> Result<Self> {
+    /// Invalid patterns are logged and skipped — the matcher is best-effort.
+    /// Use [`Self::new_strict`] when you want hard failure on invalid regex.
+    pub fn new(patterns: &[Pattern]) -> Self {
         let compiled = patterns
             .iter()
             .filter_map(|p| {
-                let Some(key) = PatternKey::from_str(&p.key) else {
+                let key = PatternKey::from_str(&p.key).or_else(|| {
                     eprintln!("media-control: unknown pattern key {:?}, skipping", p.key);
-                    return None;
-                };
-                let regex = match Regex::new(&p.value) {
-                    Ok(r) => r,
-                    Err(e) => {
+                    None
+                })?;
+                let regex = Regex::new(&p.value)
+                    .map_err(|e| {
                         eprintln!("media-control: invalid regex {:?}: {e}, skipping", p.value);
-                        return None;
-                    }
-                };
-                Some(CompiledPattern {
-                    key,
-                    regex,
-                    pinned_only: p.pinned_only,
-                    always_pin: p.always_pin,
-                })
+                    })
+                    .ok()?;
+                Some(Self::build(p, key, regex))
             })
             .collect();
 
-        Ok(Self { patterns: compiled })
+        Self { patterns: compiled }
     }
 
     /// Create a matcher that validates all patterns, returning error on first invalid regex.
@@ -204,12 +209,7 @@ impl WindowMatcher {
                 continue; // Skip unknown keys
             };
             let regex = Regex::new(&p.value).map_err(MediaControlError::from)?;
-            compiled.push(CompiledPattern {
-                key,
-                regex,
-                pinned_only: p.pinned_only,
-                always_pin: p.always_pin,
-            });
+            compiled.push(Self::build(p, key, regex));
         }
 
         Ok(Self { patterns: compiled })
@@ -243,44 +243,32 @@ impl WindowMatcher {
         clients: &[Client],
         focus_addr: Option<&str>,
     ) -> Option<MediaWindow> {
-        let mut pinned_match: Option<(&Client, MatchResult)> = None;
-        let mut focused_match: Option<(&Client, MatchResult)> = None;
-        let mut any_match: Option<(&Client, MatchResult)> = None;
+        let mut pinned: Option<(&Client, MatchResult)> = None;
+        let mut focused: Option<(&Client, MatchResult)> = None;
+        let mut any: Option<(&Client, MatchResult)> = None;
 
         for client in clients.iter().filter(|c| c.mapped && !c.hidden) {
-            if let Some(match_result) = self.matches(client) {
-                // Priority 1: Pinned
-                if client.pinned && pinned_match.is_none() {
-                    pinned_match = Some((client, match_result));
-                    continue;
-                }
+            let Some(match_result) = self.matches(client) else { continue };
 
-                // Priority 2: Focused
-                if focused_match.is_none() && focus_addr.is_some_and(|addr| client.address == addr)
-                {
-                    focused_match = Some((client, match_result));
-                    continue;
-                }
+            let slot = if client.pinned {
+                &mut pinned
+            } else if focus_addr.is_some_and(|addr| client.address == addr) {
+                &mut focused
+            } else {
+                &mut any
+            };
 
-                // Priority 3: Any
-                if any_match.is_none() {
-                    any_match = Some((client, match_result));
-                }
+            if slot.is_none() {
+                *slot = Some((client, match_result));
             }
         }
 
-        // Return highest priority match
-        if let Some((client, match_result)) = pinned_match {
-            return Some(MediaWindow::from_client(client, &match_result, 1));
-        }
-        if let Some((client, match_result)) = focused_match {
-            return Some(MediaWindow::from_client(client, &match_result, 2));
-        }
-        if let Some((client, match_result)) = any_match {
-            return Some(MediaWindow::from_client(client, &match_result, 3));
-        }
-
-        None
+        // Highest priority wins (1 = pinned, 2 = focused, 3 = any).
+        pinned
+            .map(|(c, m)| (c, m, 1u8))
+            .or_else(|| focused.map(|(c, m)| (c, m, 2)))
+            .or_else(|| any.map(|(c, m)| (c, m, 3)))
+            .map(|(c, m, p)| MediaWindow::from_client(c, &m, p))
     }
 
     /// Find all media windows on a specific monitor.
@@ -421,7 +409,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let mpv = make_client("0x1", "mpv", "video.mp4", false, true);
         let firefox = make_client("0x2", "firefox", "Mozilla Firefox", false, false);
@@ -437,7 +425,7 @@ mod tests {
             value: "Picture-in-Picture".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let pip = make_client("0x1", "firefox", "Picture-in-Picture", true, true);
         let normal = make_client("0x2", "firefox", "Mozilla Firefox", false, false);
@@ -453,7 +441,7 @@ mod tests {
             value: r"mpv|vlc".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let mpv = make_client("0x1", "mpv", "video.mp4", false, true);
         let vlc = make_client("0x2", "vlc", "movie.mkv", false, true);
@@ -471,7 +459,7 @@ mod tests {
             value: r"Picture".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let pip = make_client("0x1", "firefox", "Picture-in-Picture", true, true);
         assert!(matcher.matches(&pip).is_some());
@@ -485,7 +473,7 @@ mod tests {
             pinned_only: true,
             always_pin: false,
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         // Not pinned, not fullscreen - should not match
         let unpinned = make_client("0x1", "jellyfin", "Jellyfin", false, false);
@@ -508,7 +496,7 @@ mod tests {
             pinned_only: false,
             always_pin: true,
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let pip = make_client("0x1", "firefox", "Picture-in-Picture", false, true);
         let result = matcher.matches(&pip).unwrap();
@@ -530,7 +518,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let mpv = make_client("0x1", "mpv", "video.mp4", false, true);
         let pip = make_client("0x2", "firefox", "Picture-in-Picture", true, true);
@@ -548,7 +536,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client("0x1", "mpv", "unpinned", false, true),
@@ -568,7 +556,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client("0x1", "mpv", "unfocused", false, true),
@@ -588,7 +576,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client("0x1", "mpv", "video.mp4", false, true),
@@ -607,7 +595,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client("0x1", "mpv", "focused but not pinned", false, true),
@@ -627,7 +615,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![make_client("0x1", "firefox", "browser", false, false)];
 
@@ -643,7 +631,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 2),
@@ -663,7 +651,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 2),
@@ -683,7 +671,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 0), // Most recent but excluded
@@ -701,7 +689,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let mut hidden = make_client_full("0x2", "firefox", "hidden", false, false, 0, 1, 0, 0);
         hidden.hidden = true;
@@ -723,7 +711,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![make_client_full(
             "0x1",
@@ -757,7 +745,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client_full("0x1", "mpv", "video1", false, true, 0, 1, 0, 2),
@@ -790,7 +778,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client_full("0x1", "mpv", "unpinned1", false, true, 0, 1, 0, 2),
@@ -819,7 +807,7 @@ mod tests {
             always_pin: true,
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let mut client = make_client_full("0xabc", "mpv", "test.mp4", true, true, 2, 3, 1, 5);
         client.at = [200, 300];
@@ -848,7 +836,7 @@ mod tests {
 
     #[test]
     fn empty_patterns() {
-        let matcher = WindowMatcher::new(&[]).unwrap();
+        let matcher = WindowMatcher::new(&[]);
         let clients = vec![make_client("0x1", "mpv", "video", false, true)];
 
         assert!(matcher.find_media_window(&clients, None).is_none());
@@ -861,7 +849,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         assert!(matcher.find_media_window(&[], None).is_none());
     }
@@ -880,7 +868,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let client = make_client("0x1", "mpv", "video", false, true);
         let result = matcher.matches(&client).unwrap();
@@ -915,7 +903,7 @@ mod tests {
             },
         ];
 
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
         let client = make_client("0x1", "mpv", "video", false, true);
 
         // Should still work with valid pattern
@@ -929,7 +917,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         // All candidates have focus_history_id = -1 (never focused)
         let clients = vec![
@@ -952,7 +940,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let clients = vec![
             make_client_full("0x1", "mpv", "video.mp4", true, true, 0, 1, 0, 3),
@@ -971,7 +959,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let mut client = make_client("0x1", "mpv", "video", false, true);
         client.mapped = false;
@@ -986,7 +974,7 @@ mod tests {
             value: "mpv".to_string(),
             ..Default::default()
         }];
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         let mut client = make_client("0x1", "mpv", "video", false, true);
         client.hidden = true;

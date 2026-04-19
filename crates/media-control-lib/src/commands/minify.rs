@@ -4,7 +4,9 @@
 //! (configurable via `positioning.minified_scale`). All positioning and
 //! avoidance rules still apply — just with smaller dimensions.
 
-use super::{CommandContext, get_media_window, reposition_to_default, suppress_avoider, toggle_minified};
+use super::{
+    CommandContext, get_media_window, reposition_to_default, suppress_avoider, toggle_minified,
+};
 use crate::error::Result;
 
 /// Toggle minified mode, resize, and reposition the media window.
@@ -15,12 +17,12 @@ pub async fn minify(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     };
 
-    if window.fullscreen != 0 {
+    if window.fullscreen > 0 {
         return Ok(());
     }
 
     reposition_to_default(ctx, &window.address).await?;
-    suppress_avoider().await.ok();
+    suppress_avoider().await;
 
     tracing::debug!(
         "minify: {}",

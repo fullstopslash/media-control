@@ -4,10 +4,17 @@
 //! supporting session management, playback control, and watched status.
 
 use reqwest::header::{HeaderMap, HeaderValue};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
+
+/// Maximum size accepted for the Jellyfin credentials file.
+///
+/// Real cred.json files are < 4 KiB; the cap exists to prevent OOM if a
+/// hostile or accidental large file is placed at the credential path.
+const MAX_CRED_FILE_BYTES: u64 = 64 * 1024;
 
 /// Errors that can occur when interacting with Jellyfin.
 #[derive(Debug, Error)]
@@ -15,11 +22,17 @@ pub enum JellyfinError {
     #[error("credentials file not found at {0}")]
     CredentialsNotFound(PathBuf),
 
+    #[error("credentials file too large: {size} bytes (max {max})")]
+    CredentialsTooLarge { size: u64, max: u64 },
+
     #[error("failed to parse credentials: {0}")]
     CredentialsParsing(#[from] serde_json::Error),
 
     #[error("invalid credentials: missing {0}")]
     InvalidCredentials(&'static str),
+
+    #[error("invalid HTTP header value for {0}")]
+    InvalidHeader(&'static str),
 
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -29,9 +42,6 @@ pub enum JellyfinError {
 
     #[error("session has no currently playing item")]
     NoPlayingItem,
-
-    #[error("failed to get hostname")]
-    HostnameError,
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -290,29 +300,51 @@ pub struct JellyfinClient {
 }
 
 impl JellyfinClient {
+    /// Resolve the credentials file path, honoring `XDG_CONFIG_HOME`.
+    fn default_cred_path() -> Option<PathBuf> {
+        let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        Some(config_dir.join("jellyfin-mpv-shim").join("cred.json"))
+    }
+
     /// Load credentials from the default credential file.
     ///
-    /// Reads from `~/.config/jellyfin-mpv-shim/cred.json`.
+    /// Reads from `$XDG_CONFIG_HOME/jellyfin-mpv-shim/cred.json` (falling back
+    /// to `~/.config/...`). The file is size-capped at
+    /// [`MAX_CRED_FILE_BYTES`] to prevent OOM on a malformed input.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file doesn't exist or can't be parsed.
+    /// Returns an error if the file doesn't exist, exceeds the size cap, or
+    /// can't be parsed.
     pub async fn load_credentials() -> Result<Credentials> {
-        let home = std::env::var("HOME").map_err(|_| {
+        let cred_path = Self::default_cred_path().ok_or_else(|| {
             JellyfinError::CredentialsNotFound(PathBuf::from(
                 "~/.config/jellyfin-mpv-shim/cred.json",
             ))
         })?;
 
-        let cred_path = PathBuf::from(home).join(".config/jellyfin-mpv-shim/cred.json");
+        // Use metadata to check existence + size in one syscall pair.
+        let meta = match tokio::fs::metadata(&cred_path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(JellyfinError::CredentialsNotFound(cred_path));
+            }
+            Err(e) => return Err(JellyfinError::Io(e)),
+        };
 
-        if !cred_path.exists() {
-            return Err(JellyfinError::CredentialsNotFound(cred_path));
+        if meta.len() > MAX_CRED_FILE_BYTES {
+            return Err(JellyfinError::CredentialsTooLarge {
+                size: meta.len(),
+                max: MAX_CRED_FILE_BYTES,
+            });
         }
 
         let content = tokio::fs::read_to_string(&cred_path).await?;
 
-        // The credential file is an array; we use the first entry
+        // The credential file is an array; we use the first entry.
         let creds: Vec<Credentials> = serde_json::from_str(&content)?;
 
         creds
@@ -321,43 +353,58 @@ impl JellyfinClient {
             .ok_or(JellyfinError::InvalidCredentials("no credentials in file"))
     }
 
+    /// Build the default header bundle for Jellyfin API requests.
+    ///
+    /// Centralises the `Authorization` and `X-Emby-*` headers so secret
+    /// material lives in headers (not URLs/logs) and header construction
+    /// failures map to a single, well-typed error.
+    fn build_default_headers(credentials: &Credentials, hostname: &str) -> Result<HeaderMap> {
+        // Build authorization header in MediaBrowser format
+        let auth_header = format!(
+            "MediaBrowser Client=\"media-control\", Device=\"{hostname}\", DeviceId=\"{}\", Version=\"1.0.0\", Token=\"{}\"",
+            credentials.device_id, credentials.token
+        );
+
+        // Single helper to convert a borrowed string into a sensitive header value.
+        let mk = |name: &'static str, value: &str| -> Result<(reqwest::header::HeaderName, HeaderValue)> {
+            let mut hv = HeaderValue::from_str(value).map_err(|_| JellyfinError::InvalidHeader(name))?;
+            hv.set_sensitive(true);
+            Ok((reqwest::header::HeaderName::from_static(name), hv))
+        };
+
+        let entries: [(reqwest::header::HeaderName, HeaderValue); 5] = [
+            mk("authorization", &auth_header)?,
+            mk("x-emby-token", &credentials.token)?,
+            (
+                reqwest::header::HeaderName::from_static("x-emby-client"),
+                HeaderValue::from_static("media-control"),
+            ),
+            mk("x-emby-device-name", hostname)?,
+            mk("x-emby-device-id", &credentials.device_id)?,
+        ];
+
+        let mut headers = HeaderMap::with_capacity(entries.len());
+        for (k, v) in entries {
+            headers.insert(k, v);
+        }
+        Ok(headers)
+    }
+
     /// Create a new client from credentials.
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP client can't be built or hostname lookup fails.
+    /// Returns an error if the HTTP client can't be built or a header value
+    /// is invalid.
     pub fn new(credentials: Credentials) -> Result<Self> {
+        // Lossy is fine: hostname is purely identification, not a security
+        // boundary, and we want to avoid an extra allocation if the OsString
+        // is already valid UTF-8.
         let hostname = gethostname::gethostname()
-            .into_string()
-            .unwrap_or_else(|_| "media-control".to_string());
+            .to_string_lossy()
+            .into_owned();
 
-        let mut headers = HeaderMap::new();
-
-        // Build authorization header in MediaBrowser format
-        let auth_header = format!(
-            "MediaBrowser Client=\"media-control\", Device=\"{}\", DeviceId=\"{}\", Version=\"1.0.0\", Token=\"{}\"",
-            hostname, credentials.device_id, credentials.token
-        );
-
-        headers.insert(
-            "Authorization",
-            HeaderValue::from_str(&auth_header).map_err(|_| JellyfinError::HostnameError)?,
-        );
-        headers.insert(
-            "X-Emby-Token",
-            HeaderValue::from_str(&credentials.token)
-                .map_err(|_| JellyfinError::InvalidCredentials("token"))?,
-        );
-        headers.insert("X-Emby-Client", HeaderValue::from_static("media-control"));
-        headers.insert(
-            "X-Emby-Device-Name",
-            HeaderValue::from_str(&hostname).map_err(|_| JellyfinError::HostnameError)?,
-        );
-        headers.insert(
-            "X-Emby-Device-Id",
-            HeaderValue::from_str(&credentials.device_id)
-                .map_err(|_| JellyfinError::InvalidCredentials("device_id"))?,
-        );
+        let headers = Self::build_default_headers(&credentials, &hostname)?;
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
@@ -381,22 +428,54 @@ impl JellyfinClient {
         Self::new(credentials)
     }
 
+    /// Build a fully-qualified endpoint URL from a path fragment.
+    ///
+    /// `path` should be the API path without a leading `/` (e.g. `Sessions`,
+    /// `Users/abc/Items`). This avoids per-call `format!("{}/...", server_url)`
+    /// repetition.
+    fn endpoint(&self, path: &str) -> String {
+        let mut url = String::with_capacity(self.server_url.len() + 1 + path.len());
+        url.push_str(&self.server_url);
+        url.push('/');
+        url.push_str(path);
+        url
+    }
+
+    /// GET an endpoint and deserialise the JSON body.
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T> {
+        Ok(self
+            .client
+            .get(self.endpoint(path))
+            .query(query)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// POST to an endpoint with no body, ignoring the response.
+    async fn post_empty(&self, path: &str, query: &[(&str, &str)]) -> Result<()> {
+        self.client
+            .post(self.endpoint(path))
+            .query(query)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Fetch all active sessions from the server.
     ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails.
     pub async fn fetch_sessions(&self) -> Result<Vec<Session>> {
-        let url = format!("{}/Sessions", self.server_url);
-        let sessions = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(sessions)
+        self.get_json("Sessions", &[]).await
     }
 
     /// Find the active mpv-shim session.
@@ -434,9 +513,8 @@ impl JellyfinClient {
     ///
     /// Returns an error if the HTTP request fails.
     pub async fn stop(&self, session_id: &str) -> Result<()> {
-        let url = format!("{}/Sessions/{}/Playing/Stop", self.server_url, session_id);
-        self.client.post(&url).send().await?.error_for_status()?;
-        Ok(())
+        let path = format!("Sessions/{session_id}/Playing/Stop");
+        self.post_empty(&path, &[]).await
     }
 
     /// Stop playback for the active MPV session.
@@ -451,12 +529,8 @@ impl JellyfinClient {
     ///
     /// Returns an error if the HTTP request fails.
     pub async fn mark_watched(&self, item_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/Users/{}/PlayedItems/{}",
-            self.server_url, self.user_id, item_id
-        );
-        self.client.post(&url).send().await?.error_for_status()?;
-        Ok(())
+        let path = format!("Users/{}/PlayedItems/{item_id}", self.user_id);
+        self.post_empty(&path, &[]).await
     }
 
     /// Mark the currently playing item as watched.
@@ -482,18 +556,9 @@ impl JellyfinClient {
     ///
     /// Returns an error if the HTTP request fails.
     pub async fn get_next_up(&self, series_id: &str) -> Result<Option<String>> {
-        let url = format!(
-            "{}/Shows/{}/NextUp?UserId={}",
-            self.server_url, series_id, self.user_id
-        );
-
+        let path = format!("Shows/{series_id}/NextUp");
         let response: NextUpResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+            .get_json(&path, &[("UserId", &self.user_id)])
             .await?;
         Ok(response.items.into_iter().next().map(|item| item.id))
     }
@@ -503,18 +568,11 @@ impl JellyfinClient {
     /// Unlike `get_next_up()` which is per-series, this returns the first
     /// NextUp item across all shows.
     pub async fn get_global_next_up(&self) -> Result<Option<String>> {
-        let url = format!(
-            "{}/Shows/NextUp?UserId={}&Limit=1",
-            self.server_url, self.user_id
-        );
-
         let response: NextUpResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+            .get_json(
+                "Shows/NextUp",
+                &[("UserId", &self.user_id), ("Limit", "1")],
+            )
             .await?;
         Ok(response.items.into_iter().next().map(|item| item.id))
     }
@@ -523,19 +581,8 @@ impl JellyfinClient {
     ///
     /// Returns 0 if the item has never been played or has no resume position.
     pub async fn get_item_resume_ticks(&self, item_id: &str) -> Result<i64> {
-        let url = format!(
-            "{}/Users/{}/Items/{}",
-            self.server_url, self.user_id, item_id
-        );
-
-        let response: ItemDetail = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let path = format!("Users/{}/Items/{item_id}", self.user_id);
+        let response: ItemDetail = self.get_json(&path, &[]).await?;
         Ok(response
             .user_data
             .map(|ud| ud.playback_position_ticks)
@@ -551,17 +598,17 @@ impl JellyfinClient {
         item_id: &str,
         start_ticks: i64,
     ) -> Result<()> {
-        let mut url = format!(
-            "{}/Sessions/{}/Playing?PlayCommand=PlayNow&ItemIds={}",
-            self.server_url, session_id, item_id
-        );
-
+        let path = format!("Sessions/{session_id}/Playing");
+        let start_ticks_str;
+        let mut query: Vec<(&str, &str)> = vec![
+            ("PlayCommand", "PlayNow"),
+            ("ItemIds", item_id),
+        ];
         if start_ticks > 0 {
-            url.push_str(&format!("&StartPositionTicks={start_ticks}"));
+            start_ticks_str = start_ticks.to_string();
+            query.push(("StartPositionTicks", &start_ticks_str));
         }
-
-        self.client.post(&url).send().await?.error_for_status()?;
-        Ok(())
+        self.post_empty(&path, &query).await
     }
 
     /// Start playing an item in a session (from the beginning).
@@ -596,9 +643,9 @@ impl JellyfinClient {
                 .and_then(|s| s.default_subtitle_stream_index),
         };
 
-        let url = format!("{}/Sessions/{}/Command/Play", self.server_url, session_id);
+        let path = format!("Sessions/{session_id}/Command/Play");
         self.client
-            .post(&url)
+            .post(self.endpoint(&path))
             .json(&command)
             .send()
             .await?
@@ -608,22 +655,17 @@ impl JellyfinClient {
 
     /// Fetch playback info for an item.
     async fn fetch_playback_info(&self, item_id: &str) -> Result<PlaybackInfoResponse> {
-        let url = format!(
-            "{}/Items/{}/PlaybackInfo?UserId={}",
-            self.server_url, item_id, self.user_id
-        );
-
-        let response = self
+        let path = format!("Items/{item_id}/PlaybackInfo");
+        Ok(self
             .client
-            .post(&url)
+            .post(self.endpoint(&path))
+            .query(&[("UserId", self.user_id.as_str())])
             .json(&serde_json::json!({}))
             .send()
             .await?
             .error_for_status()?
             .json()
-            .await?;
-
-        Ok(response)
+            .await?)
     }
 
     /// Get remaining queue item IDs after the current item.
@@ -691,26 +733,15 @@ impl JellyfinClient {
 
     /// Get the library that an item belongs to via the Ancestors API.
     pub async fn get_item_library(&self, item_id: &str) -> Result<Option<LibraryInfo>> {
-        let url = format!("{}/Items/{}/Ancestors", self.server_url, item_id);
-        let ancestors: Vec<AncestorItem> = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let path = format!("Items/{item_id}/Ancestors");
+        let ancestors: Vec<AncestorItem> = self.get_json(&path, &[]).await?;
 
         Ok(ancestors.into_iter().find_map(|a| {
-            if a.item_type == "CollectionFolder" {
-                Some(LibraryInfo {
-                    id: a.id,
-                    name: a.name,
-                    collection_type: a.collection_type,
-                })
-            } else {
-                None
-            }
+            (a.item_type == "CollectionFolder").then_some(LibraryInfo {
+                id: a.id,
+                name: a.name,
+                collection_type: a.collection_type,
+            })
         }))
     }
 
@@ -731,23 +762,23 @@ impl JellyfinClient {
         exclude_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<ItemSummary>> {
-        let mut url = format!(
-            "{}/Users/{}/Items?ParentId={}&IsPlayed=false&Recursive=true&SortBy={}&SortOrder={}&Limit={}&Fields=DateCreated,ProductionYear&IncludeItemTypes=Episode,Movie,MusicVideo,Video",
-            self.server_url, self.user_id, library_id, sort_by, sort_order, limit
-        );
-
+        let path = format!("Users/{}/Items", self.user_id);
+        let limit_str = limit.to_string();
+        let mut query: Vec<(&str, &str)> = vec![
+            ("ParentId", library_id),
+            ("IsPlayed", "false"),
+            ("Recursive", "true"),
+            ("SortBy", sort_by),
+            ("SortOrder", sort_order),
+            ("Limit", &limit_str),
+            ("Fields", "DateCreated,ProductionYear"),
+            ("IncludeItemTypes", "Episode,Movie,MusicVideo,Video"),
+        ];
         if let Some(exc) = exclude_id {
-            url.push_str(&format!("&ExcludeItemIds={}", exc));
+            query.push(("ExcludeItemIds", exc));
         }
 
-        let response: ItemsResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let response: ItemsResponse = self.get_json(&path, &query).await?;
         Ok(response.items)
     }
 
@@ -755,33 +786,31 @@ impl JellyfinClient {
     ///
     /// Returns items sorted by their index/production year within the collection.
     pub async fn get_collection_items(&self, collection_id: &str) -> Result<Vec<ItemSummary>> {
-        let url = format!(
-            "{}/Users/{}/Items?ParentId={}&SortBy=SortName,ProductionYear&SortOrder=Ascending&Fields=DateCreated,ProductionYear",
-            self.server_url, self.user_id, collection_id
-        );
-
-        let response: ItemsResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let path = format!("Users/{}/Items", self.user_id);
+        let query = [
+            ("ParentId", collection_id),
+            ("SortBy", "SortName,ProductionYear"),
+            ("SortOrder", "Ascending"),
+            ("Fields", "DateCreated,ProductionYear"),
+        ];
+        let response: ItemsResponse = self.get_json(&path, &query).await?;
         Ok(response.items)
     }
 
     /// Get the server URL.
+    #[allow(dead_code)] // Public API surface; retained for downstream callers.
     pub fn server_url(&self) -> &str {
         &self.server_url
     }
 
     /// Get the user ID.
+    #[allow(dead_code)] // Public API surface; retained for downstream callers.
     pub fn user_id(&self) -> &str {
         &self.user_id
     }
 
     /// Get the device ID.
+    #[allow(dead_code)] // Public API surface; retained for downstream callers.
     pub fn device_id(&self) -> &str {
         &self.device_id
     }

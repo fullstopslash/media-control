@@ -6,11 +6,11 @@
 use tokio::process::Command;
 
 use super::fullscreen::is_pip_title;
-use super::{CommandContext, get_media_window, get_minify_state_path, send_to_mpv_socket};
+use super::{
+    CommandContext, MPV_IPC_SOCKET_DEFAULT as SHIM_SOCKET, get_media_window,
+    get_minify_state_path, send_to_mpv_socket,
+};
 use crate::error::Result;
-
-/// Default mpv IPC socket path (jellyfin-mpv-shim).
-const SHIM_SOCKET: &str = "/tmp/mpv-shim";
 
 /// Close the media window gracefully with app-specific handling.
 ///
@@ -53,16 +53,16 @@ pub async fn close(ctx: &CommandContext) -> Result<()> {
     .await
 }
 
-/// Close a specific window gracefully based on its class and title.
-///
-/// This is the internal implementation that handles app-specific close logic.
 /// Check if a process is the jellyfin-mpv-shim's mpv by looking for
-/// `--input-ipc-server=/tmp/mpv-shim` in its command line.
-fn is_shim_mpv(pid: i32) -> bool {
+/// `mpv-shim` in its command line (`/proc/<pid>/cmdline`).
+///
+/// Uses async I/O for consistency with the surrounding async context.
+async fn is_shim_mpv(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+    tokio::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .await
         .map(|cmdline| cmdline.contains("mpv-shim"))
         .unwrap_or(false)
 }
@@ -77,7 +77,7 @@ async fn close_window_gracefully(
     let close_cmd = format!("closewindow address:{addr}");
 
     // Shim mpv: send stop-and-clear, keep window alive for reuse.
-    if class == "mpv" && is_shim_mpv(pid) {
+    if class == "mpv" && is_shim_mpv(pid).await {
         let _ = send_to_mpv_socket(
             SHIM_SOCKET,
             r#"{"command":["script-message","stop-and-clear"]}"#,

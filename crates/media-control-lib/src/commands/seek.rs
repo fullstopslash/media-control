@@ -3,22 +3,27 @@
 use super::send_mpv_ipc_command;
 use crate::error::Result;
 
+/// Build the seek IPC payload. Percent is clamped to 0..=100 (defense in depth;
+/// the CLI parser already enforces this range).
+fn build_payload(percent: u8) -> String {
+    let pct = percent.min(100);
+    serde_json::json!({"command": ["seek", pct, "absolute-percent"]}).to_string()
+}
+
 /// Seek to an absolute percentage position in mpv.
 ///
 /// `percent` should be 0–100; values above 100 are clamped.
 pub async fn seek(percent: u8) -> Result<()> {
-    let pct = percent.min(100);
-    let payload = format!(r#"{{"command":["seek",{},"absolute-percent"]}}"#, pct);
-    send_mpv_ipc_command(&payload).await
+    send_mpv_ipc_command(&build_payload(percent)).await
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn seek_payload_format() {
-        let pct: u8 = 50;
-        let payload = format!(r#"{{"command":["seek",{},"absolute-percent"]}}"#, pct.min(100));
-        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&build_payload(50)).unwrap();
         let cmd = parsed["command"].as_array().unwrap();
         assert_eq!(cmd[0], "seek");
         assert_eq!(cmd[1], 50);
@@ -27,16 +32,19 @@ mod tests {
 
     #[test]
     fn seek_clamps_over_100() {
-        let pct: u8 = 255;
-        let clamped = pct.min(100);
-        assert_eq!(clamped, 100);
+        let parsed: serde_json::Value = serde_json::from_str(&build_payload(255)).unwrap();
+        assert_eq!(parsed["command"][1], 100);
     }
 
     #[test]
     fn seek_zero() {
-        let pct: u8 = 0;
-        let payload = format!(r#"{{"command":["seek",{},"absolute-percent"]}}"#, pct.min(100));
-        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&build_payload(0)).unwrap();
         assert_eq!(parsed["command"][1], 0);
+    }
+
+    #[test]
+    fn seek_boundary_100() {
+        let parsed: serde_json::Value = serde_json::from_str(&build_payload(100)).unwrap();
+        assert_eq!(parsed["command"][1], 100);
     }
 }

@@ -3,7 +3,7 @@
 //! Pins or unpins the media window and applies appropriate positioning
 //! based on the current state and configuration.
 
-use super::{CommandContext, suppress_avoider};
+use super::{CommandContext, pin_cmd, suppress_avoider, toggle_floating_cmd};
 use crate::error::Result;
 
 /// Toggle pinned floating mode for the media window.
@@ -35,30 +35,29 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
     let was_floating = media.floating;
     let was_pinned = media.pinned;
 
+    let addr = &media.address;
+
     // If both enabled, disable them (unpin then unfloat)
     if was_floating && was_pinned {
         ctx.hyprland
-            .batch(&[
-                &format!("dispatch pin address:{}", media.address),
-                &format!("dispatch togglefloating address:{}", media.address),
-            ])
+            .batch(&[&pin_cmd(addr), &toggle_floating_cmd(addr)])
             .await?;
         return Ok(());
     }
 
     // Enable pinned+floating mode
-    // Focus the window first
+    // Focus the window first (dispatch prepends "dispatch", so pass bare command)
     ctx.hyprland
-        .dispatch(&format!("focuswindow address:{}", media.address))
+        .dispatch(&format!("focuswindow address:{addr}"))
         .await?;
 
     // Build batch commands for state changes
     let mut cmds: Vec<String> = Vec::with_capacity(2);
     if !was_floating {
-        cmds.push(format!("dispatch togglefloating address:{}", media.address));
+        cmds.push(toggle_floating_cmd(addr));
     }
     if !was_pinned {
-        cmds.push(format!("dispatch pin address:{}", media.address));
+        cmds.push(pin_cmd(addr));
     }
 
     // Execute state changes if any
@@ -69,7 +68,7 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
 
     // Position to configured default corner (adjusted for minified mode)
     super::reposition_to_default(ctx, &media.address).await?;
-    suppress_avoider().await.ok();
+    suppress_avoider().await;
 
     Ok(())
 }

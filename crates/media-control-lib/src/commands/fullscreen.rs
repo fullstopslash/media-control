@@ -6,8 +6,8 @@
 use regex::Regex;
 
 use super::{
-    CommandContext, clear_suppression, get_media_window_with_clients, restore_focus,
-    suppress_avoider,
+    CommandContext, clear_suppression, focus_window_cmd, get_media_window_with_clients, pin_cmd,
+    restore_focus, suppress_avoider,
 };
 use crate::error::Result;
 use crate::hyprland::Client;
@@ -61,13 +61,14 @@ pub async fn fullscreen(ctx: &CommandContext) -> Result<()> {
 ///
 /// Makes the window floating first if needed, then pins it.
 async fn auto_pin_window(ctx: &CommandContext, media: &MediaWindow) -> Result<()> {
+    let addr = &media.address;
     if !media.floating {
         ctx.hyprland
-            .dispatch(&format!("togglefloating address:{}", media.address))
+            .dispatch(&format!("togglefloating address:{addr}"))
             .await?;
     }
     ctx.hyprland
-        .dispatch(&format!("pin address:{}", media.address))
+        .dispatch(&format!("pin address:{addr}"))
         .await?;
     Ok(())
 }
@@ -83,11 +84,11 @@ async fn enter_fullscreen_mode(ctx: &CommandContext, media: &MediaWindow) -> Res
     let mut cmds: Vec<String> = Vec::with_capacity(3);
 
     // 1. Focus the media window
-    cmds.push(format!("dispatch focuswindow address:{}", media.address));
+    cmds.push(focus_window_cmd(&media.address));
 
     // 2. Temporarily unpin if pinned (fullscreen windows cannot be pinned)
     if media.pinned {
-        cmds.push(format!("dispatch pin address:{}", media.address));
+        cmds.push(pin_cmd(&media.address));
     }
 
     // 3. Toggle fullscreen (operates on the now-focused window)
@@ -98,9 +99,7 @@ async fn enter_fullscreen_mode(ctx: &CommandContext, media: &MediaWindow) -> Res
     ctx.hyprland.batch(&cmd_refs).await?;
 
     // Suppress avoider to prevent repositioning
-    if let Err(e) = suppress_avoider().await {
-        eprintln!("media-control: failed to suppress avoider: {e}");
-    }
+    suppress_avoider().await;
 
     Ok(())
 }
@@ -115,18 +114,12 @@ async fn exit_fullscreen(
     let should_restore_pin = media.always_pin || media.pinned || is_pip_title(&media.title);
     let previous_focus = ctx.window_matcher.find_previous_focus(clients, addr, None);
     // Suppress avoider BEFORE starting - prevents repositioning during state changes
-    if let Err(e) = suppress_avoider().await {
-        eprintln!("media-control: failed to suppress avoider: {e}");
-    }
+    suppress_avoider().await;
 
     // Focus the media window and toggle fullscreen atomically
     // Note: fullscreen dispatcher doesn't accept address selector, operates on focused window
-    ctx.hyprland
-        .batch(&[
-            &format!("dispatch focuswindow address:{addr}"),
-            "dispatch fullscreen 0",
-        ])
-        .await?;
+    let focus = focus_window_cmd(addr);
+    ctx.hyprland.batch(&[&focus, "dispatch fullscreen 0"]).await?;
 
     // Retry loop for exiting fullscreen (like bash script)
     let mut attempt = 0;
@@ -146,34 +139,22 @@ async fn exit_fullscreen(
         attempt += 1;
 
         // Refresh suppression before retry
-        if let Err(e) = suppress_avoider().await {
-            eprintln!("media-control: failed to suppress avoider: {e}");
-        }
+        suppress_avoider().await;
 
         // Try again - focus and fullscreen atomically
-        ctx.hyprland
-            .batch(&[
-                &format!("dispatch focuswindow address:{addr}"),
-                "dispatch fullscreen 0",
-            ])
-            .await?;
+        let focus = focus_window_cmd(addr);
+        ctx.hyprland.batch(&[&focus, "dispatch fullscreen 0"]).await?;
 
         // Aggressive double-toggle on final attempt
         if attempt == MAX_FULLSCREEN_EXIT_ATTEMPTS {
             ctx.hyprland
-                .batch(&[
-                    &format!("dispatch focuswindow address:{addr}"),
-                    "dispatch fullscreen 0",
-                    "dispatch fullscreen 0",
-                ])
+                .batch(&[&focus, "dispatch fullscreen 0", "dispatch fullscreen 0"])
                 .await?;
         }
     }
 
     // Refresh suppression before pin/focus restoration
-    if let Err(e) = suppress_avoider().await {
-        eprintln!("media-control: failed to suppress avoider: {e}");
-    }
+    suppress_avoider().await;
 
     // Get fresh state after exiting fullscreen
     let fresh_clients = ctx.hyprland.get_clients().await?;
@@ -211,9 +192,7 @@ async fn exit_fullscreen(
     // 3. The daemon would skip avoid due to debounce, leaving the window in wrong position
     //
     // By explicitly calling avoid here, we ensure proper positioning with fresh client data.
-    if let Err(e) = clear_suppression().await {
-        eprintln!("media-control: failed to clear suppression: {e}");
-    }
+    clear_suppression().await;
     if let Err(e) = super::avoid::avoid(ctx).await {
         tracing::debug!("avoid after fullscreen exit failed (non-fatal): {e}");
     }

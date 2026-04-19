@@ -88,15 +88,21 @@ impl Direction {
     /// ```
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        // Try intuitive names first (case-insensitive)
-        match s.to_lowercase().as_str() {
-            "left" => Some(Self::Left),
-            "right" => Some(Self::Right),
-            "up" => Some(Self::Up),
-            "down" => Some(Self::Down),
-            // Fall back to vim-style single character
-            _ => s.chars().next().and_then(Self::from_char),
+        // Try intuitive names first (case-insensitive, no allocation)
+        if s.eq_ignore_ascii_case("left") {
+            return Some(Self::Left);
         }
+        if s.eq_ignore_ascii_case("right") {
+            return Some(Self::Right);
+        }
+        if s.eq_ignore_ascii_case("up") {
+            return Some(Self::Up);
+        }
+        if s.eq_ignore_ascii_case("down") {
+            return Some(Self::Down);
+        }
+        // Fall back to vim-style single character
+        s.chars().next().and_then(Self::from_char)
     }
 }
 
@@ -174,7 +180,7 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
     ctx.hyprland.batch(&[&move_cmd, &resize_cmd]).await?;
 
     // Suppress avoider to prevent immediate repositioning
-    let _ = suppress_avoider().await;
+    suppress_avoider().await;
 
     Ok(())
 }

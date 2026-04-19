@@ -29,24 +29,15 @@ pub async fn status(json_output: bool) -> crate::error::Result<bool> {
         }
     };
 
-    // Query remaining properties (best-effort, default on failure)
-    let position = query_mpv_property("playback-time")
-        .await
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let duration = query_mpv_property("duration")
-        .await
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let paused = query_mpv_property("pause")
-        .await
-        .ok()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Query remaining properties concurrently (best-effort, default on failure)
+    let (pos_result, dur_result, pause_result) = tokio::join!(
+        query_mpv_property("playback-time"),
+        query_mpv_property("duration"),
+        query_mpv_property("pause"),
+    );
+    let position = pos_result.ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let duration = dur_result.ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let paused = pause_result.ok().and_then(|v| v.as_bool()).unwrap_or(false);
 
     if json_output {
         let output = serde_json::json!({

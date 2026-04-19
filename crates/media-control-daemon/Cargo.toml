@@ -17,4 +17,4 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 
 # For PID file management and FIFO creation
-nix = { version = "0.30", features = ["signal", "process", "fs"] }
+nix = { version = "0.30", features = ["signal", "process", "fs", "user"] }

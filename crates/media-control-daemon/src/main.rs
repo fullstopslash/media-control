@@ -12,8 +12,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use media_control_lib::commands::{self, CommandContext};
+use media_control_lib::commands::{self, CommandContext, runtime_dir};
 use media_control_lib::config::Config;
+use media_control_lib::hyprland::runtime_socket_path;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::fs;
@@ -43,46 +44,57 @@ enum Commands {
     Foreground,
 }
 
-/// Get the path to the PID file.
+/// Get the path to the PID file (in `$XDG_RUNTIME_DIR`, sanitized).
 fn get_pid_file_path() -> PathBuf {
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(runtime_dir).join("media-control-daemon.pid")
+    runtime_dir().join("media-control-daemon.pid")
 }
 
 /// Get the path to the trigger FIFO.
 ///
-/// This FIFO allows manual triggering of the avoider for events that
-/// don't emit Hyprland socket events (like `layoutmsg togglesplit`).
-/// Located in /tmp to avoid leaving files on disk (tmpfs).
+/// Placed in `$XDG_RUNTIME_DIR` (per-user, mode 0700 by default on systemd
+/// systems) rather than world-writable `/tmp`. This defends against symlink
+/// races and pre-creation attacks that would otherwise be possible at a
+/// predictable `/tmp` path on a multi-user host.
 fn get_fifo_path() -> PathBuf {
-    PathBuf::from("/tmp/media-avoider-trigger.fifo")
+    runtime_dir().join("media-avoider-trigger.fifo")
 }
 
-/// Get the path to Hyprland's socket2.
+/// Get the path to Hyprland's socket2 (event stream).
 fn get_socket2_path() -> Result<PathBuf, String> {
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").map_err(|_| "XDG_RUNTIME_DIR not set")?;
-    let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .map_err(|_| "HYPRLAND_INSTANCE_SIGNATURE not set")?;
-
-    Ok(PathBuf::from(runtime_dir)
-        .join("hypr")
-        .join(instance_sig)
-        .join(".socket2.sock"))
+    runtime_socket_path(".socket2.sock").map_err(|e| e.to_string())
 }
 
 /// Read PID from the PID file.
+///
+/// Rejects non-positive PIDs to avoid accidentally signalling process group 0
+/// or the entire session via `kill(-1, ...)` semantics.
 async fn read_pid_file() -> Option<Pid> {
     let path = get_pid_file_path();
     let content = fs::read_to_string(&path).await.ok()?;
     let pid: i32 = content.trim().parse().ok()?;
+    if pid <= 1 {
+        return None;
+    }
     Some(Pid::from_raw(pid))
 }
 
-/// Write current PID to the PID file.
+/// Write current PID to the PID file with restrictive permissions.
+///
+/// Uses O_CREAT|O_TRUNC|O_WRONLY with mode 0o600 so the file cannot be read
+/// by other users on a shared host.
 async fn write_pid_file() -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let path = get_pid_file_path();
     let pid = std::process::id();
-    fs::write(&path, pid.to_string()).await
+
+    // Atomically (re)create with 0600 perms.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true).mode(0o600);
+    let mut file = opts.open(&path)?;
+    use std::io::Write;
+    write!(file, "{pid}")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Remove the PID file.
@@ -91,10 +103,24 @@ async fn remove_pid_file() {
     let _ = fs::remove_file(&path).await;
 }
 
-/// Check if a process with the given PID is running.
+/// Check if a process with the given PID is running AND is plausibly our daemon.
+///
+/// A bare `kill(pid, 0)` is racy: PIDs are recycled, so a stale PID file may
+/// reference an unrelated process — possibly even one owned by a different
+/// user. Defend against that by also checking `/proc/<pid>/comm` matches the
+/// expected daemon binary name when available; fall back to signal-0 if
+/// `/proc` is unreadable.
 fn is_process_running(pid: Pid) -> bool {
-    // Sending signal 0 checks if process exists without actually signaling it
-    signal::kill(pid, None).is_ok()
+    if signal::kill(pid, None).is_err() {
+        return false;
+    }
+    // Best-effort identity check — only trust kill if comm matches.
+    let comm_path = format!("/proc/{}/comm", pid.as_raw());
+    match std::fs::read_to_string(&comm_path) {
+        Ok(comm) => comm.trim() == env!("CARGO_PKG_NAME") || comm.trim() == "media-control-d",
+        // /proc not available or unreadable — fall back to signal-0 result.
+        Err(_) => true,
+    }
 }
 
 /// Trigger the avoid command.
@@ -105,15 +131,48 @@ async fn trigger_avoid(ctx: &CommandContext) {
 }
 
 /// Create the trigger FIFO if it doesn't exist.
+///
+/// Hardened against symlink attacks: uses `lstat` (no symlink resolution) to
+/// check the existing entry, refuses to remove anything that isn't a real
+/// FIFO owned by us, and creates the new FIFO with mode 0o600.
 fn create_fifo() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
     let path = get_fifo_path();
 
-    // Remove stale FIFO if it exists
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+    // Use symlink_metadata (lstat) — does NOT follow symlinks. If an attacker
+    // pre-created a symlink at our path we'd otherwise remove the target.
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "refusing to use {path:?}: it is a symlink"
+                )));
+            }
+            if !ft.is_fifo() {
+                return Err(std::io::Error::other(format!(
+                    "refusing to use {path:?}: not a FIFO"
+                )));
+            }
+            // Only remove if it's owned by us.
+            let our_uid = nix::unistd::Uid::current().as_raw();
+            if meta.uid() != our_uid {
+                return Err(std::io::Error::other(format!(
+                    "refusing to use {path:?}: owned by uid {} (expected {our_uid})",
+                    meta.uid()
+                )));
+            }
+            std::fs::remove_file(&path)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
 
-    // Create new FIFO using nix
+    // mkfifo creates atomically; mode 0o600 is masked by umask but caller
+    // controls that. The previous symlink check + per-user runtime dir means
+    // a TOCTOU race here would require write access to $XDG_RUNTIME_DIR,
+    // which on systemd systems is the user's own 0700 directory.
     nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600))
         .map_err(std::io::Error::other)?;
 
@@ -253,7 +312,7 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
         Config::default()
     });
     let debounce_ms = config.positioning.debounce_ms;
-    let ctx = CommandContext::with_config(config.clone())?;
+    let ctx = CommandContext::with_config(config)?;
     let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
 
     // Create FIFO for manual triggers
@@ -300,8 +359,16 @@ async fn run_foreground() -> ExitCode {
     }
 
     // Run event loop with graceful shutdown
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to register SIGTERM handler");
+    let mut sigterm = match tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("failed to register SIGTERM handler: {e}");
+            remove_pid_file().await;
+            return ExitCode::FAILURE;
+        }
+    };
 
     let result = tokio::select! {
         result = run_event_loop() => result,

@@ -35,10 +35,14 @@ pub mod seek;
 pub mod status;
 
 use std::env;
-use std::path::PathBuf;
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::error::Result;
@@ -65,7 +69,7 @@ impl CommandContext {
     /// allowing tests to provide a mock Hyprland socket and custom configuration.
     #[cfg(test)]
     pub fn for_test(hyprland: HyprlandClient, config: Config) -> Result<Self> {
-        let window_matcher = WindowMatcher::new(&config.patterns)?;
+        let window_matcher = WindowMatcher::new(&config.patterns);
         Ok(Self {
             hyprland,
             config,
@@ -108,7 +112,7 @@ impl CommandContext {
                 )),
             })?;
 
-        let window_matcher = WindowMatcher::new(&config.patterns)?;
+        let window_matcher = WindowMatcher::new(&config.patterns);
 
         Ok(Self {
             hyprland,
@@ -128,15 +132,6 @@ pub(crate) fn find_focused_address(clients: &[Client]) -> Option<&str> {
         .iter()
         .find(|c| c.focus_history_id == 0)
         .map(|c| c.address.as_str())
-}
-
-/// Get the current mpv media window, or None if no mpv window is found.
-///
-/// Combines the common `get_media_window` + `class == "mpv"` guard
-/// used across mark_watched, chapter, and keep commands.
-pub async fn require_mpv_window(ctx: &CommandContext) -> Result<Option<MediaWindow>> {
-    let window = get_media_window(ctx).await?;
-    Ok(window.filter(|w| w.class == "mpv"))
 }
 
 /// Get the current media window.
@@ -178,9 +173,32 @@ pub fn get_media_window_with_clients(
 }
 
 /// Get the runtime directory (`$XDG_RUNTIME_DIR` or `/tmp` fallback).
-fn runtime_dir() -> PathBuf {
-    let dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(dir)
+///
+/// Sanitizes the env value to defend against path-traversal injection:
+/// the path must be absolute, contain no `..` components, and exist as a
+/// directory. On any failure, falls back to `/tmp`.
+pub fn runtime_dir() -> PathBuf {
+    fn sanitize(raw: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(raw);
+        if !p.is_absolute() {
+            return None;
+        }
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        // Existence check defends against typo'd or hostile values.
+        if !p.is_dir() {
+            return None;
+        }
+        Some(p)
+    }
+
+    env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .and_then(|v| sanitize(&v))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 /// Get the path to the avoider suppress file.
@@ -192,39 +210,50 @@ pub fn get_suppress_file_path() -> PathBuf {
     runtime_dir().join("media-avoider-suppress")
 }
 
+/// Write a value to the suppress file. Logs on failure.
+async fn write_suppress_file(content: &str) {
+    if let Err(e) = fs::write(get_suppress_file_path(), content).await {
+        tracing::debug!("failed to write suppress file: {e}");
+    }
+}
+
 /// Write a timestamp to the suppress file to prevent avoider repositioning.
 ///
 /// The avoider daemon checks this file before repositioning. If the timestamp
 /// is recent (within the configured timeout), it skips the reposition operation.
 /// This prevents feedback loops when commands intentionally move windows.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be written.
-pub async fn suppress_avoider() -> Result<()> {
-    let path = get_suppress_file_path();
-    // Write milliseconds to match bash daemon's _should_suppress() check
+pub async fn suppress_avoider() {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-
-    fs::write(&path, timestamp.to_string()).await?;
-    Ok(())
+    write_suppress_file(&timestamp.to_string()).await;
 }
 
 /// Clear the avoider suppression to allow the next avoid trigger to run.
 ///
 /// This writes a timestamp of 0 (epoch) which will always appear as stale
 /// to the avoider daemon, allowing it to run on the next event.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be written.
-pub async fn clear_suppression() -> Result<()> {
-    let path = get_suppress_file_path();
-    fs::write(&path, "0").await?;
-    Ok(())
+pub async fn clear_suppression() {
+    write_suppress_file("0").await;
+}
+
+/// Build a `dispatch focuswindow address:<addr>` command string.
+#[inline]
+pub(crate) fn focus_window_cmd(addr: &str) -> String {
+    format!("dispatch focuswindow address:{addr}")
+}
+
+/// Build a `dispatch pin address:<addr>` command string.
+#[inline]
+pub(crate) fn pin_cmd(addr: &str) -> String {
+    format!("dispatch pin address:{addr}")
+}
+
+/// Build a `dispatch togglefloating address:<addr>` command string.
+#[inline]
+pub(crate) fn toggle_floating_cmd(addr: &str) -> String {
+    format!("dispatch togglefloating address:{addr}")
 }
 
 /// Restore focus to a window without warping the cursor.
@@ -232,11 +261,13 @@ pub async fn clear_suppression() -> Result<()> {
 /// Tries modern `cursor:no_warps` syntax first, falls back to legacy
 /// `general:no_cursor_warps` for older Hyprland versions.
 pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
+    let focus = focus_window_cmd(addr);
+
     let result = ctx
         .hyprland
         .batch(&[
             "keyword cursor:no_warps true",
-            &format!("dispatch focuswindow address:{addr}"),
+            &focus,
             "keyword cursor:no_warps false",
         ])
         .await;
@@ -245,7 +276,7 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
         ctx.hyprland
             .batch(&[
                 "keyword general:no_cursor_warps true",
-                &format!("dispatch focuswindow address:{addr}"),
+                &focus,
                 "keyword general:no_cursor_warps false",
             ])
             .await?;
@@ -331,7 +362,7 @@ pub(crate) async fn reposition_to_default(ctx: &CommandContext, addr: &str) -> R
 }
 
 /// Default mpv IPC socket path (mpv-shim).
-const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpv-shim";
+pub(crate) const MPV_IPC_SOCKET_DEFAULT: &str = "/tmp/mpv-shim";
 
 /// Fallback mpv IPC socket path (legacy).
 const MPV_IPC_SOCKET_FALLBACK: &str = "/tmp/mpvctl-jshim";
@@ -345,43 +376,57 @@ const SOCKET_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// Delay between retry attempts.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// Check that a path exists and is a Unix socket.
+fn is_unix_socket(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false)
+}
+
 /// Shim query socket path for cached lookups.
 const SHIM_QUERY_SOCKET: &str = "/tmp/mpv-shim-query.sock";
+
+/// Connect to a Unix socket and write `payload\n`, returning the open stream.
+///
+/// Bounded by `SOCKET_CONNECT_TIMEOUT`. Caller is responsible for
+/// validating that `path` is a real Unix socket via [`is_unix_socket`]
+/// before calling — defends against symlink-to-regular-file in /tmp.
+async fn connect_and_write(
+    path: &Path,
+    payload: &str,
+    append_newline: bool,
+) -> std::io::Result<UnixStream> {
+    timeout(SOCKET_CONNECT_TIMEOUT, async {
+        let mut stream = UnixStream::connect(path).await?;
+        stream.write_all(payload.as_bytes()).await?;
+        if append_newline {
+            stream.write_all(b"\n").await?;
+        }
+        Ok::<_, std::io::Error>(stream)
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket connect timeout"))?
+}
 
 /// Query the shim's query socket with a JSON request.
 ///
 /// Returns the raw response string, or None if the socket is unavailable.
 /// Single attempt, no retry — designed for fast cached lookups.
 pub async fn query_shim(request: &serde_json::Value) -> Option<String> {
-    use std::os::unix::fs::FileTypeExt;
-    use std::path::Path;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
-    use tokio::time::timeout;
-
     let path = Path::new(SHIM_QUERY_SOCKET);
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => {}
-        _ => return None,
+    if !is_unix_socket(path) {
+        return None;
     }
 
     let payload = request.to_string();
-    let result = timeout(SOCKET_CONNECT_TIMEOUT, async {
-        let mut stream = UnixStream::connect(path).await?;
-        stream.write_all(payload.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        stream.shutdown().await?;
-
-        let mut buf = String::new();
-        stream.read_to_string(&mut buf).await?;
-        Ok::<_, std::io::Error>(buf)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(buf)) if !buf.is_empty() => Some(buf),
-        _ => None,
+    let mut stream = connect_and_write(path, &payload, true).await.ok()?;
+    if stream.shutdown().await.is_err() {
+        return None;
     }
+
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).await.ok()?;
+    if buf.is_empty() { None } else { Some(buf) }
 }
 
 /// Get the ordered list of mpv IPC socket paths to try.
@@ -405,40 +450,23 @@ async fn mpv_ipc_exchange(
     payload: &str,
     read_response: bool,
 ) -> std::result::Result<Option<serde_json::Value>, ()> {
-    use std::os::unix::fs::FileTypeExt;
-    use std::path::Path;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-    use tokio::time::timeout;
-
     let path = Path::new(socket_path);
 
-    // Validate socket
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => {}
-        Ok(_) => {
+    if !is_unix_socket(path) {
+        if path.exists() {
             eprintln!("media-control: skipping {socket_path}: not a socket");
-            return Err(());
         }
-        Err(_) => return Err(()),
+        return Err(());
     }
 
     // Connect + write with timeout
-    let stream_result = timeout(SOCKET_CONNECT_TIMEOUT, async {
-        let mut stream = UnixStream::connect(path).await?;
-        stream.write_all(payload.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        Ok::<_, std::io::Error>(stream)
-    })
-    .await;
-
-    let mut stream = match stream_result {
-        Ok(Ok(s)) => s,
-        Ok(Err(_)) => return Err(()),
-        Err(_) => {
+    let mut stream = match connect_and_write(path, payload, true).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             eprintln!("media-control: timeout connecting to {socket_path}");
             return Err(());
         }
+        Err(_) => return Err(()),
     };
 
     if !read_response {
@@ -491,11 +519,14 @@ pub async fn send_mpv_script_message_with_args(message: &str, args: &[&str]) -> 
     let mut parts: Vec<&str> = vec!["script-message", message];
     parts.extend_from_slice(args);
     let payload = serde_json::json!({"command": parts}).to_string();
-    send_mpv_fire_and_forget(&payload).await
+    send_mpv_ipc_command(&payload).await
 }
 
-/// Send a command to mpv without reading the response.
-async fn send_mpv_fire_and_forget(payload: &str) -> Result<()> {
+/// Send a raw JSON command to mpv via IPC socket (fire-and-forget).
+///
+/// Tries multiple socket paths with retry. Does not read the response —
+/// avoids blocking on mpv's event flood during rapid-fire commands.
+pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
     let paths = mpv_socket_paths();
 
     for attempt in 0..2u8 {
@@ -532,29 +563,17 @@ pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
 
     for socket_path in &mpv_socket_paths() {
         if let Ok(Some(resp)) = mpv_ipc_exchange(socket_path, &payload, true).await {
-            if resp.get("error").and_then(|e| e.as_str()) == Some("success") {
+            let err_str = resp.get("error").and_then(|e| e.as_str());
+            if err_str == Some("success") {
                 return Ok(resp.get("data").cloned().unwrap_or(serde_json::Value::Null));
             }
             return Err(crate::error::MediaControlError::mpv_connection_failed(
-                format!(
-                    "mpv error: {}",
-                    resp.get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("unknown")
-                ),
+                format!("mpv error: {}", err_str.unwrap_or("unknown")),
             ));
         }
     }
 
     Err(crate::error::MediaControlError::mpv_no_socket())
-}
-
-/// Send a raw JSON command to mpv via IPC socket (fire-and-forget).
-///
-/// Tries multiple socket paths with retry. Does not read the response —
-/// avoids blocking on mpv's event flood during rapid-fire commands.
-pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
-    send_mpv_fire_and_forget(payload).await
 }
 
 /// Send a payload to a specific mpv socket (fire-and-forget, no response read).
@@ -630,26 +649,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppress_avoider_succeeds() {
-        // Verify suppress_avoider writes without error.
-        // We don't check the file content because parallel tests also write
-        // to the same shared suppress file, causing race conditions.
-        suppress_avoider()
-            .await
-            .expect("should write suppress file");
-
-        // Verify the file exists
+    async fn suppress_avoider_writes_file() {
+        suppress_avoider().await;
         let path = get_suppress_file_path();
         assert!(path.exists(), "suppress file should exist at {path:?}");
     }
 
     #[tokio::test]
-    async fn clear_suppression_succeeds() {
-        // Just verify it doesn't error. Can't assert file content because
-        // parallel tests also write to the shared suppress file.
-        clear_suppression()
-            .await
-            .expect("should clear suppress file");
+    async fn clear_suppression_writes_file() {
+        clear_suppression().await;
+        let path = get_suppress_file_path();
+        assert!(path.exists(), "suppress file should exist at {path:?}");
     }
 
     #[test]
@@ -746,7 +756,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let matcher = WindowMatcher::new(&patterns).unwrap();
+        let matcher = WindowMatcher::new(&patterns);
 
         // Create mock clients where Firefox is focused (focusHistoryID == 0)
         // but mpv is also present and pinned

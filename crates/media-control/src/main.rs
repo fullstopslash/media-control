@@ -282,7 +282,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::chapter::chapter(dir).await?;
         }
         Commands::Play { target } => {
-            commands::play::play(&ctx, &target).await?;
+            commands::play::play(&target).await?;
         }
         Commands::Random { random_type } => {
             commands::random::random(random_type.as_deref()).await?;

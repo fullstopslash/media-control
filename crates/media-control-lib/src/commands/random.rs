@@ -14,17 +14,9 @@ use super::{send_mpv_script_message, send_mpv_script_message_with_args};
 ///
 /// If `random_type` is provided, it's passed as an argument to the
 /// `random` script-message. The active store interprets the type.
-pub async fn random(
-    random_type: Option<&str>,
-) -> crate::error::Result<()> {
+pub async fn random(random_type: Option<&str>) -> crate::error::Result<()> {
     match random_type {
-        Some(t) => {
-            send_mpv_script_message_with_args("random", &[t]).await?;
-        }
-        None => {
-            send_mpv_script_message("random").await?;
-        }
+        Some(t) => send_mpv_script_message_with_args("random", &[t]).await,
+        None => send_mpv_script_message("random").await,
     }
-
-    Ok(())
 }

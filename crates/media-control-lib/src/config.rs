@@ -40,8 +40,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
+
+/// Maximum size accepted for the user config file.
+///
+/// Real configs are < 16 KiB; the cap exists to prevent OOM if a hostile
+/// or accidental large file is symlinked at the config path.
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Maximum compiled-NFA size for a user-supplied title regex (bytes).
+/// Caps catastrophic-backtracking surface area for daemon-hot regexes.
+const TITLE_REGEX_SIZE_LIMIT: usize = 64 * 1024;
 
 /// Error type for configuration operations.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +61,9 @@ pub enum ConfigError {
 
     #[error("failed to parse TOML: {0}")]
     Parse(#[from] toml::de::Error),
+
+    #[error("config file too large: {size} bytes (max {max})")]
+    TooLarge { size: u64, max: u64 },
 
     #[error("home directory not found")]
     NoHomeDir,
@@ -104,12 +117,22 @@ impl Config {
 
     /// Load configuration from a specific path.
     ///
+    /// The file is size-capped at [`MAX_CONFIG_FILE_BYTES`] to prevent OOM
+    /// on a malformed (or symlinked) input.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The file cannot be read
+    /// - The file cannot be read or exceeds the size cap
     /// - The TOML content is malformed
     pub fn load_from_path(path: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > MAX_CONFIG_FILE_BYTES {
+            return Err(ConfigError::TooLarge {
+                size: meta.len(),
+                max: MAX_CONFIG_FILE_BYTES,
+            });
+        }
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
@@ -409,13 +432,20 @@ impl Clone for PositionOverride {
 
 impl PositionOverride {
     /// Get the compiled title regex, compiling it on first access.
+    ///
+    /// Compilation is bounded by [`TITLE_REGEX_SIZE_LIMIT`] to cap the worst
+    /// case for catastrophic-backtracking patterns supplied by user config —
+    /// this matcher runs in the daemon hot path on every focus event.
     fn title_regex(&self) -> Option<&Regex> {
         self.compiled_title_regex
             .get_or_init(|| {
                 if self.focused_title.is_empty() {
                     None
                 } else {
-                    Regex::new(&self.focused_title).ok()
+                    RegexBuilder::new(&self.focused_title)
+                        .size_limit(TITLE_REGEX_SIZE_LIMIT)
+                        .build()
+                        .ok()
                 }
             })
             .as_ref()
