@@ -1364,8 +1364,14 @@ mod tests {
         // SAFETY: single-threaded test
         unsafe {
             set_env("XDG_RUNTIME_DIR", "tmp/runtime");
-            let dir = runtime_dir();
-            assert_eq!(dir, PathBuf::from("/tmp"), "relative path must be rejected");
+            let result = runtime_dir();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::MediaControlError::InvalidArgument(_))
+                ),
+                "relative path must be rejected, got {result:?}"
+            );
             if let Some(val) = original {
                 set_env("XDG_RUNTIME_DIR", &val);
             } else {
@@ -1382,8 +1388,14 @@ mod tests {
         // SAFETY: single-threaded
         unsafe {
             set_env("XDG_RUNTIME_DIR", "/run/user/1000/../../etc");
-            let dir = runtime_dir();
-            assert_eq!(dir, PathBuf::from("/tmp"), "parent-dir traversal must be rejected");
+            let result = runtime_dir();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::MediaControlError::InvalidArgument(_))
+                ),
+                "parent-dir traversal must be rejected, got {result:?}"
+            );
             if let Some(val) = original {
                 set_env("XDG_RUNTIME_DIR", &val);
             } else {
@@ -1405,12 +1417,42 @@ mod tests {
                 "XDG_RUNTIME_DIR",
                 "/definitely/does/not/exist/runtime-dir-12345",
             );
-            let dir = runtime_dir();
-            assert_eq!(dir, PathBuf::from("/tmp"));
+            let result = runtime_dir();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::MediaControlError::InvalidArgument(_))
+                ),
+                "nonexistent path must be rejected, got {result:?}"
+            );
             if let Some(val) = original {
                 set_env("XDG_RUNTIME_DIR", &val);
             } else {
                 remove_env("XDG_RUNTIME_DIR");
+            }
+        }
+    }
+
+    /// Security: ensure `runtime_dir()` rejects an unset env var entirely
+    /// rather than silently falling back to `/tmp` (which is world-writable
+    /// on most systems and exposes derived paths to symlink attacks).
+    #[tokio::test]
+    async fn runtime_dir_rejects_missing_env_var() {
+        let _g = super::async_env_test_mutex().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: single-threaded
+        unsafe {
+            remove_env("XDG_RUNTIME_DIR");
+            let result = runtime_dir();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::MediaControlError::InvalidArgument(_))
+                ),
+                "unset XDG_RUNTIME_DIR must be rejected, got {result:?}"
+            );
+            if let Some(val) = original {
+                set_env("XDG_RUNTIME_DIR", &val);
             }
         }
     }
@@ -1581,6 +1623,16 @@ mod tests {
         // the timestamp and the assertion flaps.
         let _g = super::async_env_test_mutex().lock().await;
 
+        // Provide a valid XDG_RUNTIME_DIR — the new `runtime_dir`
+        // contract refuses to invent one for us. A per-test tempdir
+        // sidesteps the cross-test races on the shared system path.
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        let runtime = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test, restored at end
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", runtime.path().to_str().unwrap());
+        }
+
         let mock = MockHyprland::start().await;
         let ctx = mock.default_context();
 
@@ -1600,10 +1652,10 @@ mod tests {
             "expected move dispatch: {cmds:?}"
         );
 
-        // Suppress file should hold a recent (positive) timestamp. The shared
-        // on-disk path may be racing with parallel tests — tolerate transient
-        // mid-write empty reads by polling briefly.
-        let path = get_suppress_file_path();
+        // Suppress file should hold a recent (positive) timestamp. With the
+        // per-test tempdir there are no parallel writers, but we still poll
+        // a few iterations in case fs flush is delayed.
+        let path = get_suppress_file_path().expect("XDG_RUNTIME_DIR set above");
         let mut got_nonzero = false;
         for _ in 0..10 {
             let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
@@ -1615,6 +1667,16 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
+
+        // SAFETY: restore env before the assert (which can panic)
+        unsafe {
+            if let Some(v) = original {
+                set_env("XDG_RUNTIME_DIR", &v);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+        }
+
         assert!(
             got_nonzero,
             "reposition_to_default must write a non-zero suppress timestamp"

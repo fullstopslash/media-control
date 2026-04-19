@@ -74,6 +74,11 @@ struct PositionPair {
 ///
 /// Returns primary and secondary positions for mouseover toggle behavior.
 /// Looks up config overrides by focused_class (case-insensitive) and/or title (regex).
+///
+/// Resolves the minified flag once at the top and threads it through the
+/// `_with_minified` helpers — each resolve without this would stat the
+/// minify marker file again. Four+ resolves per call made the redundancy
+/// visible in a flame graph.
 fn get_position_pair(
     ctx: &CommandContext,
     focused_class: &str,
@@ -81,7 +86,10 @@ fn get_position_pair(
 ) -> PositionPair {
     let positions = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
-    let resolve_or = |name: &str, default: i32| super::resolve_position_or(ctx, name, default);
+    let minified = super::is_minified();
+    let resolve_or = |name: &str, default: i32| {
+        super::resolve_position_or_with_minified(ctx, name, default, minified)
+    };
 
     // Default positions (adjusted for minified mode)
     let default_primary_x = resolve_or(&positioning.default_x, positions.x_right);
@@ -94,7 +102,7 @@ fn get_position_pair(
         let override_or = |field: &Option<String>, default: i32| -> i32 {
             field
                 .as_ref()
-                .and_then(|s| super::resolve_effective_position(ctx, s))
+                .and_then(|s| super::resolve_effective_position_with_minified(ctx, s, minified))
                 .unwrap_or(default)
         };
         return PositionPair {
@@ -131,7 +139,13 @@ fn calculate_target_position(
 ) -> (i32, i32) {
     let positioning = &ctx.config.positioning;
     let positions = &ctx.config.positions;
-    let resolve_or = |name: &str, default: i32| super::resolve_position_or(ctx, name, default);
+    // Compute the minified flag once: this function reads four positions
+    // and the dimensions in quick succession; without sharing the bool
+    // each call would stat the minify marker file independently.
+    let minified = super::is_minified();
+    let resolve_or = |name: &str, default: i32| {
+        super::resolve_position_or_with_minified(ctx, name, default, minified)
+    };
 
     // Use effective positions (adjusted for minified mode)
     let x_left = resolve_or("x_left", positions.x_left);
@@ -139,7 +153,7 @@ fn calculate_target_position(
     let y_top = resolve_or("y_top", positions.y_top);
     let y_bottom = resolve_or("y_bottom", positions.y_bottom);
 
-    let (media_width, _) = super::effective_dimensions(ctx);
+    let (media_width, _) = super::effective_dimensions_with_minified(ctx, minified);
     // Widen to i64: socket-provided geometry could push these sums past i32::MAX.
     // All center-point math uses safe-midpoint formulas so even adversarial
     // i32 extremes cannot overflow before comparison.
@@ -233,18 +247,50 @@ where
 }
 
 /// Check if avoider should be suppressed due to recent activity.
+///
+/// Returns `false` (i.e. "not suppressed, run avoid") on every read /
+/// parse / env failure. Each failure mode is logged at `debug` so an
+/// operator who notices the avoider thrashing can tell whether the
+/// suppress file was missing (normal — no recent dispatch), unreadable
+/// (permission regression, stat race), unparseable (write was truncated by
+/// a non-atomic writer), or whether the env var itself disappeared.
+/// Without these logs the failure path is silent and indistinguishable
+/// from "no suppress was ever issued".
 async fn should_suppress(suppress_timeout_ms: u64) -> bool {
-    let path = get_suppress_file_path();
+    let path = match get_suppress_file_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("suppress check skipped: cannot resolve path: {e}");
+            return false;
+        }
+    };
 
-    let Ok(content) = fs::read_to_string(&path).await else {
-        return false;
+    let content = match fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // ENOENT is the normal "no recent dispatch" case — keep it at
+            // `trace` so we don't drown the signal in noise on every tick.
+            tracing::trace!("suppress file absent: {}", path.display());
+            return false;
+        }
+        Err(e) => {
+            tracing::debug!(
+                "suppress file unreadable (treating as not suppressed): {}: {e}",
+                path.display()
+            );
+            return false;
+        }
     };
 
     let Ok(timestamp_ms) = content.trim().parse::<u64>() else {
+        tracing::debug!(
+            "suppress file content not parseable as u64 (treating as not suppressed): {:?}",
+            content.trim()
+        );
         return false;
     };
 
-    let now = u64::try_from(now_unix_millis()).unwrap_or(u64::MAX);
+    let now = now_unix_millis();
     now.saturating_sub(timestamp_ms) < suppress_timeout_ms
 }
 
@@ -295,8 +341,8 @@ impl<'a> FocusedWindow<'a> {
     }
 }
 
-/// Count non-media windows on the same workspace.
-fn count_other_windows(clients: &[Client], workspace_id: i32, ctx: &CommandContext) -> usize {
+/// Counts all visible non-media windows on `workspace_id`, including the currently focused window.
+fn count_non_media_windows(clients: &[Client], workspace_id: i32, ctx: &CommandContext) -> usize {
     clients
         .iter()
         .filter(|c| {
@@ -372,8 +418,11 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     };
 
-    let other_count = count_other_windows(&clients, focused.workspace_id, ctx);
-    let is_single_workspace = other_count <= 1;
+    let non_media_count = count_non_media_windows(&clients, focused.workspace_id, ctx);
+    // "Single-workspace" here means at most one non-media peer alongside
+    // the media windows — see `count_non_media_windows` for what this
+    // includes (the focused window itself is counted).
+    let is_single_workspace = non_media_count <= 1;
 
     let media_windows: Vec<MediaWindow> = ctx
         .window_matcher
@@ -561,12 +610,18 @@ async fn handle_mouseover_geometry(
 
 /// Case 4: Non-media focused, geometry overlap in multi-workspace.
 ///
-/// Repositions the first overlapping media window whose target slot is also
-/// clear. If the first overlapping window's target is itself blocked (anti-
-/// bounce short-circuit in `try_move_clear_of`), we continue to the next
-/// candidate so a second movable window isn't starved waiting for its own
-/// focus event. We still stop after the first **successful** move to avoid
-/// cascading suppressions in a single tick.
+/// Repositions every overlapping media window whose target slot is also
+/// clear. Pre-fix this returned after the first successful move, leaving
+/// any other overlapping windows stuck — Hyprland fires no event for the
+/// windows that didn't move, so they would never be reconsidered until
+/// the next unrelated focus/window event. The single suppression timer
+/// (warmed by `move_media_window` on each iteration) covers all moves in
+/// the same tick, so issuing several dispatches here is no more dangerous
+/// than the single-dispatch path it replaces.
+///
+/// A window whose target is itself blocked (anti-bounce short-circuit in
+/// `try_move_clear_of`) is skipped without aborting the loop — a second
+/// movable window must not be starved waiting for its own focus event.
 async fn handle_geometry_overlap(
     ctx: &CommandContext,
     focused: &FocusedWindow<'_>,
@@ -582,11 +637,16 @@ async fn handle_geometry_overlap(
         }
         let (target_x, target_y) =
             calculate_target_position(ctx, window.x, window.y, focused.width);
-        tracing::debug!("avoid: overlap detected, target=({target_x}, {target_y})");
-        if try_move_clear_of(ctx, &window.address, target_x, target_y, &overlaps_focused).await? {
-            return Ok(());
-        }
-        // Target also blocked — try the next overlapping window.
+        tracing::debug!(
+            "avoid: overlap detected on {}, target=({target_x}, {target_y})",
+            window.address
+        );
+        // `try_move_clear_of` returns Ok(false) when the target slot is
+        // also blocked; that's a per-window decision, not a reason to
+        // stop processing siblings. We propagate hard errors (`?`) and
+        // continue on soft "couldn't relocate this one" outcomes.
+        let _ = try_move_clear_of(ctx, &window.address, target_x, target_y, &overlaps_focused)
+            .await?;
     }
     Ok(())
 }
@@ -1719,6 +1779,16 @@ mod tests {
         // serializing them together is harmless.
         let _g = crate::commands::async_env_test_mutex().lock().await;
 
+        // The fixed `runtime_dir` no longer falls back to `/tmp`. Provide
+        // a per-invocation tempdir so the test owns its suppress-file
+        // path and is unaffected by what siblings did before us.
+        let original_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let runtime = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test under the async env mutex
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
+        }
+
         let mock = MockHyprland::start().await;
         mock.set_response("j/clients", &make_clients_json(&mock_clients))
             .await;
@@ -1728,9 +1798,18 @@ mod tests {
         avoid(&ctx).await.unwrap();
 
         let cmds = mock.captured_commands().await;
-        let path = get_suppress_file_path();
+        let path = get_suppress_file_path().expect("XDG_RUNTIME_DIR set above");
         let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
         let ts: u64 = content.trim().parse().unwrap_or(0);
+
+        // SAFETY: restore env before the asserts (which can panic)
+        unsafe {
+            if let Some(v) = original_runtime {
+                std::env::set_var("XDG_RUNTIME_DIR", v);
+            } else {
+                std::env::remove_var("XDG_RUNTIME_DIR");
+            }
+        }
 
         assert!(
             cmds.iter().any(|c| c.contains(expect_move_substr)),
