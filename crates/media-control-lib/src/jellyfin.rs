@@ -72,6 +72,14 @@ pub struct Credentials {
     pub device_id: String,
 }
 
+/// Stable fallback device ID used when `cred.json` lacks a `uuid`.
+///
+/// Real cred files written by jellyfin-mpv-shim always include a `uuid`. This
+/// default exists only so an entirely hand-rolled credentials file (lacking
+/// `uuid`) still parses. The constant is shared across installs by design: it
+/// identifies the *application* (media-control), not a specific host. Per-host
+/// identification uses the sanitised `gethostname()` value in the
+/// `X-Emby-Device-Name` header.
 fn default_device_id() -> String {
     "77c2f402-7180-4d84-a2f7-8d832b89e241".to_string()
 }
@@ -142,10 +150,6 @@ pub struct NowPlayingItem {
     /// Item type (Episode, Movie, etc.)
     #[serde(rename = "Type")]
     pub type_field: String,
-
-    /// File path on server (available in NowPlayingQueueFullItems)
-    #[serde(default)]
-    pub path: Option<String>,
 
     /// When the item was added to the library
     #[serde(default)]
@@ -785,7 +789,6 @@ impl JellyfinClient {
         Ok(())
     }
 
-
     /// Get the library that an item belongs to via the Ancestors API.
     pub async fn get_item_library(&self, item_id: &str) -> Result<Option<LibraryInfo>> {
         let path = format!("Items/{item_id}/Ancestors");
@@ -1292,4 +1295,54 @@ mod tests {
         let session: Session = serde_json::from_str(json).unwrap();
         assert!(session.current_item().is_none());
     }
+
+    #[test]
+    fn credentials_parsing_rejects_malformed_json() {
+        // Anything that isn't valid JSON must surface as `CredentialsParsing`
+        // (the `#[from] serde_json::Error` bridge). A user staring at the
+        // log should see the parse error verbatim, not a silent fallback.
+        let raw = "{ this is not json }";
+        let err = serde_json::from_str::<Vec<Credentials>>(raw)
+            .map_err(JellyfinError::from)
+            .unwrap_err();
+        assert!(matches!(err, JellyfinError::CredentialsParsing(_)));
+        assert!(err.to_string().contains("failed to parse credentials"));
+    }
+
+    #[test]
+    fn credentials_parsing_rejects_wrong_shape() {
+        // cred.json must be an array; an object should fail with a clear
+        // typed error rather than a panic on indexing later.
+        let raw = r#"{"address":"x","UserId":"u","AccessToken":"t"}"#;
+        let err = serde_json::from_str::<Vec<Credentials>>(raw)
+            .map_err(JellyfinError::from)
+            .unwrap_err();
+        assert!(matches!(err, JellyfinError::CredentialsParsing(_)));
+    }
+
+    #[test]
+    fn credentials_too_large_displays_size_and_cap() {
+        let err = JellyfinError::CredentialsTooLarge {
+            size: 999_999,
+            max: 65_536,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("999999"), "size missing: {msg}");
+        assert!(msg.contains("65536"), "cap missing: {msg}");
+    }
+
+    #[test]
+    fn credentials_not_found_displays_path() {
+        let err = JellyfinError::CredentialsNotFound(PathBuf::from("/tmp/nope.json"));
+        assert!(err.to_string().contains("/tmp/nope.json"));
+    }
+
+    #[test]
+    fn invalid_credentials_names_missing_field() {
+        // Static-str field name must surface verbatim; without it the user
+        // can't tell *which* field was missing from `cred.json`.
+        let err = JellyfinError::InvalidCredentials("no credentials in file");
+        assert!(err.to_string().contains("no credentials in file"));
+    }
 }
+

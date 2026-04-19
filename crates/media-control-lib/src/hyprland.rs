@@ -112,15 +112,31 @@ pub struct HyprlandClient {
 /// Build the absolute path to one of Hyprland's per-instance Unix sockets
 /// (e.g. `.socket.sock` for commands, `.socket2.sock` for events).
 ///
-/// Sanitizes both env vars to defend against path-traversal injection: the
-/// runtime dir must be absolute and free of `..`; the instance signature must
-/// be a single non-empty component free of separators and `..`.
+/// Sanitizes both env vars *and* the `name` argument to defend against
+/// path-traversal injection: the runtime dir must be absolute and free of
+/// `..`; the instance signature and `name` must each be a single non-empty
+/// component free of separators and `..`.
 ///
 /// # Errors
 ///
 /// Returns [`HyprlandError::MissingEnvVar`] if `XDG_RUNTIME_DIR` or
-/// `HYPRLAND_INSTANCE_SIGNATURE` are unset or contain unsafe components.
+/// `HYPRLAND_INSTANCE_SIGNATURE` are unset or contain unsafe components,
+/// or if `name` is empty / contains separators / contains `..`.
 pub fn runtime_socket_path(name: &str) -> Result<PathBuf> {
+    /// Reject empty / multi-component / traversal-laden path components.
+    fn is_safe_component(s: &str) -> bool {
+        !s.is_empty()
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+            && s != ".."
+            && s != "."
+    }
+
+    if !is_safe_component(name) {
+        return Err(HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
+    }
+
     let runtime_dir = env::var("XDG_RUNTIME_DIR")
         .map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
     let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")

@@ -22,11 +22,30 @@
 //! # }
 //! ```
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::config::Pattern;
 use crate::error::{MediaControlError, Result};
 use crate::hyprland::Client;
+
+/// Maximum compiled-NFA size (bytes) for user-supplied class/title regex.
+///
+/// Bounds catastrophic-backtracking surface area for the daemon hot path —
+/// `WindowMatcher::matches` runs on every focus event for every client.
+/// Mirrors the cap used in `config.rs` for override title regexes.
+const PATTERN_REGEX_SIZE_LIMIT: usize = 64 * 1024;
+
+/// Compile a user-supplied pattern regex with the size cap applied.
+///
+/// Note: pattern regex is intentionally **unanchored** (consistent with the
+/// original bash `[[ =~ ]]` semantics) — `is_match` returns true on any
+/// substring match. Callers who need exact matching must anchor with `^...$`
+/// in the configured pattern value.
+fn compile_pattern_regex(pattern: &str) -> std::result::Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern)
+        .size_limit(PATTERN_REGEX_SIZE_LIMIT)
+        .build()
+}
 
 /// Property key for pattern matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +104,7 @@ impl CompiledPattern {
 }
 
 /// Result of pattern matching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct MatchResult {
     /// Index of the pattern that matched.
     pub pattern_index: usize,
@@ -187,6 +206,10 @@ impl WindowMatcher {
     ///
     /// Invalid patterns are logged and skipped — the matcher is best-effort.
     /// Use [`Self::new_strict`] when you want hard failure on invalid regex.
+    ///
+    /// Each pattern regex is compiled with a 64 KiB NFA size cap to bound
+    /// catastrophic-backtracking surface area in the daemon hot path. A
+    /// pathological pattern that exceeds the cap is logged and skipped.
     pub fn new(patterns: &[Pattern]) -> Self {
         let compiled = patterns
             .iter()
@@ -195,7 +218,7 @@ impl WindowMatcher {
                     eprintln!("media-control: unknown pattern key {:?}, skipping", p.key);
                     None
                 })?;
-                let regex = Regex::new(&p.value)
+                let regex = compile_pattern_regex(&p.value)
                     .map_err(|e| {
                         eprintln!("media-control: invalid regex {:?}: {e}, skipping", p.value);
                     })
@@ -207,7 +230,8 @@ impl WindowMatcher {
         Self { patterns: compiled }
     }
 
-    /// Create a matcher that validates all patterns, returning error on first invalid regex.
+    /// Create a matcher that validates all patterns, returning error on first
+    /// invalid regex. Same NFA size cap as [`Self::new`].
     pub fn new_strict(patterns: &[Pattern]) -> Result<Self> {
         let mut compiled = Vec::with_capacity(patterns.len());
 
@@ -215,7 +239,7 @@ impl WindowMatcher {
             let Some(key) = PatternKey::from_str(&p.key) else {
                 continue; // Skip unknown keys
             };
-            let regex = Regex::new(&p.value).map_err(MediaControlError::from)?;
+            let regex = compile_pattern_regex(&p.value).map_err(MediaControlError::from)?;
             compiled.push(Self::build(p, key, regex));
         }
 
@@ -1031,6 +1055,113 @@ mod tests {
         let result = matcher.find_media_window(&clients, None).unwrap();
         assert_eq!(result.address, "0x1");
         assert_eq!(result.priority, PRIORITY_PINNED);
+    }
+
+    #[test]
+    fn find_previous_focus_includes_id_zero_when_not_media() {
+        // Edge case: focus_history_id == 0 is the most-recently-focused window.
+        // When the media window's address differs from the id-0 window, the id-0
+        // window IS the previous focus and must be returned (not filtered out).
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns);
+
+        let clients = vec![
+            // mpv on workspace 1, id 5 (not the focused window)
+            make_client_full("0xmpv", "mpv", "video.mp4", true, true, 0, 1, 0, 5),
+            // firefox is the focused window (id 0) — must be returned
+            make_client_full("0xfx", "firefox", "browser", false, false, 0, 1, 0, 0),
+            // a kitty terminal that was focused before firefox
+            make_client_full("0xkit", "kitty", "term", false, false, 0, 1, 0, 1),
+        ];
+
+        let result = matcher.find_previous_focus(&clients, "0xmpv", None);
+        assert_eq!(
+            result,
+            Some("0xfx".to_string()),
+            "id=0 (current focus) is the previous-focus candidate when not the media window"
+        );
+    }
+
+    #[test]
+    fn find_previous_focus_id_zero_filtered_when_it_is_media() {
+        // Inverse case: when the media window IS focus_history_id == 0, it is
+        // excluded by address, so the next-lowest non-negative id wins.
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns);
+
+        let clients = vec![
+            make_client_full("0xmpv", "mpv", "video.mp4", true, true, 0, 1, 0, 0),
+            make_client_full("0xfx", "firefox", "browser", false, false, 0, 1, 0, 1),
+        ];
+
+        let result = matcher.find_previous_focus(&clients, "0xmpv", None);
+        assert_eq!(result, Some("0xfx".to_string()));
+    }
+
+    #[test]
+    fn pattern_regex_size_cap_rejects_huge_pattern() {
+        // A regex that produces a state machine larger than the 64 KiB cap
+        // must be rejected by both `new` (skipped) and `new_strict` (Err).
+        // We construct one via large repetition.
+        let huge = "a{50000}".to_string();
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: huge.clone(),
+            ..Default::default()
+        }];
+
+        // new() skips invalid → no patterns compile → no match
+        let matcher = WindowMatcher::new(&patterns);
+        let client = make_client("0x1", "aaaa", "test", false, false);
+        assert!(
+            matcher.matches(&client).is_none(),
+            "size-capped pattern must be skipped by new()"
+        );
+
+        // new_strict() must return Err
+        assert!(
+            WindowMatcher::new_strict(&patterns).is_err(),
+            "size-capped pattern must error from new_strict()"
+        );
+    }
+
+    #[test]
+    fn pattern_regex_anchoring_is_unanchored() {
+        // Documented behavior: patterns are unanchored (substring match),
+        // matching the original bash `[[ =~ ]]` semantics. Test enforces that
+        // a pattern like "mpv" matches "not-mpv-really" so future refactors
+        // that silently anchor would fail this test.
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns);
+        let client = make_client("0x1", "not-mpv-really", "test", false, false);
+        assert!(
+            matcher.matches(&client).is_some(),
+            "patterns are intentionally unanchored — substring match expected"
+        );
+
+        // Anchored pattern in config must NOT match the substring case.
+        let anchored = vec![Pattern {
+            key: "class".to_string(),
+            value: "^mpv$".to_string(),
+            ..Default::default()
+        }];
+        let matcher2 = WindowMatcher::new(&anchored);
+        assert!(
+            matcher2.matches(&client).is_none(),
+            "anchored pattern must reject substring"
+        );
     }
 
     #[test]

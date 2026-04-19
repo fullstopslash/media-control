@@ -93,6 +93,33 @@ pub enum ConfigError {
 /// Result type alias for configuration operations.
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
+/// Reject values exceeding a millisecond ceiling.
+///
+/// Centralises the `debounce_ms`/`suppress_ms` ceiling check so both fields
+/// share identical wording and bounds.
+fn check_ms_ceiling(field: &'static str, value: u16, ceiling: u16) -> Result<()> {
+    if value > ceiling {
+        return Err(ConfigError::InvalidValue {
+            field,
+            reason: format!("must be <= {ceiling} (got {value})"),
+        });
+    }
+    Ok(())
+}
+
+/// Reject non-positive integer values.
+///
+/// Used for pixel dimensions where zero/negative makes no geometric sense.
+fn check_positive(field: &'static str, value: i32) -> Result<()> {
+    if value <= 0 {
+        return Err(ConfigError::InvalidValue {
+            field,
+            reason: format!("must be > 0 (got {value})"),
+        });
+    }
+    Ok(())
+}
+
 /// Root configuration structure.
 ///
 /// Contains all settings for media window management including
@@ -108,18 +135,6 @@ pub struct Config {
 
     /// Avoidance behavior settings.
     pub positioning: Positioning,
-
-    /// Play subcommand settings.
-    #[serde(default)]
-    pub play: PlayConfig,
-}
-
-/// Play subcommand settings.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct PlayConfig {
-    /// Jellyfin library ID for Pinchflat content.
-    /// Required when using `media-control play recent-pinchflat`.
-    pub pinchflat_library_id: Option<String>,
 }
 
 impl Config {
@@ -226,35 +241,15 @@ impl Config {
         // but a single 60 s+ debounce or suppression window would freeze the
         // avoider daemon — almost certainly a misconfiguration.
         const MS_CEILING: u16 = 60_000;
-        if p.debounce_ms > MS_CEILING {
-            return Err(ConfigError::InvalidValue {
-                field: "positioning.debounce_ms",
-                reason: format!("must be <= {MS_CEILING} (got {})", p.debounce_ms),
-            });
-        }
-        if p.suppress_ms > MS_CEILING {
-            return Err(ConfigError::InvalidValue {
-                field: "positioning.suppress_ms",
-                reason: format!("must be <= {MS_CEILING} (got {})", p.suppress_ms),
-            });
-        }
+        check_ms_ceiling("positioning.debounce_ms", p.debounce_ms, MS_CEILING)?;
+        check_ms_ceiling("positioning.suppress_ms", p.suppress_ms, MS_CEILING)?;
         Ok(())
     }
 
     /// Validate numeric ranges on `[positions]`.
     fn validate_positions(p: &Positions) -> Result<()> {
-        if p.width <= 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "positions.width",
-                reason: format!("must be > 0 (got {})", p.width),
-            });
-        }
-        if p.height <= 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "positions.height",
-                reason: format!("must be > 0 (got {})", p.height),
-            });
-        }
+        check_positive("positions.width", p.width)?;
+        check_positive("positions.height", p.height)?;
         Ok(())
     }
 
@@ -351,7 +346,6 @@ impl Default for Config {
             ],
             positions: Positions::default(),
             positioning: Positioning::default(),
-            play: PlayConfig::default(),
         }
     }
 }

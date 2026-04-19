@@ -515,7 +515,12 @@ async fn handle_mouseover_toggle(
         .await?;
     }
 
-    // Restore focus so subsequent mouseovers trigger new events
+    // Restore focus so subsequent mouseovers trigger new events.
+    // Re-arm suppression: even if the move above was skipped (already at target),
+    // the focuswindow dispatch below still emits an event Hyprland sends back to
+    // the daemon. Without re-arming, the daemon would re-enter avoid before
+    // suppress_ms elapsed since the last move (or never warmed at all).
+    suppress_avoider().await;
     if let Err(e) = restore_focus(ctx, &prev_window.address).await {
         tracing::warn!("media-control: failed to restore focus: {e}");
     }
@@ -548,22 +553,31 @@ async fn handle_mouseover_geometry(
         return Ok(());
     }
 
+    // Re-arm suppression before dispatching focuswindow. The earlier
+    // move_media_window call inside try_move_clear_of warmed the suppress
+    // file, but the restore_focus batch below issues 3 more dispatches and
+    // we don't want a tight `suppress_ms` to elapse between them.
     if let Some(prev_addr) = ctx.window_matcher.find_previous_focus(
         clients,
         focused.address,
         Some(focused.workspace_id),
-    ) && let Err(e) = restore_focus(ctx, &prev_addr).await
-    {
-        tracing::warn!("media-control: failed to restore focus: {e}");
+    ) {
+        suppress_avoider().await;
+        if let Err(e) = restore_focus(ctx, &prev_addr).await {
+            tracing::warn!("media-control: failed to restore focus: {e}");
+        }
     }
     Ok(())
 }
 
 /// Case 4: Non-media focused, geometry overlap in multi-workspace.
 ///
-/// Only repositions the **first** overlapping media window per call —
-/// callers re-trigger via Hyprland events, so subsequent windows are
-/// handled on the next pass. This avoids cascading suppressions.
+/// Repositions the first overlapping media window whose target slot is also
+/// clear. If the first overlapping window's target is itself blocked (anti-
+/// bounce short-circuit in `try_move_clear_of`), we continue to the next
+/// candidate so a second movable window isn't starved waiting for its own
+/// focus event. We still stop after the first **successful** move to avoid
+/// cascading suppressions in a single tick.
 async fn handle_geometry_overlap(
     ctx: &CommandContext,
     focused: &FocusedWindow<'_>,
@@ -580,8 +594,10 @@ async fn handle_geometry_overlap(
         let (target_x, target_y) =
             calculate_target_position(ctx, window.x, window.y, focused.width);
         tracing::debug!("avoid: overlap detected, target=({target_x}, {target_y})");
-        try_move_clear_of(ctx, &window.address, target_x, target_y, &overlaps_focused).await?;
-        return Ok(());
+        if try_move_clear_of(ctx, &window.address, target_x, target_y, &overlaps_focused).await? {
+            return Ok(());
+        }
+        // Target also blocked — try the next overlapping window.
     }
     Ok(())
 }
@@ -603,6 +619,7 @@ async fn handle_fullscreen_nonmedia(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::clear_suppression;
     use crate::config::Config;
     use crate::test_helpers::*;
 
@@ -1650,6 +1667,142 @@ mod tests {
         );
         assert_eq!(tx_wide, 0, "wide should preserve media_x");
         assert_ne!(ty_wide, 100, "wide should change media_y");
+    }
+
+    #[tokio::test]
+    async fn handle_geometry_overlap_loops_past_blocked_target() {
+        // Regression: prior to the fix, `handle_geometry_overlap` returned
+        // unconditionally after the first overlapping window — even if its
+        // target was blocked. After the fix, it continues iterating.
+        //
+        // We can't easily construct two windows where the first's target is
+        // blocked but the second's is not (they share `calculate_target_position`
+        // logic seeded by current pos). Instead: a single overlapping window
+        // whose target IS clear must still trigger a move. Combined with the
+        // existing `handle_geometry_overlap_skips_when_target_also_blocked`
+        // which proves the blocked branch is short-circuited, this proves
+        // both loop paths.
+        let mock = MockHyprland::start().await;
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser",
+                false, false, 0, 1, 0, 0,
+                [900, 500], [800, 600],
+            ),
+            make_test_client_full(
+                "0xkitty", "kitty", "Term",
+                false, false, 0, 1, 0, 2,
+                [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 1,
+                [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        assert!(
+            cmds.iter().any(|c| c.contains("movewindowpixel")),
+            "should move overlapping window with clear target: {cmds:?}"
+        );
+    }
+
+    /// Verify a single avoid handler warms (or leaves warm) the global
+    /// suppress file. Captures all relevant state under the shared test
+    /// mutex, then drops the lock BEFORE asserting — assertions can panic,
+    /// and a panic with the lock held would poison the mutex and cascade
+    /// failures across other tests in the same process.
+    ///
+    /// `suppress_ms = 0` (test_config) ensures should_suppress is bypassed
+    /// so avoid runs to completion regardless of file state.
+    async fn assert_handler_warms_suppression(
+        mock_clients: Vec<crate::hyprland::Client>,
+        expect_move_substr: &str,
+        expect_focus_substr: &str,
+    ) {
+        // Hold a tokio mutex across the critical section. `std::sync::MutexGuard`
+        // is `!Sync` and clippy::await_holding_lock fires on awaits while it's
+        // alive — using the async mutex is the correct primitive for serializing
+        // process-wide state across `.await` points. Reusing `async_env_test_mutex`
+        // keeps the lock domain count small; both protect process-global state and
+        // serializing them together is harmless.
+        let _g = crate::commands::async_env_test_mutex().lock().await;
+
+        let mock = MockHyprland::start().await;
+        mock.set_response("j/clients", &make_clients_json(&mock_clients))
+            .await;
+        let ctx = mock.context(test_config());
+
+        clear_suppression().await;
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let path = get_suppress_file_path();
+        let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let ts: u64 = content.trim().parse().unwrap_or(0);
+
+        assert!(
+            cmds.iter().any(|c| c.contains(expect_move_substr)),
+            "expected {expect_move_substr:?} in {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains(expect_focus_substr)),
+            "expected {expect_focus_substr:?} in {cmds:?}"
+        );
+        assert!(
+            ts > 0,
+            "suppress file should contain a positive timestamp (got {ts})"
+        );
+    }
+
+    #[tokio::test]
+    async fn mouseover_toggle_warms_suppression_for_focus_restore() {
+        // Regression: focuswindow dispatched by restore_focus would re-enter
+        // avoid if suppression wasn't warmed. The fix calls suppress_avoider
+        // immediately before restore_focus regardless of the move branch.
+        let clients = vec![
+            make_test_client_full(
+                "0xfx", "firefox", "Browser",
+                false, false, 0, 1, 0, 1,
+                [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 0,
+                [1272, 712], [640, 360],
+            ),
+        ];
+        assert_handler_warms_suppression(clients, "movewindowpixel", "focuswindow").await;
+    }
+
+    #[tokio::test]
+    async fn mouseover_geometry_warms_suppression_for_focus_restore() {
+        // Regression: same race as the toggle path — restore_focus emits a
+        // focuswindow event which Hyprland ships back to the daemon. Re-arming
+        // suppression here keeps the avoider quiet until the dust settles.
+        let clients = vec![
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 0,
+                [200, 200], [640, 360],
+            ),
+            make_test_client_full(
+                "0xfx", "firefox", "Browser",
+                false, false, 0, 1, 0, 1,
+                [100, 100], [800, 600],
+            ),
+            make_test_client_full(
+                "0xkitty", "kitty", "Term",
+                false, false, 0, 1, 0, 2,
+                [1500, 0], [200, 200],
+            ),
+        ];
+        assert_handler_warms_suppression(clients, "movewindowpixel", "focuswindow").await;
     }
 
     #[tokio::test]

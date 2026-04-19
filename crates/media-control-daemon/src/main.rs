@@ -537,6 +537,12 @@ async fn cmd_start() -> ExitCode {
     // Without this, two `start` invocations could each pass the PID-check
     // below and both spawn a daemon; the second's PID file would clobber
     // the first, leaking a daemon process.
+    //
+    // The held `File` handle is the kernel-side mutex; closing it (by
+    // dropping `_start_lock`) only releases our open FD. The on-disk
+    // sentinel that other processes see is removed by `release_start_lock`,
+    // so we ALWAYS call that before returning — the `File` then drops
+    // naturally at scope end.
     let _start_lock = match acquire_or_recover_start_lock().await {
         Ok(f) => f,
         Err(code) => return code,
@@ -554,7 +560,6 @@ async fn cmd_start() -> ExitCode {
     }
 
     let result = spawn_foreground_worker();
-    drop(_start_lock);
     release_start_lock();
     result
 }
@@ -632,6 +637,17 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::FileTypeExt;
+
+    /// Async serialization for tests in this binary that mutate
+    /// `XDG_RUNTIME_DIR` across `.await`. Backed by `tokio::sync::Mutex`
+    /// so its guard is `Send` and can safely outlive an await — the
+    /// std-mutex pattern would force a drop-before-await that fails to
+    /// actually serialize.
+    fn env_test_lock() -> &'static tokio::sync::Mutex<()> {
+        use std::sync::OnceLock;
+        static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
 
     /// Avoid-trigger event matcher correctly identifies relevant events
     /// and ignores everything else. This guards against silent regression
@@ -751,6 +767,12 @@ mod tests {
     /// signalling the entire process group via kill(0)/kill(-1) semantics.
     #[tokio::test]
     async fn read_pid_file_rejects_low_pids() {
+        // Hold the async env-mutex for the whole body — `runtime_dir()`
+        // (called by `get_pid_file_path()`) reads `XDG_RUNTIME_DIR` from
+        // the process env, which we mutate here. Any future test that
+        // also touches `XDG_RUNTIME_DIR` will serialize through this.
+        let _g = env_test_lock().lock().await;
+
         // Set XDG_RUNTIME_DIR to a temp dir for isolation.
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: single-threaded test

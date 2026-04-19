@@ -25,7 +25,9 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use super::{CommandContext, clear_suppression, get_media_window, suppress_avoider};
+use super::{
+    CommandContext, clear_suppression, focus_window_cmd, get_media_window, suppress_avoider,
+};
 use crate::error::Result;
 
 /// Focus the media window, or launch a command if no media window exists.
@@ -78,9 +80,7 @@ pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> 
     // Try to find a media window
     if let Some(window) = get_media_window(ctx).await? {
         // Focus the window (dispatch prepends "dispatch", so pass bare command)
-        ctx.hyprland
-            .dispatch(&format!("focuswindow address:{}", window.address))
-            .await?;
+        ctx.hyprland.dispatch(&focus_window_cmd(&window.address)).await?;
 
         return Ok(true);
     }

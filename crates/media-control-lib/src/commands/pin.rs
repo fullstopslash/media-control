@@ -3,7 +3,7 @@
 //! Pins or unpins the media window and applies appropriate positioning
 //! based on the current state and configuration.
 
-use super::{CommandContext, pin_cmd, suppress_avoider, toggle_floating_cmd};
+use super::{CommandContext, focus_window_cmd, pin_cmd, suppress_avoider, toggle_floating_cmd};
 use crate::error::Result;
 
 /// Toggle pinned floating mode for the media window.
@@ -37,6 +37,12 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
 
     let addr = &media.address;
 
+    // Suppress at the top — every dispatch below (pin/unpin/float/move) will
+    // generate Hyprland events that arrive within the daemon's debounce
+    // window. We have to beat all of them to the suppress file, not just the
+    // final reposition.
+    suppress_avoider().await;
+
     // If both enabled, disable them (unpin then unfloat)
     if was_floating && was_pinned {
         ctx.hyprland
@@ -47,9 +53,7 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
 
     // Enable pinned+floating mode
     // Focus the window first (dispatch prepends "dispatch", so pass bare command)
-    ctx.hyprland
-        .dispatch(&format!("focuswindow address:{addr}"))
-        .await?;
+    ctx.hyprland.dispatch(&focus_window_cmd(addr)).await?;
 
     // Build batch commands for state changes
     let mut cmds: Vec<String> = Vec::with_capacity(2);
@@ -66,13 +70,13 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
         ctx.hyprland.batch(&cmd_refs).await?;
     }
 
-    // Suppress BEFORE the move/resize batch — the resulting movewindow
-    // events would otherwise race the daemon and trigger an avoid pass on
-    // the freshly pinned window.
+    // Refresh suppression before the reposition — the prior dispatches may
+    // have consumed several debounce cycles, and we want fresh suppression
+    // covering the move/resize batch issued by reposition_to_default.
     suppress_avoider().await;
 
     // Position to configured default corner (adjusted for minified mode)
-    super::reposition_to_default(ctx, &media.address).await?;
+    super::reposition_to_default(ctx, addr).await?;
 
     Ok(())
 }

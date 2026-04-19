@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
@@ -247,13 +247,19 @@ pub async fn clear_suppression() {
 /// Test-only mutex serializing access to process-wide state used by the
 /// suppress file and runtime-dir resolution: `$XDG_RUNTIME_DIR`,
 /// `$HYPRLAND_INSTANCE_SIGNATURE`, and the on-disk suppress file path.
-/// Any test that mutates these must hold this lock for the whole body
-/// or it will race with parallel tests touching the same globals.
+/// Single process-wide async mutex serialising ALL tests that touch shared
+/// global state: `XDG_RUNTIME_DIR`, `HYPRLAND_INSTANCE_SIGNATURE`,
+/// `MPV_IPC_SOCKET`, or the on-disk suppress file.
+///
+/// Using ONE lock domain eliminates the inter-domain race that previously
+/// existed between sync env-mutation tests and async suppress-file tests.
+/// All callers hold this with `let _g = async_env_test_mutex().lock().await`
+/// for the full test body.
 #[cfg(test)]
-pub(crate) fn suppress_file_test_mutex() -> &'static std::sync::Mutex<()> {
+pub(crate) fn async_env_test_mutex() -> &'static tokio::sync::Mutex<()> {
     use std::sync::OnceLock;
-    static M: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    M.get_or_init(|| std::sync::Mutex::new(()))
+    static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Build a `dispatch focuswindow address:<addr>` command string.
@@ -376,6 +382,12 @@ pub fn resolve_effective_position(ctx: &CommandContext, name: &str) -> Option<i3
 ///
 /// Resolves the default x/y from config (adjusted for minified mode),
 /// then batches a resize + move. Used by fullscreen exit, pin, and minify.
+///
+/// Suppresses the avoider BEFORE dispatching — the move/resize events fire
+/// within the daemon's debounce window and would otherwise race the suppress
+/// file. Callers may still suppress earlier to cover additional dispatches
+/// they issue in the same operation; this internal suppression is a safety
+/// net so a caller can never forget the contract.
 pub(crate) async fn reposition_to_default(ctx: &CommandContext, addr: &str) -> Result<()> {
     let positioning = &ctx.config.positioning;
     let target_x = resolve_effective_position(ctx, &positioning.default_x)
@@ -383,6 +395,11 @@ pub(crate) async fn reposition_to_default(ctx: &CommandContext, addr: &str) -> R
     let target_y = resolve_effective_position(ctx, &positioning.default_y)
         .unwrap_or(ctx.config.positions.y_bottom);
     let (ew, eh) = effective_dimensions(ctx);
+
+    // Suppress immediately before dispatch. Idempotent w.r.t. an earlier
+    // caller-side suppress — both writes set a fresh timestamp.
+    suppress_avoider().await;
+
     ctx.hyprland
         .batch(&[
             &format!("dispatch resizewindowpixel exact {ew} {eh},address:{addr}"),
@@ -418,9 +435,6 @@ fn is_unix_socket(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Shim query socket path for cached lookups.
-const SHIM_QUERY_SOCKET: &str = "/tmp/mpv-shim-query.sock";
-
 /// Connect to a Unix socket and write `payload\n`, returning the open stream.
 ///
 /// Bounded by `SOCKET_CONNECT_TIMEOUT`. Caller is responsible for
@@ -441,27 +455,6 @@ async fn connect_and_write(
     })
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket connect timeout"))?
-}
-
-/// Query the shim's query socket with a JSON request.
-///
-/// Returns the raw response string, or None if the socket is unavailable.
-/// Single attempt, no retry — designed for fast cached lookups.
-pub async fn query_shim(request: &serde_json::Value) -> Option<String> {
-    let path = Path::new(SHIM_QUERY_SOCKET);
-    if !is_unix_socket(path) {
-        return None;
-    }
-
-    let payload = request.to_string();
-    let mut stream = connect_and_write(path, &payload, true).await.ok()?;
-    if stream.shutdown().await.is_err() {
-        return None;
-    }
-
-    let mut buf = String::new();
-    stream.read_to_string(&mut buf).await.ok()?;
-    if buf.is_empty() { None } else { Some(buf) }
 }
 
 /// Get the ordered list of mpv IPC socket paths to try.
@@ -568,7 +561,17 @@ pub async fn send_mpv_script_message_with_args(message: &str, args: &[&str]) -> 
 /// Try each candidate mpv socket path in turn, with optional retry passes.
 ///
 /// On the first path that yields `Some(T)`, returns it. Otherwise returns
-/// `None` after all paths and retries are exhausted.
+/// `None` after all paths and retries are exhausted; emits a single
+/// `tracing::debug!` listing every attempted path so the caller's
+/// "no socket" error has actionable context in the logs.
+///
+/// # Timing
+///
+/// Per-path timeouts are applied inside `op`, not here, so total wall time
+/// scales as `(retries + 1) * paths.len() * <op timeout>`. With the default
+/// 50ms connect + 50ms response budget and 3 paths, a single call (`retries=0`)
+/// caps at ~300ms; a retried call (`retries=1`) caps at ~625ms incl.
+/// [`RETRY_DELAY`].
 async fn try_mpv_paths<T, F, Fut>(retries: u8, mut op: F) -> Option<T>
 where
     F: FnMut(String) -> Fut,
@@ -588,6 +591,12 @@ where
             }
         }
     }
+    tracing::debug!(
+        "mpv IPC failed across {} path(s) after {} attempt(s): {:?}",
+        paths.len(),
+        retries as u32 + 1,
+        paths
+    );
     None
 }
 
@@ -607,7 +616,15 @@ pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
 /// Query an mpv property and return its value.
 ///
 /// Sends a `get_property` command to mpv and returns the `data` field from
-/// the response. Single attempt, no retry — designed for fast status queries.
+/// the response. Single attempt across all candidate paths (no retry pass)
+/// — designed for fast status queries.
+///
+/// # Timing
+///
+/// Per-path timeout is `SOCKET_CONNECT_TIMEOUT + SOCKET_RESPONSE_TIMEOUT`
+/// (currently 100 ms). With up to 3 candidate sockets the worst-case wall
+/// time is ~300 ms; in the common single-socket case it's bounded by the
+/// per-path timeout.
 ///
 /// # Example
 ///
@@ -645,10 +662,12 @@ pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
     }
 }
 
-/// Send a payload to a specific mpv socket (fire-and-forget, no response read).
+/// Send a payload to a *specific* mpv socket (fire-and-forget, no response read).
 ///
-/// Used by `keep` for broadcast semantics.
-pub async fn send_to_mpv_socket(socket_path: &str, payload: &str) -> bool {
+/// Bypasses [`mpv_socket_paths`]'s discovery list — the caller already knows
+/// which socket they want (e.g. the shim socket when closing a shim window).
+/// Returns `true` on successful write, `false` on any failure.
+pub(crate) async fn send_to_mpv_socket(socket_path: &str, payload: &str) -> bool {
     mpv_ipc_exchange(socket_path, payload, false).await.is_ok()
 }
 
@@ -677,9 +696,9 @@ mod tests {
         unsafe { env::remove_var(key) };
     }
 
-    #[test]
-    fn suppress_file_path_uses_xdg_runtime_dir() {
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+    #[tokio::test]
+    async fn suppress_file_path_uses_xdg_runtime_dir() {
+        let _g = super::async_env_test_mutex().lock().await;
         // Save original value
         let original = env::var("XDG_RUNTIME_DIR").ok();
 
@@ -699,9 +718,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn suppress_file_path_fallback() {
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+    #[tokio::test]
+    async fn suppress_file_path_fallback() {
+        let _g = super::async_env_test_mutex().lock().await;
         // Save original value
         let original = env::var("XDG_RUNTIME_DIR").ok();
 
@@ -721,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn suppress_avoider_writes_file() {
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let _g = super::async_env_test_mutex().lock().await;
         suppress_avoider().await;
         let path = get_suppress_file_path();
         assert!(path.exists(), "suppress file should exist at {path:?}");
@@ -729,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_suppression_writes_file() {
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let _g = super::async_env_test_mutex().lock().await;
         clear_suppression().await;
         let path = get_suppress_file_path();
         assert!(path.exists(), "suppress file should exist at {path:?}");
@@ -779,11 +798,16 @@ mod tests {
         use tokio::io::AsyncBufReadExt;
         use tokio::net::UnixListener;
 
+        // Hold the async env-mutex across all `.await`s in this test so a
+        // parallel test cannot rewrite MPV_IPC_SOCKET between our set_env
+        // call and the internal `mpv_socket_paths()` env::var read inside
+        // `send_mpv_script_message`. The guard is `Send` so this is safe.
+        let _g = super::async_env_test_mutex().lock().await;
+        let original = env::var("MPV_IPC_SOCKET").ok();
+
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test-mpv-socket");
         let listener = UnixListener::bind(&socket_path).unwrap();
-
-        let original = env::var("MPV_IPC_SOCKET").ok();
 
         // SAFETY: Test is single-threaded
         unsafe {
@@ -933,9 +957,9 @@ mod tests {
 
     /// Security: ensure `runtime_dir()` rejects relative XDG_RUNTIME_DIR
     /// (would otherwise resolve to CWD-relative paths).
-    #[test]
-    fn runtime_dir_rejects_relative_path() {
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+    #[tokio::test]
+    async fn runtime_dir_rejects_relative_path() {
+        let _g = super::async_env_test_mutex().lock().await;
         let original = env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: single-threaded test
         unsafe {
@@ -951,9 +975,9 @@ mod tests {
     }
 
     /// Security: ensure `runtime_dir()` rejects paths containing `..`.
-    #[test]
-    fn runtime_dir_rejects_parent_dir_traversal() {
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+    #[tokio::test]
+    async fn runtime_dir_rejects_parent_dir_traversal() {
+        let _g = super::async_env_test_mutex().lock().await;
         let original = env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: single-threaded
         unsafe {
@@ -971,9 +995,9 @@ mod tests {
     /// Security: ensure `runtime_dir()` rejects nonexistent paths
     /// (defends against typo'd or hostile values pointing to attacker-controlled
     /// future locations).
-    #[test]
-    fn runtime_dir_rejects_nonexistent() {
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+    #[tokio::test]
+    async fn runtime_dir_rejects_nonexistent() {
+        let _g = super::async_env_test_mutex().lock().await;
         let original = env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: single-threaded
         unsafe {
@@ -1031,11 +1055,11 @@ mod tests {
 
     /// `runtime_socket_path` (Hyprland helper) must reject env vars whose
     /// instance signature contains separators or `..`.
-    #[test]
-    fn runtime_socket_path_rejects_traversal_in_signature() {
+    #[tokio::test]
+    async fn runtime_socket_path_rejects_traversal_in_signature() {
         use crate::hyprland::runtime_socket_path;
 
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let _g = super::async_env_test_mutex().lock().await;
         let orig_runtime = env::var("XDG_RUNTIME_DIR").ok();
         let orig_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
 
@@ -1067,11 +1091,11 @@ mod tests {
     }
 
     /// `runtime_socket_path` must reject relative XDG_RUNTIME_DIR.
-    #[test]
-    fn runtime_socket_path_rejects_relative_runtime_dir() {
+    #[tokio::test]
+    async fn runtime_socket_path_rejects_relative_runtime_dir() {
         use crate::hyprland::runtime_socket_path;
 
-        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let _g = super::async_env_test_mutex().lock().await;
         let orig_runtime = env::var("XDG_RUNTIME_DIR").ok();
         let orig_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
 
@@ -1095,10 +1119,118 @@ mod tests {
         }
     }
 
+    /// `runtime_socket_path` must reject `name` arguments that are empty,
+    /// contain path separators, contain `..`, or reduce to `.` / `..`.
+    /// Without this, callers could (intentionally or via injection) build
+    /// paths that escape the `hypr/<sig>/` confinement.
+    #[tokio::test]
+    async fn runtime_socket_path_rejects_unsafe_name_argument() {
+        use crate::hyprland::runtime_socket_path;
+
+        let _g = super::async_env_test_mutex().lock().await;
+        let orig_runtime = env::var("XDG_RUNTIME_DIR").ok();
+        let orig_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+
+        // SAFETY: single-threaded test, restored at end
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", "/tmp");
+            set_env("HYPRLAND_INSTANCE_SIGNATURE", "valid_sig");
+
+            // Names that must be rejected.
+            for bad in &["", "..", ".", "../escape", "a/b", "a\\b", "x\0y"] {
+                assert!(
+                    runtime_socket_path(bad).is_err(),
+                    "name {bad:?} must be rejected"
+                );
+            }
+
+            // Sanity: the real socket names callers actually use must pass.
+            for good in &[".socket.sock", ".socket2.sock"] {
+                assert!(
+                    runtime_socket_path(good).is_ok(),
+                    "name {good:?} must be accepted"
+                );
+            }
+
+            // Restore
+            if let Some(v) = orig_runtime {
+                set_env("XDG_RUNTIME_DIR", &v);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+            if let Some(v) = orig_sig {
+                set_env("HYPRLAND_INSTANCE_SIGNATURE", &v);
+            } else {
+                remove_env("HYPRLAND_INSTANCE_SIGNATURE");
+            }
+        }
+    }
+
+    /// `reposition_to_default` must suppress the avoider BEFORE its dispatch
+    /// so the move/resize events fire while the suppress timestamp is fresh.
+    /// This locks in the self-enforcing contract — callers that forget to
+    /// suppress won't trigger an avoid bounce.
+    #[tokio::test]
+    async fn reposition_to_default_self_suppresses_before_dispatch() {
+        use crate::test_helpers::MockHyprland;
+
+        // Hold the async env-mutex for the whole body — this test reads
+        // and asserts on the shared on-disk suppress file, which other
+        // parallel tests also write. Without this lock, a sibling's
+        // `clear_suppression` (which writes "0") races with our read of
+        // the timestamp and the assertion flaps.
+        let _g = super::async_env_test_mutex().lock().await;
+
+        let mock = MockHyprland::start().await;
+        let ctx = mock.default_context();
+
+        // Clear any prior suppression from sibling tests.
+        clear_suppression().await;
+
+        reposition_to_default(&ctx, "0xtest").await.unwrap();
+
+        // Both move + resize must have been dispatched.
+        let cmds = mock.captured_commands().await;
+        assert!(
+            cmds.iter().any(|c| c.contains("resizewindowpixel") && c.contains("0xtest")),
+            "expected resize dispatch: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("movewindowpixel") && c.contains("0xtest")),
+            "expected move dispatch: {cmds:?}"
+        );
+
+        // Suppress file should hold a recent (positive) timestamp. The shared
+        // on-disk path may be racing with parallel tests — tolerate transient
+        // mid-write empty reads by polling briefly.
+        let path = get_suppress_file_path();
+        let mut got_nonzero = false;
+        for _ in 0..10 {
+            let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+            if let Ok(ts) = content.trim().parse::<u64>()
+                && ts > 0
+            {
+                got_nonzero = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            got_nonzero,
+            "reposition_to_default must write a non-zero suppress timestamp"
+        );
+    }
+
     /// Verify try_mpv_paths returns None when no socket responds — sanity
     /// check on the shared retry helper.
+    ///
+    /// Holds the async env-mutex across the await so a parallel
+    /// `MPV_IPC_SOCKET`-mutating test (e.g.
+    /// `send_mpv_ipc_command_succeeds_with_real_socket`) cannot rewrite the
+    /// var mid-flight and confuse our assertion.
     #[tokio::test]
     async fn try_mpv_paths_returns_none_when_no_socket_works() {
+        let _g = super::async_env_test_mutex().lock().await;
         let original = env::var("MPV_IPC_SOCKET").ok();
         // SAFETY: single-threaded test
         unsafe {
@@ -1114,6 +1246,70 @@ mod tests {
             } else {
                 remove_env("MPV_IPC_SOCKET");
             }
+        }
+    }
+
+    /// Retry-exhaustion path: when every candidate mpv socket fails,
+    /// `send_mpv_ipc_command` must surface the typed
+    /// [`crate::error::MediaControlError::MpvIpc`] variant (NoSocket
+    /// kind) — not a generic IO error or success. Guards the failure
+    /// contract callers like `chapter` and `seek` rely on.
+    ///
+    /// Skips when the host has a live socket at one of the hardcoded
+    /// fallback paths (`/tmp/mpv-shim` or `/tmp/mpvctl-jshim`) — the test
+    /// can't simulate a no-socket world if a real mpv-shim is running on
+    /// the dev box. Asserting against a pre-existing socket would either
+    /// succeed spuriously or send a no-op `script-message` to the user's
+    /// real mpv instance.
+    #[tokio::test]
+    async fn send_mpv_ipc_command_returns_no_socket_when_all_paths_fail() {
+        use crate::error::{MediaControlError, MpvIpcErrorKind};
+
+        let _g = super::async_env_test_mutex().lock().await;
+
+        // Bail if any of the hardcoded fallback sockets are live on this host.
+        if is_unix_socket(Path::new(MPV_IPC_SOCKET_DEFAULT))
+            || is_unix_socket(Path::new(MPV_IPC_SOCKET_FALLBACK))
+        {
+            eprintln!(
+                "skipping: host has a live mpv socket at one of {MPV_IPC_SOCKET_DEFAULT:?}/{MPV_IPC_SOCKET_FALLBACK:?}"
+            );
+            return;
+        }
+
+        let original = env::var("MPV_IPC_SOCKET").ok();
+
+        // Point env at a path that does not exist. With the host-socket
+        // skip above, all three candidates should fail and we should see
+        // NoSocket.
+        unsafe {
+            set_env(
+                "MPV_IPC_SOCKET",
+                "/tmp/mpc-audit-nonexistent-socket-91827465",
+            );
+        }
+
+        let result = send_mpv_ipc_command(r#"{"command":["no-op"]}"#).await;
+
+        // SAFETY: restore env before any assert that might panic.
+        unsafe {
+            if let Some(v) = original {
+                set_env("MPV_IPC_SOCKET", &v);
+            } else {
+                remove_env("MPV_IPC_SOCKET");
+            }
+        }
+
+        match result {
+            Err(MediaControlError::MpvIpc { kind, .. }) => {
+                assert_eq!(
+                    kind,
+                    MpvIpcErrorKind::NoSocket,
+                    "expected NoSocket; got {kind:?}"
+                );
+            }
+            Ok(()) => panic!("send_mpv_ipc_command should fail when no socket exists"),
+            Err(e) => panic!("expected MpvIpc/NoSocket; got {e:?}"),
         }
     }
 }

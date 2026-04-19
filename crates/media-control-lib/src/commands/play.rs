@@ -25,6 +25,14 @@ pub enum PlayTarget {
 /// CLI input (e.g. a megabyte-long argument).
 const ITEM_ID_MAX_LEN: usize = 128;
 
+/// Maximum accepted length for a store/context name.
+///
+/// Real store names are short tokens like `jellyfin`, `twitch`, `pinchflat`,
+/// `stash`. Cap to defend the IPC path against pathological CLI input — the
+/// name is interpolated into a `script-message play-<name>` payload sent over
+/// the mpv IPC socket.
+const STORE_NAME_MAX_LEN: usize = 64;
+
 impl PlayTarget {
     /// Parse a target string from the CLI.
     ///
@@ -51,10 +59,26 @@ impl PlayTarget {
 ///
 /// All playback delegation goes through the shim — media-control is just
 /// the control plane, not the resolution engine.
+///
+/// # Errors
+///
+/// - Returns `mpv_no_socket` if the mpv IPC socket is unavailable.
+/// - Returns an `InvalidArgument` error if the parsed `Store` name exceeds
+///   `STORE_NAME_MAX_LEN` (defends the IPC path against unbounded CLI input).
 pub async fn play(target_str: &str) -> crate::error::Result<()> {
     match PlayTarget::parse(target_str) {
         PlayTarget::NextUp => send_mpv_script_message("play-next-up").await,
-        PlayTarget::Store(name) => send_mpv_script_message(&format!("play-{name}")).await,
+        PlayTarget::Store(name) => {
+            if name.len() > STORE_NAME_MAX_LEN {
+                return Err(crate::error::MediaControlError::mpv_connection_failed(
+                    format!(
+                        "play target too long: {} bytes (max {STORE_NAME_MAX_LEN})",
+                        name.len()
+                    ),
+                ));
+            }
+            send_mpv_script_message(&format!("play-{name}")).await
+        }
         PlayTarget::ItemId(id) => {
             send_mpv_script_message_with_args("play-item", &[id.as_str()]).await
         }
@@ -129,5 +153,45 @@ mod tests {
     fn parse_max_len_hex_is_item_id() {
         let max = "b".repeat(ITEM_ID_MAX_LEN);
         assert_eq!(PlayTarget::parse(&max), PlayTarget::ItemId(max));
+    }
+
+    /// Defense in depth: even though the parser routes long valid hex away
+    /// from `ItemId`, an overlong store name must still be rejected by the
+    /// IPC entry point before it hits the socket.
+    #[tokio::test]
+    async fn play_rejects_overlong_store_name() {
+        use crate::error::{MediaControlError, MpvIpcErrorKind};
+        // 65+ char non-hex string parses as Store and exceeds STORE_NAME_MAX_LEN.
+        let huge = "z".repeat(STORE_NAME_MAX_LEN + 1);
+        let err = play(&huge).await.expect_err("must reject");
+        // The length check uses ConnectionFailed with a "too long" message.
+        match err {
+            MediaControlError::MpvIpc { kind, message } => {
+                assert_eq!(kind, MpvIpcErrorKind::ConnectionFailed);
+                assert!(
+                    message.contains("too long"),
+                    "message should mention overflow: {message}"
+                );
+            }
+            other => panic!("expected MpvIpc length-check error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn play_accepts_max_len_store_name() {
+        use crate::error::{MediaControlError, MpvIpcErrorKind};
+        // Exactly at the cap. Outcome depends on socket availability; the
+        // length check itself must not fire.
+        let max = "z".repeat(STORE_NAME_MAX_LEN);
+        // If a connection error fires, it must be a real socket failure,
+        // not the length check.
+        if let Err(MediaControlError::MpvIpc { kind, message }) = play(&max).await
+            && kind == MpvIpcErrorKind::ConnectionFailed
+        {
+            assert!(
+                !message.contains("too long"),
+                "length-check should not fire at the boundary: {message}"
+            );
+        }
     }
 }

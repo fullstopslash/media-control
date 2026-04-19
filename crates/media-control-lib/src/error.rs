@@ -11,25 +11,23 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, MediaControlError>;
 
 /// Specific kinds of mpv IPC errors.
+///
+/// Only kinds that production code actually constructs are exposed; the
+/// previous `Timeout`/`ResponseError` variants were never produced and were
+/// removed to keep the surface honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MpvIpcErrorKind {
     /// No valid mpv IPC socket found.
     NoSocket,
-    /// Connection or write timed out.
-    Timeout,
     /// Connection failed on all socket paths.
     ConnectionFailed,
-    /// mpv returned an error response.
-    ResponseError,
 }
 
 impl std::fmt::Display for MpvIpcErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoSocket => write!(f, "no mpv IPC socket found"),
-            Self::Timeout => write!(f, "connection timed out"),
             Self::ConnectionFailed => write!(f, "connection failed"),
-            Self::ResponseError => write!(f, "mpv returned an error"),
         }
     }
 }
@@ -79,7 +77,11 @@ pub enum MediaControlError {
     WindowNotFound,
 
     /// mpv IPC communication error.
-    #[error("mpv IPC error: {kind}")]
+    ///
+    /// `message` carries actionable detail (e.g. the offending input length,
+    /// the attempted socket paths) and is included in `Display` so users can
+    /// diagnose without cracking open `Debug`.
+    #[error("mpv IPC error: {kind}: {message}")]
     MpvIpc {
         kind: MpvIpcErrorKind,
         message: String,
@@ -243,14 +245,9 @@ mod tests {
             MpvIpcErrorKind::NoSocket.to_string(),
             "no mpv IPC socket found"
         );
-        assert_eq!(MpvIpcErrorKind::Timeout.to_string(), "connection timed out");
         assert_eq!(
             MpvIpcErrorKind::ConnectionFailed.to_string(),
             "connection failed"
-        );
-        assert_eq!(
-            MpvIpcErrorKind::ResponseError.to_string(),
-            "mpv returned an error"
         );
     }
 
@@ -274,6 +271,34 @@ mod tests {
     fn error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MediaControlError>();
+    }
+
+    #[test]
+    fn config_io_error_display_includes_underlying_message() {
+        // The Config(_) bridge must surface the inner Display so users can
+        // diagnose missing/permission-denied config files from the log alone.
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "perm boom");
+        let cfg: crate::config::ConfigError = io.into();
+        let err: MediaControlError = cfg.into();
+        let msg = err.to_string();
+        assert!(msg.contains("config error"), "got: {msg}");
+        // The chain must reach the io message; Display flattens via the
+        // inner ConfigError::Io's `{0}` substitution.
+        assert!(msg.contains("perm boom"), "io message lost: {msg}");
+    }
+
+    #[test]
+    fn jellyfin_credentials_too_large_displays_with_size() {
+        // Size cap errors must show the offending size + cap so the user can
+        // diagnose without reaching for a debugger.
+        let jf = crate::jellyfin::JellyfinError::CredentialsTooLarge {
+            size: 999_999,
+            max: 65_536,
+        };
+        let err: MediaControlError = jf.into();
+        let msg = err.to_string();
+        assert!(msg.contains("999999"), "size missing: {msg}");
+        assert!(msg.contains("65536"), "cap missing: {msg}");
     }
 
     #[test]
