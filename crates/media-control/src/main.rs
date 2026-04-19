@@ -183,12 +183,18 @@ async fn main() {
         return;
     }
 
-    // Setup logging (off by default, enabled with -v)
-    if cli.verbose {
-        tracing_subscriber::fmt()
-            .with_env_filter("media_control=debug")
-            .init();
-    }
+    // Setup logging. Default to `warn` so things like a broken config file
+    // are visible without `-v`; `-v` flips us up to `debug`. Done BEFORE
+    // the status branch so `-v media-control status` is also instrumented.
+    let log_filter = if cli.verbose {
+        "media_control=debug"
+    } else {
+        "media_control=warn"
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter)
+        .with_target(false)
+        .init();
 
     // Handle status early (no config/context needed — just mpv IPC)
     if let Commands::Status { json } = cli.command {
@@ -204,11 +210,54 @@ async fn main() {
 
     if let Err(e) = run(cli).await {
         eprintln!("media-control: {e}");
-        // Fire-and-forget desktop notification
-        let _ = std::process::Command::new("notify-send")
-            .args(["-u", "critical", "media-control", &format!("{e}")])
-            .spawn();
+        notify_error(&e.to_string()).await;
         std::process::exit(1);
+    }
+}
+
+/// Emit a desktop notification for a fatal error.
+///
+/// We poll `try_wait` (not `wait`) so the notification has actually been
+/// dispatched to dbus before we exit — a bare `spawn()` followed by an
+/// immediate `process::exit` can drop the notification on slower systems
+/// because the parent's exit reaps the child before notify-send completes
+/// its dbus call. `notify-send` typically returns within a few ms, but we
+/// still cap the total wait so we never block exit indefinitely if dbus is
+/// wedged.
+///
+/// `async` so we can use `tokio::time::sleep` instead of `std::thread::sleep`
+/// — the latter would park a tokio worker thread and could starve other
+/// tasks during the polling window.
+async fn notify_error(message: &str) {
+    use std::time::{Duration, Instant};
+
+    let mut child = match std::process::Command::new("notify-send")
+        .args(["-u", "critical", "media-control", message])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        // notify-send is optional — silently skip if not installed.
+        Err(_) => return,
+    };
+
+    // Bounded wait: poll try_wait until done or 500ms elapses.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() >= deadline => {
+                // Don't block exit forever — notify-send is hung. Reap the
+                // child after killing so it doesn't linger as a zombie until
+                // our own exit cleans up the process table entry.
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(_) => return,
+        }
     }
 }
 
@@ -217,7 +266,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let config = match &cli.config {
         Some(path) => Config::load_from_path(path)?,
         None => Config::load().unwrap_or_else(|e| {
-            tracing::debug!("Config load failed ({e}), using defaults");
+            // `warn!` (not `debug!`): if the user has a config file that
+            // fails to parse, they should see *something* without needing
+            // `-v`. `Config::load` already returns `Ok(default)` for plain
+            // ENOENT, so reaching this branch means a real parse error.
+            tracing::warn!("Config load failed ({e}), using defaults");
             Config::default()
         }),
     };
@@ -238,7 +291,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::close::close(&ctx).await?;
         }
         Commands::Focus { launch } => {
-            commands::focus::focus_or_launch(&ctx, launch.as_deref()).await?;
+            // `focus_or_launch` returns Ok(true) if a window was focused (or
+            // launched), Ok(false) if no media window exists and no `--launch`
+            // fallback was supplied. Surface the latter as a non-zero exit so
+            // callers (e.g. waybar/keybinds) can chain conditionally.
+            if !commands::focus::focus_or_launch(&ctx, launch.as_deref()).await? {
+                std::process::exit(1);
+            }
         }
         Commands::Avoid => {
             commands::avoid::avoid(&ctx).await?;

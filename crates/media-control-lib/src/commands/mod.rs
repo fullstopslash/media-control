@@ -100,15 +100,10 @@ impl CommandContext {
     /// - The Hyprland socket is not available
     /// - Any pattern regex fails to compile
     pub fn with_config(config: Config) -> Result<Self> {
-        let hyprland =
-            HyprlandClient::new().map_err(|e| crate::error::MediaControlError::HyprlandIpc {
-                kind: crate::error::HyprlandIpcErrorKind::SocketNotFound,
-                source: Some(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    e.to_string(),
-                )),
-            })?;
-
+        // Use the existing `From<HyprlandError>` bridge so the typed source
+        // chain (env-var name, IO error, etc.) is preserved end-to-end
+        // instead of being flattened into a stringified `NotFound`.
+        let hyprland = HyprlandClient::new()?;
         let window_matcher = WindowMatcher::new(&config.patterns);
 
         Ok(Self {
@@ -127,7 +122,7 @@ impl CommandContext {
 pub(crate) fn find_focused_address(clients: &[Client]) -> Option<&str> {
     clients
         .iter()
-        .find(|c| c.focus_history_id == 0)
+        .find(|c| c.is_focused())
         .map(|c| c.address.as_str())
 }
 
@@ -169,15 +164,22 @@ pub fn get_media_window_with_clients(
     ctx.window_matcher.find_media_window(clients, focus_addr)
 }
 
-/// Get the runtime directory (`$XDG_RUNTIME_DIR` or `/tmp` fallback).
+/// Get the runtime directory from `$XDG_RUNTIME_DIR`.
 ///
 /// Sanitizes the env value to defend against path-traversal injection:
 /// the path must be absolute, contain no `..` components, and exist as a
-/// directory. On any failure, falls back to `/tmp` and emits a one-shot
-/// warning since `/tmp` is world-writable on most systems.
-pub fn runtime_dir() -> PathBuf {
+/// directory.
+///
+/// # Errors
+///
+/// Returns [`MediaControlError::InvalidArgument`] when `XDG_RUNTIME_DIR`
+/// is unset, empty, relative, contains `..`, or does not point to an
+/// existing directory. Falling back to `/tmp` would be world-writable and
+/// would expose every derived path (suppress file, minify state) to
+/// symlink attacks; we refuse to do so.
+pub fn runtime_dir() -> Result<PathBuf> {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+    static MISSING_WARNED: AtomicBool = AtomicBool::new(false);
 
     fn sanitize(raw: &str) -> Option<PathBuf> {
         let p = PathBuf::from(raw);
@@ -197,14 +199,16 @@ pub fn runtime_dir() -> PathBuf {
     }
 
     if let Some(dir) = env::var("XDG_RUNTIME_DIR").ok().and_then(|v| sanitize(&v)) {
-        return dir;
+        return Ok(dir);
     }
-    if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+    if !MISSING_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
-            "XDG_RUNTIME_DIR unset or invalid; falling back to /tmp (world-writable, less secure)"
+            "XDG_RUNTIME_DIR is required (must be absolute, free of `..`, and an existing directory); refusing to fall back to /tmp"
         );
     }
-    PathBuf::from("/tmp")
+    Err(crate::error::MediaControlError::invalid_argument(
+        "XDG_RUNTIME_DIR is required: must be set to an absolute, existing directory path with no `..` components",
+    ))
 }
 
 /// Get the path to the avoider suppress file.
@@ -212,14 +216,45 @@ pub fn runtime_dir() -> PathBuf {
 /// The suppress file is located at `$XDG_RUNTIME_DIR/media-avoider-suppress`.
 /// When this file exists and contains a recent timestamp, the avoider daemon
 /// will skip repositioning to prevent feedback loops.
-pub fn get_suppress_file_path() -> PathBuf {
-    runtime_dir().join("media-avoider-suppress")
+///
+/// # Errors
+///
+/// Propagates the error from [`runtime_dir`] when `XDG_RUNTIME_DIR` is
+/// unset or invalid.
+pub fn get_suppress_file_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("media-avoider-suppress"))
 }
 
-/// Write a value to the suppress file. Logs on failure.
+/// Write a value to the suppress file atomically.
+///
+/// Writes to `<path>.tmp` in the same directory, then atomically renames
+/// into place. This guarantees a concurrent reader either sees the previous
+/// contents or the full new contents — never an empty mid-write file that
+/// would parse as zero and disable suppression. Logs on failure.
 async fn write_suppress_file(content: &str) {
-    if let Err(e) = fs::write(get_suppress_file_path(), content).await {
-        tracing::debug!("failed to write suppress file: {e}");
+    let path = match get_suppress_file_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("cannot write suppress file: {e}");
+            return;
+        }
+    };
+    // `<path>.tmp` lives in the same directory (and therefore the same
+    // filesystem) as `path`, so `rename` is a single atomic syscall on
+    // POSIX. Using a fixed sibling name means a crashed run leaves at most
+    // one stale `.tmp` artifact rather than an unbounded set.
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    if let Err(e) = fs::write(&tmp, content).await {
+        tracing::debug!("failed to write suppress file (tmp): {e}");
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, &path).await {
+        tracing::debug!("failed to rename suppress file into place: {e}");
+        // Best-effort cleanup so we don't leave the tmp artifact behind.
+        let _ = fs::remove_file(&tmp).await;
     }
 }
 
@@ -229,11 +264,7 @@ async fn write_suppress_file(content: &str) {
 /// is recent (within the configured timeout), it skips the reposition operation.
 /// This prevents feedback loops when commands intentionally move windows.
 pub async fn suppress_avoider() {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    write_suppress_file(&timestamp.to_string()).await;
+    write_suppress_file(&now_unix_millis().to_string()).await;
 }
 
 /// Clear the avoider suppression to allow the next avoid trigger to run.
@@ -262,30 +293,94 @@ pub(crate) fn async_env_test_mutex() -> &'static tokio::sync::Mutex<()> {
     M.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Build a `dispatch focuswindow address:<addr>` command string.
+// ---------------------------------------------------------------------------
+// Bare-action helpers
+//
+// Each helper returns the bare Hyprland action body — e.g. `pin address:0xabc`,
+// `movewindowpixel exact 100 200,address:0xabc` — *without* the leading
+// `dispatch ` token. Pair with [`HyprlandClient::dispatch`] (single) or
+// [`HyprlandClient::dispatch_batch`] (multiple), both of which prepend the
+// `dispatch ` token themselves. This keeps the literal `dispatch ` in exactly
+// one place per code path and lets the same helper feed both single and batch
+// dispatch sites.
+// ---------------------------------------------------------------------------
+
+/// `focuswindow address:<addr>` action.
 #[inline]
-pub(crate) fn focus_window_cmd(addr: &str) -> String {
-    format!("dispatch focuswindow address:{addr}")
+pub(crate) fn focus_window_action(addr: &str) -> String {
+    format!("focuswindow address:{addr}")
 }
 
-/// Build a `dispatch pin address:<addr>` command string.
+/// `pin address:<addr>` action.
 #[inline]
-pub(crate) fn pin_cmd(addr: &str) -> String {
-    format!("dispatch pin address:{addr}")
+pub(crate) fn pin_action(addr: &str) -> String {
+    format!("pin address:{addr}")
 }
 
-/// Build a `dispatch togglefloating address:<addr>` command string.
+/// `togglefloating address:<addr>` action.
 #[inline]
-pub(crate) fn toggle_floating_cmd(addr: &str) -> String {
-    format!("dispatch togglefloating address:{addr}")
+pub(crate) fn toggle_floating_action(addr: &str) -> String {
+    format!("togglefloating address:{addr}")
+}
+
+/// `closewindow address:<addr>` action.
+#[inline]
+pub(crate) fn close_window_action(addr: &str) -> String {
+    format!("closewindow address:{addr}")
+}
+
+/// `movewindowpixel exact <x> <y>,address:<addr>` action.
+#[inline]
+pub(crate) fn move_pixel_action(addr: &str, x: i32, y: i32) -> String {
+    format!("movewindowpixel exact {x} {y},address:{addr}")
+}
+
+/// `resizewindowpixel exact <w> <h>,address:<addr>` action.
+#[inline]
+pub(crate) fn resize_pixel_action(addr: &str, w: i32, h: i32) -> String {
+    format!("resizewindowpixel exact {w} {h},address:{addr}")
+}
+
+/// Convert a slice of `String`s into the `&[&str]` shape `HyprlandClient::batch` wants.
+///
+/// Centralises the noisy `.iter().map(String::as_str).collect()` pattern so
+/// callers building dynamic batch lists read uniformly.
+#[inline]
+pub(crate) fn as_str_refs(cmds: &[String]) -> Vec<&str> {
+    cmds.iter().map(String::as_str).collect()
+}
+
+/// Current wall-clock time in milliseconds since UNIX epoch.
+///
+/// Returns `0` when the system clock is before `UNIX_EPOCH` (impossible on a
+/// healthy system; preserves the prior `unwrap_or_default()` semantics).
+/// Saturates at [`u64::MAX`] in the year-584-million case so callers can
+/// drop their `try_from(...).unwrap_or(u64::MAX)` boilerplate.
+#[inline]
+pub(crate) fn now_unix_millis() -> u64 {
+    let raw = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(raw).unwrap_or(u64::MAX)
 }
 
 /// Restore focus to a window without warping the cursor.
 ///
 /// Tries modern `cursor:no_warps` syntax first, falls back to legacy
 /// `general:no_cursor_warps` for older Hyprland versions.
+///
+/// If the modern batch fails partway, the trailing `cursor:no_warps false`
+/// reset may never have fired, leaving warps disabled until something else
+/// clears it. Before falling back, we emit the reset unconditionally so
+/// the modern keyword can never be left stuck on `true`. The reset is
+/// cheap and idempotent, so issuing it on the (rare) success-then-failure
+/// edge is harmless.
 pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
-    let focus = focus_window_cmd(addr);
+    // Build the focuswindow batch entry once, in `dispatch`-prefixed form so
+    // it can ride alongside the `keyword` lines in `batch()` (which doesn't
+    // auto-prefix).
+    let focus = format!("dispatch {}", focus_window_action(addr));
 
     let result = ctx
         .hyprland
@@ -297,6 +392,22 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
         .await;
 
     if result.is_err() {
+        // Best-effort cleanup: ensure the modern keyword is reset to
+        // `false` even if the batch above failed mid-flight (succeeded at
+        // setting `true` but never reached the trailing `false`). Errors
+        // here are intentionally swallowed — the legacy retry below is
+        // what the caller is actually waiting on. `batch` with a single
+        // element is the right primitive: `keyword …` is NOT a dispatch
+        // action, so the `dispatch_batch` / `dispatch` helpers (which
+        // auto-prefix `dispatch `) would mangle it.
+        if let Err(e) = ctx
+            .hyprland
+            .batch(&["keyword cursor:no_warps false"])
+            .await
+        {
+            tracing::debug!("modern cursor:no_warps reset on fallback failed: {e}");
+        }
+
         ctx.hyprland
             .batch(&[
                 "keyword general:no_cursor_warps true",
@@ -313,18 +424,29 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
 ///
 /// Presence of this file means the media window is in minified mode.
 /// Located in `$XDG_RUNTIME_DIR` (tmpfs) so it resets on reboot.
-pub fn get_minify_state_path() -> PathBuf {
-    runtime_dir().join("media-control-minified")
+///
+/// # Errors
+///
+/// Propagates the error from [`runtime_dir`] when `XDG_RUNTIME_DIR` is
+/// unset or invalid.
+pub fn get_minify_state_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("media-control-minified"))
 }
 
 /// Check if minified mode is active.
+///
+/// Returns `false` when `XDG_RUNTIME_DIR` is unavailable — the safe
+/// default, since minified is an opt-in mode and we never want a missing
+/// env var to silently flip the window into the scaled branch.
 pub fn is_minified() -> bool {
-    get_minify_state_path().exists()
+    get_minify_state_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
 
 /// Toggle minified mode on/off. Returns the new state.
 pub async fn toggle_minified() -> Result<bool> {
-    let path = get_minify_state_path();
+    let path = get_minify_state_path()?;
     if path.exists() {
         fs::remove_file(&path).await?;
         Ok(false)
@@ -334,19 +456,13 @@ pub async fn toggle_minified() -> Result<bool> {
     }
 }
 
-/// Get the effective window dimensions, accounting for minified mode.
+/// Compute scaled (width, height) for the minified branch.
 ///
 /// Defends against pathological config (NaN, negative, or huge `minified_scale`)
 /// by clamping the scaled value into a sane range before converting back to
 /// `i32`. Without this, an `f32 → i32` saturating-cast on `NaN` or out-of-range
 /// values would yield `0` / `i32::MAX` and propagate into geometry math.
-pub fn effective_dimensions(ctx: &CommandContext) -> (i32, i32) {
-    let w = ctx.config.positions.width;
-    let h = ctx.config.positions.height;
-    if !is_minified() {
-        return (w, h);
-    }
-    let raw_scale = ctx.config.positioning.minified_scale;
+fn scaled_dims(w: i32, h: i32, raw_scale: f32) -> (i32, i32) {
     let scale = if raw_scale.is_finite() {
         raw_scale.clamp(0.0, 10.0)
     } else {
@@ -359,18 +475,77 @@ pub fn effective_dimensions(ctx: &CommandContext) -> (i32, i32) {
     (scaled(w), scaled(h))
 }
 
+/// Get the effective window dimensions, accounting for minified mode.
+///
+/// Filesystem-stat shortcut wrapper around
+/// [`effective_dimensions_with_minified`]. Prefer the `_with_minified`
+/// variant when the caller already has the bool — repeated stats add up
+/// in hot paths like the avoider.
+pub fn effective_dimensions(ctx: &CommandContext) -> (i32, i32) {
+    effective_dimensions_with_minified(ctx, is_minified())
+}
+
+/// Variant of [`effective_dimensions`] that takes a precomputed `minified`
+/// flag, avoiding a redundant filesystem stat in callers that already
+/// computed it (or that need to call this alongside
+/// [`resolve_effective_position_with_minified`]).
+#[inline]
+pub(crate) fn effective_dimensions_with_minified(
+    ctx: &CommandContext,
+    minified: bool,
+) -> (i32, i32) {
+    let w = ctx.config.positions.width;
+    let h = ctx.config.positions.height;
+    if !minified {
+        return (w, h);
+    }
+    scaled_dims(w, h, ctx.config.positioning.minified_scale)
+}
+
+/// Resolve a position name adjusted for minified mode, falling back to `default` when unset.
+///
+/// Convenience wrapper that captures the `resolve(...).unwrap_or(default)` pattern
+/// repeated across `avoid.rs`, `move_window.rs`, and `mod.rs::reposition_to_default`.
+#[inline]
+pub(crate) fn resolve_position_or(ctx: &CommandContext, name: &str, default: i32) -> i32 {
+    resolve_effective_position(ctx, name).unwrap_or(default)
+}
+
+/// Variant of [`resolve_position_or`] that takes a precomputed `minified`
+/// flag — see [`effective_dimensions_with_minified`].
+#[inline]
+pub(crate) fn resolve_position_or_with_minified(
+    ctx: &CommandContext,
+    name: &str,
+    default: i32,
+    minified: bool,
+) -> i32 {
+    resolve_effective_position_with_minified(ctx, name, minified).unwrap_or(default)
+}
+
 /// Resolve a position name adjusted for minified mode.
 ///
 /// When minified, "x_right" and "y_bottom" shift outward because the
 /// smaller window needs a larger x/y to maintain the same gap from the
 /// screen edge. "x_left" and "y_top" stay the same.
 pub fn resolve_effective_position(ctx: &CommandContext, name: &str) -> Option<i32> {
+    resolve_effective_position_with_minified(ctx, name, is_minified())
+}
+
+/// Variant of [`resolve_effective_position`] that takes a precomputed
+/// `minified` flag — see [`effective_dimensions_with_minified`].
+#[inline]
+pub(crate) fn resolve_effective_position_with_minified(
+    ctx: &CommandContext,
+    name: &str,
+    minified: bool,
+) -> Option<i32> {
     let raw = ctx.config.resolve_position(name)?;
-    if !is_minified() {
+    if !minified {
         return Some(raw);
     }
     let p = &ctx.config.positions;
-    let (ew, eh) = effective_dimensions(ctx);
+    let (ew, eh) = scaled_dims(p.width, p.height, ctx.config.positioning.minified_scale);
     match name {
         "x_right" => Some(raw + (p.width - ew)),
         "y_bottom" => Some(raw + (p.height - eh)),
@@ -390,20 +565,39 @@ pub fn resolve_effective_position(ctx: &CommandContext, name: &str) -> Option<i3
 /// net so a caller can never forget the contract.
 pub(crate) async fn reposition_to_default(ctx: &CommandContext, addr: &str) -> Result<()> {
     let positioning = &ctx.config.positioning;
-    let target_x = resolve_effective_position(ctx, &positioning.default_x)
-        .unwrap_or(ctx.config.positions.x_right);
-    let target_y = resolve_effective_position(ctx, &positioning.default_y)
-        .unwrap_or(ctx.config.positions.y_bottom);
-    let (ew, eh) = effective_dimensions(ctx);
+    // Compute the minified flag once: each `resolve_effective_position` /
+    // `effective_dimensions` call would otherwise stat the same minify
+    // marker file. With four reads in this function alone, the redundant
+    // syscalls are non-trivial — the `_with_minified` variants thread the
+    // bool through so we pay for one stat instead of four.
+    let minified = is_minified();
+    // Fall back through `resolve_effective_position_with_minified` so the
+    // fallback name is also adjusted for minified mode — using the raw
+    // config value here would bypass the minified offset and place the
+    // window incorrectly.
+    let target_x = resolve_effective_position_with_minified(ctx, &positioning.default_x, minified)
+        .unwrap_or_else(|| {
+            resolve_position_or_with_minified(ctx, "x_right", ctx.config.positions.x_right, minified)
+        });
+    let target_y = resolve_effective_position_with_minified(ctx, &positioning.default_y, minified)
+        .unwrap_or_else(|| {
+            resolve_position_or_with_minified(
+                ctx,
+                "y_bottom",
+                ctx.config.positions.y_bottom,
+                minified,
+            )
+        });
+    let (ew, eh) = effective_dimensions_with_minified(ctx, minified);
 
     // Suppress immediately before dispatch. Idempotent w.r.t. an earlier
     // caller-side suppress — both writes set a fresh timestamp.
     suppress_avoider().await;
 
     ctx.hyprland
-        .batch(&[
-            &format!("dispatch resizewindowpixel exact {ew} {eh},address:{addr}"),
-            &format!("dispatch movewindowpixel exact {target_x} {target_y},address:{addr}"),
+        .dispatch_batch(&[
+            &resize_pixel_action(addr, ew, eh),
+            &move_pixel_action(addr, target_x, target_y),
         ])
         .await?;
     Ok(())
@@ -457,11 +651,68 @@ async fn connect_and_write(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket connect timeout"))?
 }
 
+/// Validate an mpv IPC socket path candidate sourced from env input.
+///
+/// Mirrors the constraints applied to `XDG_RUNTIME_DIR` in [`runtime_dir`]:
+/// the path must be absolute and contain no `..` components. Existence is
+/// NOT checked here (the socket may legitimately not yet exist when the
+/// caller probes the candidate list); the lstat-based [`is_unix_socket`]
+/// downstream catches that case.
+///
+/// # Errors
+///
+/// Returns [`MediaControlError::InvalidArgument`] when the supplied
+/// `MPV_IPC_SOCKET` is empty, relative, or contains `..` components.
+fn validate_mpv_socket_path(raw: &str) -> Result<PathBuf> {
+    if raw.is_empty() {
+        return Err(crate::error::MediaControlError::invalid_argument(
+            "MPV_IPC_SOCKET must not be empty",
+        ));
+    }
+    let p = PathBuf::from(raw);
+    if !p.is_absolute() {
+        return Err(crate::error::MediaControlError::invalid_argument(format!(
+            "MPV_IPC_SOCKET must be an absolute path (got {raw:?})"
+        )));
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(crate::error::MediaControlError::invalid_argument(format!(
+            "MPV_IPC_SOCKET must not contain `..` components (got {raw:?})"
+        )));
+    }
+    Ok(p)
+}
+
 /// Get the ordered list of mpv IPC socket paths to try.
+///
+/// `MPV_IPC_SOCKET` (when set) is validated through
+/// [`validate_mpv_socket_path`] — the same constraints `runtime_dir`
+/// applies to `XDG_RUNTIME_DIR`. An invalid value is logged once and
+/// dropped from the candidate list rather than poisoning the whole call;
+/// the hardcoded fallbacks still get a chance.
 fn mpv_socket_paths() -> Vec<String> {
     let mut paths = Vec::with_capacity(3);
     if let Ok(env_path) = env::var("MPV_IPC_SOCKET") {
-        paths.push(env_path);
+        match validate_mpv_socket_path(&env_path) {
+            Ok(p) => {
+                // `from(PathBuf).to_string_lossy().into_owned()` would
+                // smuggle non-UTF8 bytes through with `?` placeholders; the
+                // validator already rejected unusable shapes, so a direct
+                // String round-trip is safe here.
+                if let Some(s) = p.to_str() {
+                    paths.push(s.to_string());
+                } else {
+                    tracing::warn!(
+                        "MPV_IPC_SOCKET contains non-UTF8 bytes; ignoring and using fallbacks"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("ignoring invalid MPV_IPC_SOCKET: {e}");
+            }
+        }
     }
     paths.push(MPV_IPC_SOCKET_DEFAULT.to_string());
     paths.push(MPV_IPC_SOCKET_FALLBACK.to_string());
@@ -534,9 +785,31 @@ async fn mpv_ipc_exchange(
     })
     .await;
 
+    // Distinguish the three failure modes in the log so a wedged-mpv
+    // condition (timeout) is observable from the same log stream as a
+    // closed-socket condition (EOF) or a malformed line that bubbled all
+    // the way out (parse). The public return shape is preserved
+    // (`Ok(None)`) so callers don't have to learn three new error
+    // variants — the diagnostic lives in the trace, not the type.
     match read_result {
         Ok(Ok(val)) => Ok(Some(val)),
-        _ => Ok(None), // read failed or timed out — command was sent
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            tracing::debug!(
+                "mpv {socket_path}: EOF before response (mpv closed the connection)"
+            );
+            Ok(None)
+        }
+        Ok(Err(e)) => {
+            tracing::debug!("mpv {socket_path}: read error: {e}");
+            Ok(None)
+        }
+        Err(_) => {
+            tracing::debug!(
+                "mpv {socket_path}: response read timed out after {}ms (socket alive but mpv hung)",
+                SOCKET_RESPONSE_TIMEOUT.as_millis()
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -558,32 +831,61 @@ pub async fn send_mpv_script_message_with_args(message: &str, args: &[&str]) -> 
     send_mpv_ipc_command(&payload).await
 }
 
+/// Validate that a CLI-supplied IPC token does not exceed `max_len` bytes.
+///
+/// Returns [`crate::error::MediaControlError::InvalidArgument`] (not
+/// `MpvIpc/ConnectionFailed`) when the cap is exceeded — the connection was
+/// never attempted, the input was rejected. Centralised so every IPC-bound
+/// CLI argument enforces the cap identically and emits the same error shape
+/// for callers/tests.
+#[inline]
+pub(crate) fn validate_ipc_token_len(label: &str, value: &str, max_len: usize) -> Result<()> {
+    if value.len() > max_len {
+        return Err(crate::error::MediaControlError::invalid_argument(format!(
+            "{label} too long: {} bytes (max {max_len})",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Try each candidate mpv socket path in turn, with optional retry passes.
 ///
-/// On the first path that yields `Some(T)`, returns it. Otherwise returns
-/// `None` after all paths and retries are exhausted; emits a single
-/// `tracing::debug!` listing every attempted path so the caller's
-/// "no socket" error has actionable context in the logs.
+/// Returns the first `Some(T)` produced by any (path, attempt) pair; if
+/// all combinations fail, emits a single `tracing::debug!` listing every
+/// attempted path so the caller's "no socket" error has actionable context
+/// in the logs.
+///
+/// # Iteration order
+///
+/// `for path { for attempt { … } }` — exhaust retries on each path before
+/// moving to the next. The other order (`for attempt { for path { … } }`)
+/// burns every retry on a wedged path 1 before path 2 is ever tried,
+/// turning a stale-but-present socket into a long latency spike for a
+/// caller that only needs the live fallback. With this ordering, a stale
+/// path 1 still gives the live path 2 the very first attempt on its first
+/// pass — at the cost of `RETRY_DELAY` between attempts on the same
+/// path, which is the desired latency budget for a single bad endpoint.
 ///
 /// # Timing
 ///
 /// Per-path timeouts are applied inside `op`, not here, so total wall time
-/// scales as `(retries + 1) * paths.len() * <op timeout>`. With the default
-/// 50ms connect + 50ms response budget and 3 paths, a single call (`retries=0`)
-/// caps at ~300ms; a retried call (`retries=1`) caps at ~625ms incl.
-/// [`RETRY_DELAY`].
+/// scales as `paths.len() * (retries + 1) * <op timeout> + paths.len() *
+/// retries * RETRY_DELAY`. With the default 50ms connect + 50ms response
+/// budget, 3 paths, and `retries=1`, the worst case is
+/// `3 * 2 * 100ms + 3 * 1 * 25ms = 675ms`.
 async fn try_mpv_paths<T, F, Fut>(retries: u8, mut op: F) -> Option<T>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
     let paths = mpv_socket_paths();
-    for attempt in 0..=retries {
-        if attempt > 0 {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-        for path in &paths {
-            // Clone the owned PathBuf into a String to sidestep the
+    for path in &paths {
+        for attempt in 0..=retries {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            // Clone the owned String to sidestep the
             // closure-borrow-vs-future-lifetime tangle: `op` returns a future
             // that may outlive the `&path` borrow, so we hand it an owned copy.
             if let Some(v) = op(path.clone()).await {
@@ -594,7 +896,7 @@ where
     tracing::debug!(
         "mpv IPC failed across {} path(s) after {} attempt(s): {:?}",
         paths.len(),
-        retries as u32 + 1,
+        u32::from(retries) + 1,
         paths
     );
     None
@@ -702,12 +1004,17 @@ mod tests {
         // Save original value
         let original = env::var("XDG_RUNTIME_DIR").ok();
 
+        // Use a real existing directory so the validator inside
+        // `runtime_dir` accepts it. Pre-fix this used `/run/user/1000`
+        // which doesn't exist in CI sandboxes.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+
         // SAFETY: Test is single-threaded and restores the original value
         unsafe {
-            // Test with XDG_RUNTIME_DIR set
-            set_env("XDG_RUNTIME_DIR", "/run/user/1000");
-            let path = get_suppress_file_path();
-            assert_eq!(path, PathBuf::from("/run/user/1000/media-avoider-suppress"));
+            set_env("XDG_RUNTIME_DIR", dir_str);
+            let path = get_suppress_file_path().expect("XDG_RUNTIME_DIR is valid");
+            assert_eq!(path, dir.path().join("media-avoider-suppress"));
 
             // Restore original value
             if let Some(val) = original {
@@ -719,17 +1026,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppress_file_path_fallback() {
+    async fn suppress_file_path_errors_when_runtime_dir_missing() {
         let _g = super::async_env_test_mutex().lock().await;
         // Save original value
         let original = env::var("XDG_RUNTIME_DIR").ok();
 
         // SAFETY: Test is single-threaded and restores the original value
         unsafe {
-            // Test without XDG_RUNTIME_DIR
+            // The env var is required — there is no `/tmp` fallback any more.
             remove_env("XDG_RUNTIME_DIR");
-            let path = get_suppress_file_path();
-            assert_eq!(path, PathBuf::from("/tmp/media-avoider-suppress"));
+            let result = get_suppress_file_path();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::MediaControlError::InvalidArgument(_))
+                ),
+                "expected InvalidArgument when XDG_RUNTIME_DIR is unset, got {result:?}"
+            );
 
             // Restore original value
             if let Some(val) = original {
@@ -741,17 +1054,104 @@ mod tests {
     #[tokio::test]
     async fn suppress_avoider_writes_file() {
         let _g = super::async_env_test_mutex().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        let dir = tempfile::tempdir().unwrap();
+
+        // SAFETY: single-threaded test
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", dir.path().to_str().unwrap());
+        }
+
         suppress_avoider().await;
-        let path = get_suppress_file_path();
+        let path = get_suppress_file_path().unwrap();
         assert!(path.exists(), "suppress file should exist at {path:?}");
+
+        // SAFETY: restore
+        unsafe {
+            if let Some(val) = original {
+                set_env("XDG_RUNTIME_DIR", &val);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+        }
     }
 
     #[tokio::test]
     async fn clear_suppression_writes_file() {
         let _g = super::async_env_test_mutex().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        let dir = tempfile::tempdir().unwrap();
+
+        // SAFETY: single-threaded test
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", dir.path().to_str().unwrap());
+        }
+
         clear_suppression().await;
-        let path = get_suppress_file_path();
+        let path = get_suppress_file_path().unwrap();
         assert!(path.exists(), "suppress file should exist at {path:?}");
+
+        // SAFETY: restore
+        unsafe {
+            if let Some(val) = original {
+                set_env("XDG_RUNTIME_DIR", &val);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+        }
+    }
+
+    /// Atomicity: a concurrent reader must never observe an empty (mid-write)
+    /// suppress file. The fixed `write_suppress_file` writes to `<path>.tmp`
+    /// then renames; the rename is a single syscall, so any read either
+    /// returns the prior content or the full new content.
+    #[tokio::test]
+    async fn write_suppress_file_is_atomic() {
+        let _g = super::async_env_test_mutex().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        let dir = tempfile::tempdir().unwrap();
+
+        // SAFETY: single-threaded test
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", dir.path().to_str().unwrap());
+        }
+
+        // Pre-seed a known value so an empty read would be obviously wrong.
+        let path = get_suppress_file_path().unwrap();
+        tokio::fs::write(&path, "12345").await.unwrap();
+
+        // Race a reader against a writer. Each iteration overwrites and reads
+        // back; the read must always parse to a positive integer (never empty).
+        let writer = async {
+            for i in 0..50 {
+                write_suppress_file(&format!("{}", 1_000_000 + i)).await;
+            }
+        };
+        let reader = async {
+            for _ in 0..200 {
+                if let Ok(s) = tokio::fs::read_to_string(&path).await {
+                    let trimmed = s.trim();
+                    assert!(
+                        !trimmed.is_empty(),
+                        "atomic write must never expose empty file"
+                    );
+                    let _: u64 = trimmed.parse().unwrap_or_else(|_| {
+                        panic!("read non-numeric content during write: {trimmed:?}")
+                    });
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::join!(writer, reader);
+
+        // SAFETY: restore
+        unsafe {
+            if let Some(val) = original {
+                set_env("XDG_RUNTIME_DIR", &val);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+        }
     }
 
     #[test]
@@ -902,7 +1302,7 @@ mod tests {
         // This should be Firefox (0x1), not requiring a separate get_active_window() call
         let focus_addr = clients
             .iter()
-            .filter(|c| c.focus_history_id == 0)
+            .filter(|c| c.is_focused())
             .map(|c| c.address.as_str())
             .next();
 

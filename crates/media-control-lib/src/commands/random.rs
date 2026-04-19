@@ -8,7 +8,7 @@
 //! - Twitch: (any or none — picks random live channel)
 //! - Stash: `scene`, `performer`, `studio`
 
-use super::{send_mpv_script_message, send_mpv_script_message_with_args};
+use super::{send_mpv_script_message, send_mpv_script_message_with_args, validate_ipc_token_len};
 
 /// Maximum accepted length for a random-type token.
 ///
@@ -24,20 +24,14 @@ const RANDOM_TYPE_MAX_LEN: usize = 64;
 ///
 /// # Errors
 ///
-/// - Returns `mpv_no_socket` if no mpv IPC socket is available.
-/// - Returns an `mpv_connection_failed` error if `random_type` exceeds
-///   `RANDOM_TYPE_MAX_LEN`.
+/// - Returns [`crate::error::MediaControlError::MpvIpc`] with kind `NoSocket`
+///   if no mpv IPC socket is available.
+/// - Returns [`crate::error::MediaControlError::InvalidArgument`] if
+///   `random_type` exceeds [`RANDOM_TYPE_MAX_LEN`].
 pub async fn random(random_type: Option<&str>) -> crate::error::Result<()> {
     match random_type {
         Some(t) => {
-            if t.len() > RANDOM_TYPE_MAX_LEN {
-                return Err(crate::error::MediaControlError::mpv_connection_failed(
-                    format!(
-                        "random type too long: {} bytes (max {RANDOM_TYPE_MAX_LEN})",
-                        t.len()
-                    ),
-                ));
-            }
+            validate_ipc_token_len("random type", t, RANDOM_TYPE_MAX_LEN)?;
             send_mpv_script_message_with_args("random", &[t]).await
         }
         None => send_mpv_script_message("random").await,
@@ -53,34 +47,31 @@ mod tests {
     /// length-check defense for `random_type`.
     #[tokio::test]
     async fn random_rejects_overlong_type() {
-        use crate::error::{MediaControlError, MpvIpcErrorKind};
+        use crate::error::MediaControlError;
         let huge = "x".repeat(RANDOM_TYPE_MAX_LEN + 1);
         let err = random(Some(&huge)).await.expect_err("must reject");
+        // Input validation must surface as InvalidArgument — never as a
+        // misleading IPC connection failure.
         match err {
-            MediaControlError::MpvIpc { kind, message } => {
-                assert_eq!(kind, MpvIpcErrorKind::ConnectionFailed);
+            MediaControlError::InvalidArgument(msg) => {
                 assert!(
-                    message.contains("too long"),
-                    "message should mention overflow: {message}"
+                    msg.contains("too long"),
+                    "message should mention overflow: {msg}"
                 );
             }
-            other => panic!("expected MpvIpc length-check error, got: {other:?}"),
+            other => panic!("expected InvalidArgument length-check error, got: {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn random_accepts_max_len_type() {
-        use crate::error::{MediaControlError, MpvIpcErrorKind};
+        use crate::error::MediaControlError;
         // Exactly at the limit: parse must accept; outcome depends on mpv
-        // socket availability, but the length check itself must not fire.
+        // socket availability, but the length check itself must not fire —
+        // so we must NOT see InvalidArgument for input at the boundary.
         let max = "x".repeat(RANDOM_TYPE_MAX_LEN);
-        if let Err(MediaControlError::MpvIpc { kind, message }) = random(Some(&max)).await
-            && kind == MpvIpcErrorKind::ConnectionFailed
-        {
-            assert!(
-                !message.contains("too long"),
-                "length-check should not fire at the boundary: {message}"
-            );
+        if let Err(MediaControlError::InvalidArgument(msg)) = random(Some(&max)).await {
+            panic!("length-check should not fire at the boundary: {msg}");
         }
     }
 }

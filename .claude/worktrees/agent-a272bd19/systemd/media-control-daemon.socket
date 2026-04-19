@@ -1,0 +1,10 @@
+[Unit]
+Description=Media Control Daemon Socket
+PartOf=media-control-daemon.service
+
+[Socket]
+ListenStream=%t/media-control-daemon.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

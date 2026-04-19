@@ -3,7 +3,10 @@
 //! Pins or unpins the media window and applies appropriate positioning
 //! based on the current state and configuration.
 
-use super::{CommandContext, pin_cmd, suppress_avoider, toggle_floating_cmd};
+use super::{
+    CommandContext, as_str_refs, focus_window_action, pin_action, suppress_avoider,
+    toggle_floating_action,
+};
 use crate::error::Result;
 
 /// Toggle pinned floating mode for the media window.
@@ -46,33 +49,29 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
     // If both enabled, disable them (unpin then unfloat)
     if was_floating && was_pinned {
         ctx.hyprland
-            .batch(&[&pin_cmd(addr), &toggle_floating_cmd(addr)])
+            .dispatch_batch(&[&pin_action(addr), &toggle_floating_action(addr)])
             .await?;
         return Ok(());
     }
 
-    // Enable pinned+floating mode
-    // Focus the window first (dispatch prepends "dispatch", so pass bare command)
-    ctx.hyprland.dispatch(&format!("focuswindow address:{addr}")).await?;
-
-    // Build batch commands for state changes
-    let mut cmds: Vec<String> = Vec::with_capacity(2);
+    // Enable pinned+floating mode. Focus + state changes go in a single
+    // batch so Hyprland processes them atomically (no intermediate render
+    // where the window is e.g. floated-but-unfocused) and we save a socket
+    // round-trip vs dispatching focus separately.
+    let mut cmds: Vec<String> = Vec::with_capacity(3);
+    cmds.push(focus_window_action(addr));
     if !was_floating {
-        cmds.push(toggle_floating_cmd(addr));
+        cmds.push(toggle_floating_action(addr));
     }
     if !was_pinned {
-        cmds.push(pin_cmd(addr));
+        cmds.push(pin_action(addr));
     }
+    ctx.hyprland.dispatch_batch(&as_str_refs(&cmds)).await?;
 
-    // Execute state changes if any
-    if !cmds.is_empty() {
-        let cmd_refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
-        ctx.hyprland.batch(&cmd_refs).await?;
-    }
-
-    // Refresh suppression before the reposition — the prior dispatches may
-    // have consumed several debounce cycles, and we want fresh suppression
-    // covering the move/resize batch issued by reposition_to_default.
+    // Refresh suppression before the reposition — the prior batch produced
+    // activewindow + (maybe) floating + (maybe) pin events that consumed
+    // debounce cycles; we want a fresh timestamp covering the move/resize
+    // batch issued by `reposition_to_default`.
     suppress_avoider().await;
 
     // Position to configured default corner (adjusted for minified mode)

@@ -263,6 +263,20 @@ pub fn make_test_client_full(
     }
 }
 
+/// Build a `Config` with `suppress_ms = 0` so suppression never blocks tests.
+///
+/// The shared on-disk suppress file races across parallel tests touching the
+/// avoider; setting `suppress_ms = 0` forces every `should_suppress()` check
+/// to return false, eliminating that flake source. Originally duplicated in
+/// `commands::{avoid,fullscreen}::tests::test_config`; centralised here so a
+/// new test module can opt in with one import.
+#[must_use]
+pub fn test_config_no_suppress() -> Config {
+    let mut c = Config::default();
+    c.positioning.suppress_ms = 0;
+    c
+}
+
 /// Create a test `Monitor` with common defaults.
 pub fn make_test_monitor(id: i32, focused: bool) -> Monitor {
     Monitor {
@@ -353,6 +367,42 @@ mod tests {
         let cmds = mock.captured_commands().await;
         assert_eq!(cmds.len(), 1);
         assert!(cmds[0].starts_with("[[BATCH]]"));
+    }
+
+    /// `dispatch_batch` must prepend `dispatch ` to each bare action and
+    /// join with `; ` inside the `[[BATCH]]` envelope. Locks the wire format
+    /// so a future refactor cannot silently break Hyprland's parser.
+    #[tokio::test]
+    async fn mock_server_dispatch_batch_prefixes_each_action() {
+        let mock = MockHyprland::start().await;
+        let client = mock.client();
+        client
+            .dispatch_batch(&[
+                "movewindowpixel exact 100 200,address:0x1",
+                "resizewindowpixel exact 640 360,address:0x1",
+            ])
+            .await
+            .unwrap();
+
+        let cmds = mock.captured_commands().await;
+        assert_eq!(cmds.len(), 1);
+        let got = &cmds[0];
+        assert!(got.starts_with("[[BATCH]]"), "missing batch prefix: {got}");
+        assert_eq!(
+            got,
+            "[[BATCH]]dispatch movewindowpixel exact 100 200,address:0x1; dispatch resizewindowpixel exact 640 360,address:0x1",
+            "wire format drift in dispatch_batch"
+        );
+    }
+
+    /// Empty `dispatch_batch` must be a no-op (no socket call) so callers can
+    /// build dynamic batches without an explicit emptiness guard.
+    #[tokio::test]
+    async fn mock_server_dispatch_batch_empty_is_noop() {
+        let mock = MockHyprland::start().await;
+        let client = mock.client();
+        client.dispatch_batch(&[]).await.unwrap();
+        assert!(mock.captured_commands().await.is_empty());
     }
 
     #[tokio::test]

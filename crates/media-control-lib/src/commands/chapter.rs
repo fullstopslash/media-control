@@ -25,11 +25,23 @@ impl ChapterDirection {
     }
 }
 
+/// Build the chapter-navigation IPC payload.
+///
+/// Centralises payload construction so both the IPC entry point and tests
+/// use the same shape, and so future additions (e.g. a step size) live in
+/// one place. Uses `serde_json::json!` for safe JSON construction —
+/// mirrors `seek::build_payload` and avoids any chance of malformed JSON
+/// from string interpolation drift.
+fn build_payload(direction: ChapterDirection) -> String {
+    serde_json::json!({"command": ["add", "chapter", direction.offset()]}).to_string()
+}
+
 /// Navigate to the next or previous chapter in mpv.
 ///
 /// # Errors
 ///
-/// Returns an error if no mpv IPC socket is available.
+/// Returns [`crate::error::MediaControlError::MpvIpc`] with kind `NoSocket`
+/// if no mpv IPC socket is available.
 ///
 /// # Example
 ///
@@ -42,8 +54,7 @@ impl ChapterDirection {
 /// # }
 /// ```
 pub async fn chapter(direction: ChapterDirection) -> Result<()> {
-    let payload = format!(r#"{{"command":["add","chapter",{}]}}"#, direction.offset());
-    send_mpv_ipc_command(&payload).await
+    send_mpv_ipc_command(&build_payload(direction)).await
 }
 
 #[cfg(test)]
@@ -58,16 +69,17 @@ mod tests {
 
     #[test]
     fn mpv_command_format() {
-        let next_cmd = format!(
-            r#"{{"command":["add","chapter",{}]}}"#,
-            ChapterDirection::Next.offset()
-        );
-        assert_eq!(next_cmd, r#"{"command":["add","chapter",1]}"#);
+        // Parse rather than string-compare so the test doesn't depend on
+        // serde_json's whitespace/key-ordering choices.
+        let next: serde_json::Value =
+            serde_json::from_str(&build_payload(ChapterDirection::Next)).unwrap();
+        let cmd = next["command"].as_array().unwrap();
+        assert_eq!(cmd[0], "add");
+        assert_eq!(cmd[1], "chapter");
+        assert_eq!(cmd[2], 1);
 
-        let prev_cmd = format!(
-            r#"{{"command":["add","chapter",{}]}}"#,
-            ChapterDirection::Prev.offset()
-        );
-        assert_eq!(prev_cmd, r#"{"command":["add","chapter",-1]}"#);
+        let prev: serde_json::Value =
+            serde_json::from_str(&build_payload(ChapterDirection::Prev)).unwrap();
+        assert_eq!(prev["command"][2], -1);
     }
 }

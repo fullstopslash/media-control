@@ -13,6 +13,11 @@ fn build_payload(percent: u8) -> String {
 /// Seek to an absolute percentage position in mpv.
 ///
 /// `percent` should be 0–100; values above 100 are clamped.
+///
+/// # Errors
+///
+/// Returns [`crate::error::MediaControlError::MpvIpc`] with kind `NoSocket`
+/// if no mpv IPC socket is available.
 pub async fn seek(percent: u8) -> Result<()> {
     send_mpv_ipc_command(&build_payload(percent)).await
 }

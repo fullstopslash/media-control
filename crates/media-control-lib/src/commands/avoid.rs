@@ -19,11 +19,12 @@
 //! 4. **Fullscreen non-media**: When a non-media app is fullscreen, move all
 //!    media windows out of the way.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use tokio::fs;
 
-use super::{CommandContext, get_suppress_file_path, restore_focus, suppress_avoider};
+use super::{
+    CommandContext, get_suppress_file_path, move_pixel_action, now_unix_millis,
+    resize_pixel_action, restore_focus, suppress_avoider,
+};
 use crate::error::Result;
 use crate::hyprland::Client;
 use crate::window::MediaWindow;
@@ -80,8 +81,7 @@ fn get_position_pair(
 ) -> PositionPair {
     let positions = &ctx.config.positions;
     let positioning = &ctx.config.positioning;
-    let resolve = |name: &str| super::resolve_effective_position(ctx, name);
-    let resolve_or = |name: &str, default: i32| resolve(name).unwrap_or(default);
+    let resolve_or = |name: &str, default: i32| super::resolve_position_or(ctx, name, default);
 
     // Default positions (adjusted for minified mode)
     let default_primary_x = resolve_or(&positioning.default_x, positions.x_right);
@@ -92,7 +92,10 @@ fn get_position_pair(
     // Check for class/title override (case-insensitive class, regex title)
     if let Some(o) = positioning.get_override(focused_class, focused_title) {
         let override_or = |field: &Option<String>, default: i32| -> i32 {
-            field.as_ref().and_then(|s| resolve(s)).unwrap_or(default)
+            field
+                .as_ref()
+                .and_then(|s| super::resolve_effective_position(ctx, s))
+                .unwrap_or(default)
         };
         return PositionPair {
             primary_x: override_or(&o.pref_x, default_primary_x),
@@ -128,9 +131,7 @@ fn calculate_target_position(
 ) -> (i32, i32) {
     let positioning = &ctx.config.positioning;
     let positions = &ctx.config.positions;
-    let resolve_or = |name: &str, default: i32| {
-        super::resolve_effective_position(ctx, name).unwrap_or(default)
-    };
+    let resolve_or = |name: &str, default: i32| super::resolve_position_or(ctx, name, default);
 
     // Use effective positions (adjusted for minified mode)
     let x_left = resolve_or("x_left", positions.x_left);
@@ -199,10 +200,7 @@ async fn move_media_window(
     suppress_avoider().await;
 
     ctx.hyprland
-        .batch(&[
-            &format!("dispatch movewindowpixel exact {x} {y},address:{addr}"),
-            &format!("dispatch resizewindowpixel exact {w} {h},address:{addr}"),
-        ])
+        .dispatch_batch(&[&move_pixel_action(addr, x, y), &resize_pixel_action(addr, w, h)])
         .await?;
 
     Ok(())
@@ -246,14 +244,7 @@ async fn should_suppress(suppress_timeout_ms: u64) -> bool {
         return false;
     };
 
-    let now = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX);
-
+    let now = u64::try_from(now_unix_millis()).unwrap_or(u64::MAX);
     now.saturating_sub(timestamp_ms) < suppress_timeout_ms
 }
 
@@ -284,7 +275,7 @@ struct FocusedWindow<'a> {
 
 impl<'a> FocusedWindow<'a> {
     fn find(clients: &'a [Client], ctx: &CommandContext) -> Option<Self> {
-        let focused = clients.iter().find(|c| c.focus_history_id == 0)?;
+        let focused = clients.iter().find(|c| c.is_focused())?;
         let is_media = ctx.window_matcher.matches(focused).is_some();
 
         Some(Self {
@@ -310,8 +301,7 @@ fn count_other_windows(clients: &[Client], workspace_id: i32, ctx: &CommandConte
         .iter()
         .filter(|c| {
             c.workspace.id == workspace_id
-                && c.mapped
-                && !c.hidden
+                && c.is_visible()
                 && ctx.window_matcher.matches(c).is_none()
         })
         .count()
@@ -538,8 +528,7 @@ async fn handle_mouseover_geometry(
         clients.iter().any(|c| {
             c.address != focused.address
                 && c.workspace.id == focused.workspace_id
-                && c.mapped
-                && !c.hidden
+                && c.is_visible()
                 && rect_overlaps_xywh(x, y, w, h, c)
         })
     };
@@ -713,13 +702,10 @@ mod tests {
 
     // --- E2E tests using mock Hyprland ---
 
-    /// Helper: create a config with suppress_ms=0 to disable suppression in tests.
-    /// This avoids race conditions from the shared suppress file in parallel tests.
-    fn test_config() -> Config {
-        let mut config = Config::default();
-        config.positioning.suppress_ms = 0;
-        config
-    }
+    /// Re-export the shared no-suppress config under the local name the
+    /// existing tests expect. Centralised in `test_helpers` so the same
+    /// fixture is reused by `commands::fullscreen::tests`.
+    use crate::test_helpers::test_config_no_suppress as test_config;
 
     /// Helper: build clients JSON for the mock. Firefox focused (focus_history_id=0),
     /// mpv pinned+floating at the given position.

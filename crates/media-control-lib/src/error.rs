@@ -41,6 +41,9 @@ pub enum HyprlandIpcErrorKind {
     ParseError,
     /// Socket path not found (HYPRLAND_INSTANCE_SIGNATURE not set).
     SocketNotFound,
+    /// Hyprland accepted the request but replied with a non-OK status
+    /// (semantic rejection — distinct from a parse failure).
+    Rejected,
 }
 
 impl std::fmt::Display for HyprlandIpcErrorKind {
@@ -49,6 +52,7 @@ impl std::fmt::Display for HyprlandIpcErrorKind {
             Self::ConnectionFailed => write!(f, "failed to connect to Hyprland socket"),
             Self::ParseError => write!(f, "failed to parse Hyprland response"),
             Self::SocketNotFound => write!(f, "Hyprland socket not found"),
+            Self::Rejected => write!(f, "Hyprland rejected command"),
         }
     }
 }
@@ -106,15 +110,40 @@ pub enum MediaControlError {
     /// HTTP request error.
     #[error("HTTP request error: {0}")]
     Http(#[from] reqwest::Error),
+
+    /// Invalid argument supplied by the caller.
+    ///
+    /// Used when input fails validation *before* any IPC or external call is
+    /// attempted (e.g. a CLI token exceeds a length cap). Distinct from
+    /// `MpvIpc`/`HyprlandIpc` so callers and logs can tell "user input was
+    /// rejected" apart from "remote endpoint failed".
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 impl From<crate::hyprland::HyprlandError> for MediaControlError {
     fn from(err: crate::hyprland::HyprlandError) -> Self {
         use crate::hyprland::HyprlandError;
         match err {
-            HyprlandError::MissingEnvVar(_) => Self::HyprlandIpc {
+            // Preserve the missing env-var name in the source chain so
+            // operators can tell from the log alone which env var was the
+            // culprit (XDG_RUNTIME_DIR vs HYPRLAND_INSTANCE_SIGNATURE).
+            HyprlandError::MissingEnvVar(name) => Self::HyprlandIpc {
                 kind: HyprlandIpcErrorKind::SocketNotFound,
-                source: None,
+                source: Some(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("missing environment variable: {name}"),
+                )),
+            },
+            // Distinct from `MissingEnvVar`: the var *is* set but its content
+            // failed validation (path traversal, NUL byte, separator, ...).
+            // Operators reading the log can tell "you forgot to set it" from
+            // "you set it to something dangerous".
+            HyprlandError::InvalidEnvVar(name) => Self::HyprlandIpc {
+                kind: HyprlandIpcErrorKind::SocketNotFound,
+                source: Some(std::io::Error::other(format!(
+                    "invalid environment variable: {name}"
+                ))),
             },
             HyprlandError::ConnectionFailed(e)
             | HyprlandError::WriteFailed(e)
@@ -122,12 +151,14 @@ impl From<crate::hyprland::HyprlandError> for MediaControlError {
                 kind: HyprlandIpcErrorKind::ConnectionFailed,
                 source: Some(e),
             },
-            HyprlandError::JsonParseFailed(e) => Self::HyprlandIpc {
-                kind: HyprlandIpcErrorKind::ParseError,
-                source: Some(std::io::Error::other(e.to_string())),
-            },
+            // Route JSON parse failures into the typed `Json` variant so the
+            // original `serde_json::Error` (with its line/column position) is
+            // preserved end-to-end instead of being flattened to a string.
+            HyprlandError::JsonParseFailed(e) => Self::Json(e),
+            // Hyprland accepted the IPC request but replied non-OK — that's a
+            // semantic rejection, not a transport or parse failure.
             HyprlandError::CommandFailed(msg) => Self::HyprlandIpc {
-                kind: HyprlandIpcErrorKind::ParseError,
+                kind: HyprlandIpcErrorKind::Rejected,
                 source: Some(std::io::Error::other(msg)),
             },
         }
@@ -151,6 +182,11 @@ impl MediaControlError {
             kind: MpvIpcErrorKind::ConnectionFailed,
             message: msg.into(),
         }
+    }
+
+    /// Create an invalid-argument error for input that failed pre-IPC validation.
+    pub fn invalid_argument(msg: impl Into<String>) -> Self {
+        Self::InvalidArgument(msg.into())
     }
 }
 
@@ -264,6 +300,10 @@ mod tests {
         assert_eq!(
             HyprlandIpcErrorKind::SocketNotFound.to_string(),
             "Hyprland socket not found"
+        );
+        assert_eq!(
+            HyprlandIpcErrorKind::Rejected.to_string(),
+            "Hyprland rejected command"
         );
     }
 

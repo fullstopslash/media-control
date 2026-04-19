@@ -55,6 +55,17 @@ Add these when applicable:
 
 To commit, use the global recipe: `just -g commit "message"` — this describes, bookmarks, and pushes via jj in one step.
 
+## Code Intelligence (narsil-mcp + forgemax)
+
+**narsil-mcp** is available as an MCP server providing tree-sitter-based symbol lookup, call graphs, git integration, and security scanning across repos.
+
+Key usage rules:
+- Always start a session with `list_repos` or `get_index_status` to confirm which repos are indexed
+- Parameter names: `repo` (not `repo_path`), `symbol` (not `symbol_name`), `path` (not `file_path`)
+- Server is launched with `--preset balanced` (51 tools) — omit `--preset full` unless you need the extra tools
+
+**forgemax** collapses narsil-mcp (and any other configured backends) into two tools: `search` and `execute`. Use it when you want a single MCP entry point with constant ~1,100 token context cost. Config lives at `~/.config/forgemax/forge.toml`.
+
 ## Project Management
 
 Keep `todo.md` in the repo root up to date — the-desk reads it for project tracking.

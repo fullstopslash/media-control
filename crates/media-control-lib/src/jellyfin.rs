@@ -43,8 +43,49 @@ pub enum JellyfinError {
     #[error("session has no currently playing item")]
     NoPlayingItem,
 
+    /// An identifier supplied to a path-building API contains characters that
+    /// could escape the URL path (e.g. `/`, `..`, control chars).
+    ///
+    /// Jellyfin item, session, series, and library IDs are server-supplied and
+    /// must be treated as untrusted input — a hostile server could return an ID
+    /// like `../../admin` to traverse to unintended endpoints.
+    #[error("invalid {kind} id: {value:?} (must contain only [A-Za-z0-9._-])")]
+    InvalidId { kind: &'static str, value: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Validate that an ID is safe to interpolate into a URL path segment.
+///
+/// Note: this validator is for Jellyfin *path segments* — it rejects
+/// characters that would escape a URL path segment (`/`, `?`, `#`, `\`,
+/// control chars, etc.). It does **not** validate that the ID matches any
+/// particular Jellyfin format (GUID, UUID, slug, …); a well-formed but
+/// nonexistent ID will pass this check and fail later at the API call.
+///
+/// Jellyfin uses GUID-style hex IDs (32 chars) for items/sessions/users, but
+/// older endpoints occasionally return IDs with `-` or `_`. We accept the
+/// conservative `[A-Za-z0-9._-]` and reject anything else — particularly
+/// `/`, `?`, `#`, `\`, and control characters that would let a hostile
+/// server response escape the intended URL path.
+///
+/// Empty IDs are rejected because they would produce a `//` in the URL,
+/// which most servers normalise to a different endpoint.
+fn validate_id(kind: &'static str, id: &str) -> Result<()> {
+    // Reject empty, `.`, and `..` outright. The character allowlist (which
+    // includes `.`) would otherwise accept these path-traversal forms;
+    // they're meaningful only as filesystem components, never as Jellyfin IDs.
+    let bad_charset = !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if id.is_empty() || id == "." || id == ".." || bad_charset {
+        return Err(JellyfinError::InvalidId {
+            kind,
+            value: id.to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub type Result<T> = std::result::Result<T, JellyfinError>;
@@ -324,29 +365,37 @@ impl JellyfinClient {
     /// Returns an error if the file doesn't exist, exceeds the size cap, or
     /// can't be parsed.
     pub async fn load_credentials() -> Result<Credentials> {
+        use tokio::io::AsyncReadExt;
+
         let cred_path = Self::default_cred_path().ok_or_else(|| {
             JellyfinError::CredentialsNotFound(PathBuf::from(
                 "~/.config/jellyfin-mpv-shim/cred.json",
             ))
         })?;
 
-        // Use metadata to check existence + size in one syscall pair.
-        let meta = match tokio::fs::metadata(&cred_path).await {
-            Ok(m) => m,
+        // Open once, then enforce the size cap on the live reader. Doing the
+        // size check via `metadata()` followed by `read_to_string()` is a
+        // TOCTOU bug — the file can grow between the two calls. Wrapping the
+        // reader in `.take(MAX + 1)` lets us detect oversize atomically: if
+        // we read more than MAX bytes, the file is too large.
+        let file = match tokio::fs::File::open(&cred_path).await {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(JellyfinError::CredentialsNotFound(cred_path));
             }
             Err(e) => return Err(JellyfinError::Io(e)),
         };
 
-        if meta.len() > MAX_CRED_FILE_BYTES {
+        let mut content = String::new();
+        let mut limited = file.take(MAX_CRED_FILE_BYTES + 1);
+        let read = limited.read_to_string(&mut content).await?;
+
+        if read as u64 > MAX_CRED_FILE_BYTES {
             return Err(JellyfinError::CredentialsTooLarge {
-                size: meta.len(),
+                size: read as u64,
                 max: MAX_CRED_FILE_BYTES,
             });
         }
-
-        let content = tokio::fs::read_to_string(&cred_path).await?;
 
         // The credential file is an array; we use the first entry.
         let creds: Vec<Credentials> = serde_json::from_str(&content)?;
@@ -385,7 +434,25 @@ impl JellyfinClient {
     /// failures map to a single, well-typed error. The `hostname` is
     /// sanitised before interpolation so a hostile `gethostname()` cannot
     /// inject quoting characters into the auth header.
+    ///
+    /// `token` and `device_id` are checked for `"`, `\`, CR, LF, and NUL
+    /// before interpolation into the quoted MediaBrowser auth header format.
+    /// `HeaderValue::from_str` would reject CR/LF/NUL anyway, but we want a
+    /// typed error (`InvalidHeader`) — and to specifically rule out `"` /
+    /// `\` which could close the quoted string and smuggle additional
+    /// `Key="value"` pairs into the auth header.
     fn build_default_headers(credentials: &Credentials, hostname: &str) -> Result<HeaderMap> {
+        fn header_quote_safe(s: &str) -> bool {
+            s.bytes()
+                .all(|b| b != b'"' && b != b'\\' && b != b'\r' && b != b'\n' && b != 0)
+        }
+        if !header_quote_safe(&credentials.device_id) {
+            return Err(JellyfinError::InvalidHeader("authorization (device_id)"));
+        }
+        if !header_quote_safe(&credentials.token) {
+            return Err(JellyfinError::InvalidHeader("authorization (token)"));
+        }
+
         let safe_host = Self::sanitize_header_value(hostname);
         // Build authorization header in MediaBrowser format
         let auth_header = format!(
@@ -422,9 +489,16 @@ impl JellyfinClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP client can't be built or a header value
-    /// is invalid.
+    /// Returns an error if the HTTP client can't be built, a header value is
+    /// invalid, or `credentials.user_id` / `credentials.device_id` contain
+    /// characters unsafe for a URL path segment or HTTP header value.
     pub fn new(credentials: Credentials) -> Result<Self> {
+        // user_id is interpolated into URL paths in many endpoints; device_id
+        // rides in headers. Validate both up front so a broken cred.json is
+        // caught at startup, not on first request.
+        validate_id("user", &credentials.user_id)?;
+        validate_id("device", &credentials.device_id)?;
+
         // Lossy is fine: hostname is identification, not a security boundary.
         // `to_string_lossy()` returns a `Cow` that borrows the OsString when
         // it's already UTF-8 — only an invalid sequence triggers an alloc.
@@ -541,23 +615,53 @@ impl JellyfinClient {
 
     /// Find the active mpv-shim session.
     ///
-    /// Prefers the Rust mpv-shim (client="mpv-shim") over the legacy Python shim.
-    /// Falls back to any session with "mpv" in the client name.
+    /// Prefers same-device sessions to avoid controlling MPV on a foreign host.
+    /// Within the same device, prefers the Rust mpv-shim (client="mpv-shim")
+    /// over the legacy Python shim. Falls back to any session with "mpv" in
+    /// the client name only when no same-device session exists, and emits a
+    /// warning when doing so.
     pub async fn find_mpv_session(&self) -> Result<Option<Session>> {
         let sessions = self.fetch_sessions().await?;
 
-        let mpv_sessions: Vec<_> = sessions
+        // Drop self-sessions (media-control's own connection) up front.
+        let candidates: Vec<Session> = sessions
             .into_iter()
             .filter(|s| s.client != "media-control")
-            .filter(|s| s.device_id == self.device_id || s.client.to_lowercase().contains("mpv"))
             .collect();
 
-        // Prefer Rust shim (client="mpv-shim") over legacy Python shim
-        if let Some(s) = mpv_sessions.iter().find(|s| s.client == "mpv-shim") {
-            return Ok(Some(s.clone()));
+        // Prefer same-device sessions: this prevents media-control on machine A
+        // from controlling MPV on machine B.
+        let mut same_device: Vec<Session> = candidates
+            .iter()
+            .filter(|s| s.device_id == self.device_id)
+            .cloned()
+            .collect();
+
+        if !same_device.is_empty() {
+            // Within same-device hits, prefer the Rust mpv-shim over the
+            // legacy Python shim. swap_remove is O(1) and avoids cloning.
+            if let Some(idx) = same_device.iter().position(|s| s.client == "mpv-shim") {
+                return Ok(Some(same_device.swap_remove(idx)));
+            }
+            return Ok(same_device.into_iter().next());
         }
 
-        // Fall back to any mpv session
+        // Fall back to client-name matching only if no same-device session
+        // exists. This is a last resort; warn so the operator notices.
+        let mut mpv_sessions: Vec<Session> = candidates
+            .into_iter()
+            .filter(|s| s.client.to_lowercase().contains("mpv"))
+            .collect();
+
+        if mpv_sessions.is_empty() {
+            return Ok(None);
+        }
+
+        tracing::warn!("no same-device MPV session found; controlling foreign device session");
+
+        if let Some(idx) = mpv_sessions.iter().position(|s| s.client == "mpv-shim") {
+            return Ok(Some(mpv_sessions.swap_remove(idx)));
+        }
         Ok(mpv_sessions.into_iter().next())
     }
 
@@ -572,8 +676,10 @@ impl JellyfinClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails.
+    /// Returns an error if `session_id` contains characters unsafe for a URL
+    /// path segment, or the HTTP request fails.
     pub async fn stop(&self, session_id: &str) -> Result<()> {
+        validate_id("session", session_id)?;
         let path = format!("Sessions/{session_id}/Playing/Stop");
         self.post_empty(&path, &[]).await
     }
@@ -588,9 +694,12 @@ impl JellyfinClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails.
+    /// Returns an error if `item_id` contains characters unsafe for a URL
+    /// path segment, or the HTTP request fails.
     pub async fn mark_watched(&self, item_id: &str) -> Result<()> {
-        let path = format!("Users/{}/PlayedItems/{item_id}", self.user_id);
+        validate_id("item", item_id)?;
+        let user_id = &self.user_id;
+        let path = format!("Users/{user_id}/PlayedItems/{item_id}");
         self.post_empty(&path, &[]).await
     }
 
@@ -615,8 +724,10 @@ impl JellyfinClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails.
+    /// Returns an error if `series_id` contains characters unsafe for a URL
+    /// path segment, or the HTTP request fails.
     pub async fn get_next_up(&self, series_id: &str) -> Result<Option<String>> {
+        validate_id("series", series_id)?;
         let path = format!("Shows/{series_id}/NextUp");
         let response: NextUpResponse = self
             .get_json(&path, &[("UserId", &self.user_id)])
@@ -641,8 +752,15 @@ impl JellyfinClient {
     /// Get the resume position (in ticks) for an item.
     ///
     /// Returns 0 if the item has never been played or has no resume position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `item_id` contains characters unsafe for a URL
+    /// path segment, or the HTTP request fails.
     pub async fn get_item_resume_ticks(&self, item_id: &str) -> Result<i64> {
-        let path = format!("Users/{}/Items/{item_id}", self.user_id);
+        validate_id("item", item_id)?;
+        let user_id = &self.user_id;
+        let path = format!("Users/{user_id}/Items/{item_id}");
         let response: ItemDetail = self.get_json(&path, &[]).await?;
         Ok(response
             .user_data
@@ -652,12 +770,22 @@ impl JellyfinClient {
     /// Start playing an item in a session with optional resume position.
     ///
     /// Like `play_item()` but appends `StartPositionTicks` when non-zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `session_id` or `item_id` contain characters unsafe
+    /// for a URL path segment, or the HTTP request fails.
     pub async fn play_item_with_resume(
         &self,
         session_id: &str,
         item_id: &str,
         start_ticks: i64,
     ) -> Result<()> {
+        validate_id("session", session_id)?;
+        // `item_id` rides in the query string, but a hostile value with `&`
+        // or `=` could still smuggle extra parameters, and it ultimately
+        // identifies a path entity downstream — validate it the same way.
+        validate_id("item", item_id)?;
         let path = format!("Sessions/{session_id}/Playing");
         let start_ticks_str;
         let mut query: Vec<(&str, &str)> = vec![
@@ -680,9 +808,18 @@ impl JellyfinClient {
     ///
     /// Takes ownership of `item_ids` to avoid an extra clone — the underlying
     /// `PlayCommand` payload owns its `Vec<String>` regardless.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `session_id` or any element of `item_ids` contains
+    /// characters unsafe for a URL path segment, or the HTTP request fails.
     pub async fn play_items(&self, session_id: &str, item_ids: Vec<String>) -> Result<()> {
         if item_ids.is_empty() {
             return Ok(());
+        }
+        validate_id("session", session_id)?;
+        for id in &item_ids {
+            validate_id("item", id)?;
         }
 
         let playback_info = self.fetch_playback_info(&item_ids[0]).await?;
@@ -718,6 +855,7 @@ impl JellyfinClient {
 
     /// Fetch playback info for an item.
     async fn fetch_playback_info(&self, item_id: &str) -> Result<PlaybackInfoResponse> {
+        validate_id("item", item_id)?;
         let path = format!("Items/{item_id}/PlaybackInfo");
         self.post_json(
             &path,
@@ -779,18 +917,39 @@ impl JellyfinClient {
             return self.play_items(&session_id, remaining).await;
         }
 
-        // Queue empty — use NextUp API to find the next episode in the series
-        if let Some(sid) = series_id
-            && let Ok(Some(next_id)) = self.get_next_up(&sid).await
-        {
-            return self.play_item(&session_id, &next_id).await;
+        // Queue empty — use NextUp API to find the next episode in the series.
+        // We log-and-continue on `get_next_up` failure rather than propagating:
+        // marking-watched already succeeded, and a NextUp lookup miss (network
+        // blip, transient 5xx) shouldn't surface as a hard error to the caller.
+        // Silently swallowing the `Err` would make a misconfigured server look
+        // like "no next episode" forever, so we warn.
+        if let Some(sid) = series_id {
+            match self.get_next_up(&sid).await {
+                Ok(Some(next_id)) => {
+                    return self.play_item(&session_id, &next_id).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        series_id = %sid,
+                        error = %e,
+                        "get_next_up failed after mark_watched; no next episode played"
+                    );
+                }
+            }
         }
 
         Ok(())
     }
 
     /// Get the library that an item belongs to via the Ancestors API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `item_id` contains characters unsafe for a URL
+    /// path segment, or the HTTP request fails.
     pub async fn get_item_library(&self, item_id: &str) -> Result<Option<LibraryInfo>> {
+        validate_id("item", item_id)?;
         let path = format!("Items/{item_id}/Ancestors");
         let ancestors: Vec<AncestorItem> = self.get_json(&path, &[]).await?;
 
@@ -820,7 +979,11 @@ impl JellyfinClient {
         exclude_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<ItemSummary>> {
-        let path = format!("Users/{}/Items", self.user_id);
+        validate_id("library", library_id)?;
+        if let Some(exc) = exclude_id {
+            validate_id("item", exc)?;
+        }
+        let path = self.user_items_path();
         let limit_str = limit.to_string();
         let mut query: Vec<(&str, &str)> = vec![
             ("ParentId", library_id),
@@ -843,8 +1006,14 @@ impl JellyfinClient {
     /// Get items in a collection (box set).
     ///
     /// Returns items sorted by their index/production year within the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `collection_id` contains characters unsafe for a
+    /// URL query parameter, or the HTTP request fails.
     pub async fn get_collection_items(&self, collection_id: &str) -> Result<Vec<ItemSummary>> {
-        let path = format!("Users/{}/Items", self.user_id);
+        validate_id("collection", collection_id)?;
+        let path = self.user_items_path();
         let query = [
             ("ParentId", collection_id),
             ("SortBy", "SortName,ProductionYear"),
@@ -853,6 +1022,16 @@ impl JellyfinClient {
         ];
         let response: ItemsResponse = self.get_json(&path, &query).await?;
         Ok(response.items)
+    }
+
+    /// Build the `Users/{user_id}/Items` path.
+    ///
+    /// `user_id` was validated at credential-load time (it goes into headers
+    /// too) so we don't re-validate here. Centralised so the format string
+    /// lives in one place.
+    fn user_items_path(&self) -> String {
+        let user_id = &self.user_id;
+        format!("Users/{user_id}/Items")
     }
 
     /// Get the server URL.
@@ -1343,6 +1522,123 @@ mod tests {
         // can't tell *which* field was missing from `cred.json`.
         let err = JellyfinError::InvalidCredentials("no credentials in file");
         assert!(err.to_string().contains("no credentials in file"));
+    }
+
+    #[test]
+    fn validate_id_accepts_real_jellyfin_ids() {
+        // Standard 32-char GUIDs and dash-separated UUIDs.
+        assert!(validate_id("item", "abc123def456").is_ok());
+        assert!(validate_id("user", "77c2f402-7180-4d84-a2f7-8d832b89e241").is_ok());
+        assert!(validate_id("device", "device_id_with_underscores").is_ok());
+        assert!(validate_id("session", "session.with.dots").is_ok());
+    }
+
+    #[test]
+    fn validate_id_rejects_path_traversal() {
+        // The whole point of validation: path-traversal attempts must fail
+        // before reaching `format!()`.
+        for evil in [
+            "../admin",
+            "..",
+            "abc/def",
+            "abc\\def",
+            "abc?query=1",
+            "abc#frag",
+            "abc%2F",
+            "abc def", // space
+            "abc;rm -rf /",
+            "\0null",
+            "abc\nnewline",
+        ] {
+            let err = validate_id("item", evil)
+                .expect_err(&format!("expected reject for {evil:?}"));
+            assert!(matches!(err, JellyfinError::InvalidId { .. }));
+        }
+    }
+
+    #[test]
+    fn validate_id_rejects_empty() {
+        // Empty IDs would produce `//` in URL paths — different endpoint.
+        let err = validate_id("item", "").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidId { kind: "item", .. }));
+    }
+
+    #[test]
+    fn invalid_id_displays_kind_and_value() {
+        // The Display impl must surface both the kind and offending value
+        // so the user can diagnose without `Debug`.
+        let err = JellyfinError::InvalidId {
+            kind: "item",
+            value: "../admin".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("item"), "kind missing: {msg}");
+        assert!(msg.contains("../admin"), "value missing: {msg}");
+    }
+
+    #[test]
+    fn jellyfin_client_new_rejects_invalid_user_id() {
+        // A hostile cred.json with a path-traversal user_id must be rejected
+        // at construction time, not on first API call.
+        let creds = Credentials {
+            server: "http://example.com".into(),
+            user_id: "../admin".into(),
+            token: "tok".into(),
+            device_id: "did".into(),
+        };
+        let err = JellyfinClient::new(creds).unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidId { kind: "user", .. }));
+    }
+
+    #[test]
+    fn build_default_headers_rejects_quote_in_token() {
+        // A token with a literal `"` could close the auth header's quoted
+        // section and smuggle additional `Key="value"` pairs.
+        let creds = Credentials {
+            server: "http://example.com".into(),
+            user_id: "u1".into(),
+            token: "tok\"injected".into(),
+            device_id: "did".into(),
+        };
+        let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidHeader(s) if s.contains("token")));
+    }
+
+    #[test]
+    fn build_default_headers_rejects_backslash_in_device_id() {
+        let creds = Credentials {
+            server: "http://example.com".into(),
+            user_id: "u1".into(),
+            token: "tok".into(),
+            device_id: "did\\\"smuggle".into(),
+        };
+        let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidHeader(s) if s.contains("device_id")));
+    }
+
+    #[test]
+    fn build_default_headers_rejects_crlf_in_token() {
+        // CRLF in a header value could smuggle a whole new HTTP header.
+        let creds = Credentials {
+            server: "http://example.com".into(),
+            user_id: "u1".into(),
+            token: "tok\r\nX-Admin: yes".into(),
+            device_id: "did".into(),
+        };
+        let err = JellyfinClient::build_default_headers(&creds, "host").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidHeader(_)));
+    }
+
+    #[test]
+    fn jellyfin_client_new_rejects_invalid_device_id() {
+        let creds = Credentials {
+            server: "http://example.com".into(),
+            user_id: "u1".into(),
+            token: "tok".into(),
+            device_id: "evil/id".into(),
+        };
+        let err = JellyfinClient::new(creds).unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidId { kind: "device", .. }));
     }
 }
 

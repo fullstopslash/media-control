@@ -37,6 +37,13 @@ pub enum HyprlandError {
     #[error("missing environment variable: {0}")]
     MissingEnvVar(&'static str),
 
+    /// The named environment variable is set, but its content failed
+    /// validation (path traversal, NUL byte, separator, empty, ...).
+    /// Distinct from `MissingEnvVar` so log readers can tell "unset" from
+    /// "dangerously set".
+    #[error("invalid environment variable: {0}")]
+    InvalidEnvVar(&'static str),
+
     #[error("socket connection failed: {0}")]
     ConnectionFailed(#[source] std::io::Error),
 
@@ -87,6 +94,38 @@ pub struct Client {
     pub focus_history_id: i32,
 }
 
+impl Client {
+    /// True iff the client is mapped and not hidden — the canonical
+    /// "user-visible window" predicate used by every focus / overlap query.
+    ///
+    /// Centralised so the `c.mapped && !c.hidden` pattern lives in exactly
+    /// one place and a future visibility flag (e.g. `urgent`, workspace
+    /// occlusion) can extend it without hunting down every filter site.
+    #[inline]
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        self.mapped && !self.hidden
+    }
+
+    /// True iff this client is the currently-focused window
+    /// (`focus_history_id == 0`).
+    #[inline]
+    #[must_use]
+    pub fn is_focused(&self) -> bool {
+        self.focus_history_id == 0
+    }
+
+    /// True iff this client has *ever* been focused — i.e. its history id is
+    /// non-negative. Hyprland uses `-1` for windows that were created but
+    /// never received focus (these should be excluded from focus-restore
+    /// candidates).
+    #[inline]
+    #[must_use]
+    pub fn has_focus_history(&self) -> bool {
+        self.focus_history_id >= 0
+    }
+}
+
 /// Monitor data from Hyprland's `j/monitors` command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,17 +163,22 @@ pub struct HyprlandClient {
 /// or if `name` is empty / contains separators / contains `..`.
 pub fn runtime_socket_path(name: &str) -> Result<PathBuf> {
     /// Reject empty / multi-component / traversal-laden path components.
+    /// NUL bytes are rejected because most filesystems treat them as a
+    /// terminator, which would silently truncate the resulting path.
     fn is_safe_component(s: &str) -> bool {
         !s.is_empty()
             && !s.contains('/')
             && !s.contains('\\')
             && !s.contains('\0')
-            && s != ".."
+            && !s.contains("..")
             && s != "."
     }
 
+    // The `name` argument is supplied by the caller, not the environment.
+    // Treat a bad value as a validation failure on the env var that would
+    // otherwise hold this kind of component (the instance signature).
     if !is_safe_component(name) {
-        return Err(HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
+        return Err(HyprlandError::InvalidEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
     }
 
     let runtime_dir = env::var("XDG_RUNTIME_DIR")
@@ -148,15 +192,15 @@ pub fn runtime_socket_path(name: &str) -> Result<PathBuf> {
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        return Err(HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"));
+        // Var was set, but its content is unsafe — this is `Invalid`, not `Missing`.
+        return Err(HyprlandError::InvalidEnvVar("XDG_RUNTIME_DIR"));
     }
-    if instance_sig.is_empty()
-        || instance_sig.contains('/')
-        || instance_sig.contains('\\')
-        || instance_sig.contains("..")
-        || instance_sig.starts_with('.')
-    {
-        return Err(HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
+    // Reuse `is_safe_component` for instance_sig — same threat model
+    // (path-traversal, NUL-byte truncation, separator injection). Also
+    // reject signatures starting with `.` so an attacker can't squat on a
+    // hidden directory the user might not notice in `ls`.
+    if !is_safe_component(&instance_sig) || instance_sig.starts_with('.') {
+        return Err(HyprlandError::InvalidEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
     }
 
     Ok(runtime.join("hypr").join(instance_sig).join(name))
@@ -209,9 +253,16 @@ impl HyprlandClient {
     /// 2. Write command bytes
     /// 3. Read response (may be empty, "ok", or JSON)
     ///
-    /// Times out after 2 seconds per attempt. Retries once after 50ms on
-    /// connection failure (covers transient socket busy during compositor
-    /// transitions like fullscreen toggle).
+    /// Times out after 2 seconds per attempt. Retries once after 50ms only on
+    /// `ConnectionFailed` — covers transient socket-busy during compositor
+    /// transitions (e.g. fullscreen toggle) where the connect itself fails
+    /// before any bytes have been written.
+    ///
+    /// `WriteFailed` and `ReadFailed` are *not* retried: a partial write may
+    /// have already dispatched the command on the compositor side, and
+    /// re-sending a non-idempotent dispatch (e.g. `dispatch fullscreen`)
+    /// would toggle state twice. `CommandFailed` (semantic errors from
+    /// Hyprland) are also never retried.
     pub async fn command(&self, cmd: &str) -> Result<String> {
         match self
             .command_attempt(cmd, "Hyprland IPC timed out after 2s")
@@ -220,12 +271,17 @@ impl HyprlandClient {
             Ok(resp) => Ok(resp),
             Err(HyprlandError::ConnectionFailed(_)) => {
                 tokio::time::sleep(Self::RETRY_DELAY).await;
-                self.command_attempt(cmd, "Hyprland IPC timed out after 2s (retry)")
+                self.command_attempt(cmd, "Hyprland IPC timed out after 2s (attempt 2)")
                     .await
             }
             Err(e) => Err(e),
         }
     }
+
+    /// Hard cap on the response read. Real Hyprland responses (even a fully
+    /// populated `j/clients` payload) are well under this; the cap exists so
+    /// a misbehaving or malicious peer can't drive us OOM.
+    const MAX_RESPONSE_BYTES: u64 = 65_536;
 
     async fn command_inner(&self, cmd: &str) -> Result<String> {
         let mut stream = UnixStream::connect(&self.socket_path)
@@ -243,8 +299,11 @@ impl HyprlandClient {
             .await
             .map_err(HyprlandError::WriteFailed)?;
 
+        // Bound the read so a runaway peer can't exhaust memory; 64 KiB is
+        // far more headroom than any real Hyprland response needs.
         let mut response = String::new();
         stream
+            .take(Self::MAX_RESPONSE_BYTES)
             .read_to_string(&mut response)
             .await
             .map_err(HyprlandError::ReadFailed)?;
@@ -253,9 +312,14 @@ impl HyprlandClient {
     }
 
     /// Check if a Hyprland IPC response indicates success.
+    ///
+    /// Accepts only an empty body, a bare `"ok"`, or `"ok\n"`-prefixed
+    /// multi-line responses. The previous `starts_with("ok")` check would
+    /// have matched `"oklahoma_failed"` and any other word starting with
+    /// `ok`, masking real failures.
     #[inline]
     fn is_success(response: &str) -> bool {
-        response.is_empty() || response.starts_with("ok")
+        response.is_empty() || response == "ok" || response.starts_with("ok\n")
     }
 
     /// Send a command and require a success response.
@@ -299,6 +363,9 @@ impl HyprlandClient {
     /// Uses `[[BATCH]]` prefix with semicolon-separated commands.
     /// More efficient than multiple individual commands.
     ///
+    /// Each entry is sent verbatim — callers needing `dispatch ` prefixing
+    /// should prefer [`Self::dispatch_batch`] which centralises that.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -317,6 +384,45 @@ impl HyprlandClient {
             return Ok(());
         }
         self.command_ok(&format!("[[BATCH]]{}", commands.join("; "))).await
+    }
+
+    /// Execute multiple dispatch *actions* in a batch.
+    ///
+    /// Each entry is the bare action body (e.g. `pin address:0xabc`); this
+    /// method prepends the `dispatch ` token to each before joining. Pairs
+    /// with the bare-action helpers in `commands::*_action` so callers no
+    /// longer need to thread the literal `dispatch ` token through their
+    /// `format!()` calls.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use media_control_lib::hyprland::HyprlandClient;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = HyprlandClient::new()?;
+    /// client.dispatch_batch(&[
+    ///     "movewindowpixel exact 100 200,address:0x12345678",
+    ///     "resizewindowpixel exact 640 360,address:0x12345678",
+    /// ]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn dispatch_batch(&self, actions: &[&str]) -> Result<()> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        // The trailing `format!("[[BATCH]]{joined}")` reallocates anyway, so
+        // hand-tuned capacity here just adds noise. Build the joined body
+        // with a plain `String` and let `format!` size the final buffer.
+        let mut joined = String::new();
+        for (i, a) in actions.iter().enumerate() {
+            if i > 0 {
+                joined.push_str("; ");
+            }
+            joined.push_str("dispatch ");
+            joined.push_str(a);
+        }
+        self.command_ok(&format!("[[BATCH]]{joined}")).await
     }
 
     /// Get all window clients.

@@ -16,7 +16,9 @@
 //! # }
 //! ```
 
-use super::{CommandContext, get_media_window, suppress_avoider};
+use super::{
+    CommandContext, get_media_window, move_pixel_action, resize_pixel_action, suppress_avoider,
+};
 use crate::error::Result;
 
 /// Movement direction using vim-style keys.
@@ -153,11 +155,10 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
         return Ok(());
     };
 
-    // Resolve only the position needed for this direction (avoids unnecessary stat calls)
-    let resolve = |name: &str| {
-        super::resolve_effective_position(ctx, name)
-            .unwrap_or_else(|| ctx.config.resolve_position(name).unwrap_or(0))
-    };
+    // Resolve only the position needed for this direction (avoids unnecessary stat calls).
+    // The `resolve_position_or` helper centralises the `.unwrap_or(default)` pattern
+    // shared with `avoid.rs`; here `0` is the canonical fallback for an unknown name.
+    let resolve = |name: &str| super::resolve_position_or(ctx, name, 0);
     let (ew, eh) = super::effective_dimensions(ctx);
 
     let (new_x, new_y) = match direction {
@@ -168,20 +169,14 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
     };
 
     // Execute batch command to move and resize
-    let move_cmd = format!(
-        "dispatch movewindowpixel exact {} {},address:{}",
-        new_x, new_y, window.address
-    );
-    let resize_cmd = format!(
-        "dispatch resizewindowpixel exact {ew} {eh},address:{}",
-        window.address
-    );
+    let move_cmd = move_pixel_action(&window.address, new_x, new_y);
+    let resize_cmd = resize_pixel_action(&window.address, ew, eh);
 
     // Suppress BEFORE dispatch — the movewindow event arrives within the
     // daemon's debounce window, so we have to beat it to the suppress file.
     suppress_avoider().await;
 
-    ctx.hyprland.batch(&[&move_cmd, &resize_cmd]).await?;
+    ctx.hyprland.dispatch_batch(&[&move_cmd, &resize_cmd]).await?;
 
     Ok(())
 }

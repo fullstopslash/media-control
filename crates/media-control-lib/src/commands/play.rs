@@ -5,7 +5,7 @@
 //! - `<store-name>`: switch to that store and play its next-up (twitch, jellyfin, pinchflat, etc.)
 //! - `<item-id>`: play a specific item by hex ID (shim auto-detects store)
 
-use super::{send_mpv_script_message, send_mpv_script_message_with_args};
+use super::{send_mpv_script_message, send_mpv_script_message_with_args, validate_ipc_token_len};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,21 +62,17 @@ impl PlayTarget {
 ///
 /// # Errors
 ///
-/// - Returns `mpv_no_socket` if the mpv IPC socket is unavailable.
-/// - Returns an `InvalidArgument` error if the parsed `Store` name exceeds
-///   `STORE_NAME_MAX_LEN` (defends the IPC path against unbounded CLI input).
+/// - Returns [`crate::error::MediaControlError::MpvIpc`] with kind `NoSocket`
+///   if the mpv IPC socket is unavailable.
+/// - Returns [`crate::error::MediaControlError::InvalidArgument`] if the
+///   parsed `Store` name exceeds [`STORE_NAME_MAX_LEN`] (defends the IPC
+///   path against unbounded CLI input). `ItemId` is bounded at parse time
+///   by [`ITEM_ID_MAX_LEN`] and so cannot trigger this path.
 pub async fn play(target_str: &str) -> crate::error::Result<()> {
     match PlayTarget::parse(target_str) {
         PlayTarget::NextUp => send_mpv_script_message("play-next-up").await,
         PlayTarget::Store(name) => {
-            if name.len() > STORE_NAME_MAX_LEN {
-                return Err(crate::error::MediaControlError::mpv_connection_failed(
-                    format!(
-                        "play target too long: {} bytes (max {STORE_NAME_MAX_LEN})",
-                        name.len()
-                    ),
-                ));
-            }
+            validate_ipc_token_len("play target", &name, STORE_NAME_MAX_LEN)?;
             send_mpv_script_message(&format!("play-{name}")).await
         }
         PlayTarget::ItemId(id) => {
@@ -160,38 +156,32 @@ mod tests {
     /// IPC entry point before it hits the socket.
     #[tokio::test]
     async fn play_rejects_overlong_store_name() {
-        use crate::error::{MediaControlError, MpvIpcErrorKind};
+        use crate::error::MediaControlError;
         // 65+ char non-hex string parses as Store and exceeds STORE_NAME_MAX_LEN.
         let huge = "z".repeat(STORE_NAME_MAX_LEN + 1);
         let err = play(&huge).await.expect_err("must reject");
-        // The length check uses ConnectionFailed with a "too long" message.
+        // Input validation must surface as InvalidArgument, never as a
+        // misleading IPC connection failure.
         match err {
-            MediaControlError::MpvIpc { kind, message } => {
-                assert_eq!(kind, MpvIpcErrorKind::ConnectionFailed);
+            MediaControlError::InvalidArgument(msg) => {
                 assert!(
-                    message.contains("too long"),
-                    "message should mention overflow: {message}"
+                    msg.contains("too long"),
+                    "message should mention overflow: {msg}"
                 );
             }
-            other => panic!("expected MpvIpc length-check error, got: {other:?}"),
+            other => panic!("expected InvalidArgument length-check error, got: {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn play_accepts_max_len_store_name() {
-        use crate::error::{MediaControlError, MpvIpcErrorKind};
+        use crate::error::MediaControlError;
         // Exactly at the cap. Outcome depends on socket availability; the
-        // length check itself must not fire.
+        // length check itself must not fire — so we must NOT see
+        // InvalidArgument for input at the boundary.
         let max = "z".repeat(STORE_NAME_MAX_LEN);
-        // If a connection error fires, it must be a real socket failure,
-        // not the length check.
-        if let Err(MediaControlError::MpvIpc { kind, message }) = play(&max).await
-            && kind == MpvIpcErrorKind::ConnectionFailed
-        {
-            assert!(
-                !message.contains("too long"),
-                "length-check should not fire at the boundary: {message}"
-            );
+        if let Err(MediaControlError::InvalidArgument(msg)) = play(&max).await {
+            panic!("length-check should not fire at the boundary: {msg}");
         }
     }
 }

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use media_control_lib::commands::{self, CommandContext, runtime_dir};
 use media_control_lib::config::Config;
-use media_control_lib::hyprland::runtime_socket_path;
+use media_control_lib::hyprland::{HyprlandError, runtime_socket_path};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::fs;
@@ -60,8 +60,12 @@ fn get_fifo_path() -> PathBuf {
 }
 
 /// Get the path to Hyprland's socket2 (event stream).
-fn get_socket2_path() -> Result<PathBuf, String> {
-    runtime_socket_path(".socket2.sock").map_err(|e| e.to_string())
+///
+/// Propagates the typed `HyprlandError` rather than collapsing it to a
+/// `String` — preserves the error variant so callers can distinguish
+/// missing-env from malformed-env, and lets `?` carry source chains.
+fn get_socket2_path() -> Result<PathBuf, HyprlandError> {
+    runtime_socket_path(".socket2.sock")
 }
 
 /// Read PID from the PID file.
@@ -80,20 +84,38 @@ async fn read_pid_file() -> Option<Pid> {
 
 /// Write current PID to the PID file with restrictive permissions.
 ///
-/// Uses O_CREAT|O_TRUNC|O_WRONLY with mode 0o600 so the file cannot be read
-/// by other users on a shared host.
+/// Atomic: writes to `<path>.tmp` first, fsyncs, then `rename()`s into place.
+/// `rename` on the same filesystem is atomic, so a crash mid-write leaves
+/// either the old PID file or the new one — never a half-written file that
+/// `read_pid_file` would misparse as "no daemon".
+///
+/// Uses O_CREAT|O_TRUNC|O_WRONLY with mode 0o600 so the temp file cannot be
+/// read by other users on a shared host.
 async fn write_pid_file() -> std::io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+
     let path = get_pid_file_path();
+    let mut tmp_path = path.clone().into_os_string();
+    tmp_path.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_path);
     let pid = std::process::id();
 
-    // Atomically (re)create with 0600 perms.
+    // Write the new PID into a sibling temp file with 0600 perms.
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o600);
-    let mut file = opts.open(&path)?;
-    use std::io::Write;
+    let mut file = opts.open(&tmp_path)?;
     write!(file, "{pid}")?;
     file.sync_all()?;
+    drop(file);
+
+    // Atomic swap: a concurrent reader sees either the old contents or the
+    // new ones, never a partial write.
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        // Best-effort cleanup of the temp file; surface the original error.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -176,12 +198,23 @@ fn create_fifo_at(path: &Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
 
-    // mkfifo creates atomically; mode 0o600 is masked by umask but caller
-    // controls that. The previous symlink check + per-user runtime dir means
-    // a TOCTOU race here would require write access to $XDG_RUNTIME_DIR,
-    // which on systemd systems is the user's own 0700 directory.
+    // mkfifo creates atomically; mode 0o600 is masked by umask, so a
+    // restrictive process umask (say 0o077) is fine but a permissive one
+    // (e.g. 0o022) would leave the FIFO group/other-readable. Force the
+    // intended mode with an explicit chmod after creation.
+    //
+    // The previous symlink check + per-user runtime dir means a TOCTOU
+    // race here would require write access to $XDG_RUNTIME_DIR, which on
+    // systemd systems is the user's own 0700 directory.
     nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other)?;
+    nix::sys::stat::fchmodat(
+        None,
+        path,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        nix::sys::stat::FchmodatFlags::NoFollowSymlink,
+    )
+    .map_err(std::io::Error::other)
 }
 
 /// Create the trigger FIFO at the default daemon path.
@@ -257,7 +290,7 @@ async fn fifo_listener(tx: mpsc::Sender<()>) {
 }
 
 /// Connect to Hyprland socket2 with retries and backoff.
-async fn connect_hyprland_socket() -> Result<UnixStream, String> {
+async fn connect_hyprland_socket() -> Result<UnixStream, HyprlandError> {
     let socket_path = get_socket2_path()?;
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(10);
@@ -370,9 +403,12 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
     // Create FIFO for manual triggers
     create_fifo()?;
 
-    // Channel for FIFO triggers — persists across reconnections
+    // Channel for FIFO triggers — persists across reconnections.
+    // We retain the listener's `JoinHandle` so we can `abort()` it on
+    // unrecoverable FIFO failure, instead of letting it hot-spin against
+    // a non-existent FIFO path.
     let (fifo_tx, mut fifo_rx) = mpsc::channel::<()>(16);
-    tokio::spawn(fifo_listener(fifo_tx));
+    let mut fifo_listener_handle = Some(tokio::spawn(fifo_listener(fifo_tx)));
 
     info!("Event loop started");
 
@@ -383,9 +419,22 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Reconnecting to Hyprland socket...");
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
-                // Recreate FIFO in case it was cleaned up
-                if !get_fifo_path().exists() {
-                    let _ = create_fifo();
+                // Recreate FIFO in case it was cleaned up. Use lstat
+                // (symlink_metadata) instead of `.exists()` so a symlink
+                // planted at our path doesn't trick us into skipping the
+                // recreate; `create_fifo_at` will then reject the symlink
+                // explicitly with a clear error.
+                if std::fs::symlink_metadata(get_fifo_path()).is_err()
+                    && let Err(e) = create_fifo()
+                {
+                    error!("Failed to recreate FIFO after reconnect: {e}");
+                    // Stop the listener so it doesn't burn CPU repeatedly
+                    // failing to open a FIFO we can't recreate. The main
+                    // loop continues handling Hyprland events; only manual
+                    // FIFO triggers are lost.
+                    if let Some(h) = fifo_listener_handle.take() {
+                        h.abort();
+                    }
                 }
             }
             Ok(false) => {
@@ -475,6 +524,20 @@ fn release_start_lock() {
     let _ = std::fs::remove_file(start_lock_path());
 }
 
+/// RAII guard that removes the on-disk start-lock sentinel on drop.
+///
+/// `cmd_start` calls into `spawn_foreground_worker`, which can panic. Without
+/// this guard the lock file would survive and block all future starts until
+/// removed manually. Drop-on-panic ensures the next `cmd_start` recovers
+/// cleanly via `acquire_or_recover_start_lock`.
+struct StartLockGuard;
+
+impl Drop for StartLockGuard {
+    fn drop(&mut self) {
+        release_start_lock();
+    }
+}
+
 /// Acquire the start lock, recovering from a stale lock left behind by a
 /// crashed previous start. Returns the live lock handle on success.
 async fn acquire_or_recover_start_lock() -> Result<std::fs::File, ExitCode> {
@@ -487,17 +550,17 @@ async fn acquire_or_recover_start_lock() -> Result<std::fs::File, ExitCode> {
                 .map(is_process_running)
                 .unwrap_or(false);
             if pid_alive {
-                eprintln!("Daemon start already in progress");
+                error!("Daemon start already in progress");
                 return Err(ExitCode::FAILURE);
             }
             release_start_lock();
             acquire_start_lock().map_err(|e| {
-                eprintln!("Failed to acquire start lock: {e}");
+                error!("Failed to acquire start lock: {e}");
                 ExitCode::FAILURE
             })
         }
         Err(e) => {
-            eprintln!("Failed to acquire start lock: {e}");
+            error!("Failed to acquire start lock: {e}");
             Err(ExitCode::FAILURE)
         }
     }
@@ -508,7 +571,7 @@ fn spawn_foreground_worker() -> ExitCode {
     let exe = match env::current_exe() {
         Ok(path) => path,
         Err(e) => {
-            eprintln!("Failed to get executable path: {e}");
+            error!("Failed to get executable path: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -521,11 +584,13 @@ fn spawn_foreground_worker() -> ExitCode {
         .spawn()
     {
         Ok(child) => {
-            println!("Daemon started (PID {})", child.id());
+            // `info!` (not `println!`): user-facing status flows through the
+            // tracing subscriber so it can be silenced/redirected uniformly.
+            info!("Daemon started (PID {})", child.id());
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("Failed to start daemon: {e}");
+            error!("Failed to start daemon: {e}");
             ExitCode::FAILURE
         }
     }
@@ -540,66 +605,64 @@ async fn cmd_start() -> ExitCode {
     //
     // The held `File` handle is the kernel-side mutex; closing it (by
     // dropping `_start_lock`) only releases our open FD. The on-disk
-    // sentinel that other processes see is removed by `release_start_lock`,
-    // so we ALWAYS call that before returning — the `File` then drops
-    // naturally at scope end.
+    // sentinel that other processes see is removed by `StartLockGuard`'s
+    // `Drop`, which fires on every exit path including panics in
+    // `spawn_foreground_worker`.
     let _start_lock = match acquire_or_recover_start_lock().await {
         Ok(f) => f,
         Err(code) => return code,
     };
+    let _lock_guard = StartLockGuard;
 
     // Check if already running (now serialized by the lock above).
     if let Some(pid) = read_pid_file().await {
         if is_process_running(pid) {
-            eprintln!("Daemon already running (PID {pid})");
-            release_start_lock();
+            error!("Daemon already running (PID {pid})");
             return ExitCode::FAILURE;
         }
         // Stale PID file, remove it
         remove_pid_file().await;
     }
 
-    let result = spawn_foreground_worker();
-    release_start_lock();
-    result
+    spawn_foreground_worker()
 }
 
 /// Stop the running daemon.
 async fn cmd_stop() -> ExitCode {
     let Some(pid) = read_pid_file().await else {
-        eprintln!("Daemon not running (no PID file)");
+        error!("Daemon not running (no PID file)");
         return ExitCode::FAILURE;
     };
 
     if !is_process_running(pid) {
-        eprintln!("Daemon not running (stale PID file)");
+        error!("Daemon not running (stale PID file)");
         remove_pid_file().await;
         return ExitCode::FAILURE;
     }
 
     // Send SIGTERM
     if let Err(e) = signal::kill(pid, Signal::SIGTERM) {
-        eprintln!("Failed to send SIGTERM to PID {}: {}", pid, e);
+        error!("Failed to send SIGTERM to PID {pid}: {e}");
         return ExitCode::FAILURE;
     }
 
-    println!("Sent SIGTERM to daemon (PID {})", pid);
+    info!("Sent SIGTERM to daemon (PID {pid})");
     ExitCode::SUCCESS
 }
 
 /// Check daemon status.
 async fn cmd_status() -> ExitCode {
     let Some(pid) = read_pid_file().await else {
-        println!("Daemon not running (no PID file)");
-        return ExitCode::from(1);
+        info!("Daemon not running (no PID file)");
+        return ExitCode::FAILURE;
     };
 
     if is_process_running(pid) {
-        println!("Daemon running (PID {})", pid);
+        info!("Daemon running (PID {pid})");
         ExitCode::SUCCESS
     } else {
-        println!("Daemon not running (stale PID file for PID {})", pid);
-        ExitCode::from(1)
+        info!("Daemon not running (stale PID file for PID {pid})");
+        ExitCode::FAILURE
     }
 }
 
@@ -619,13 +682,15 @@ fn init_logging() {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Initialize logging for foreground mode only
-    let command = cli.command.unwrap_or(Commands::Start);
-    if matches!(command, Commands::Foreground) {
-        init_logging();
-    }
+    // Initialize logging for ALL subcommands. Previously only `foreground`
+    // installed a tracing subscriber, so `tracing::error!` calls in
+    // `cmd_start`/`cmd_stop`/`cmd_status` (and any helper they invoke)
+    // were silently dropped. Initializing globally lets us emit structured
+    // logs uniformly and replace the bare `eprintln!` calls in the
+    // background-mode paths.
+    init_logging();
 
-    match command {
+    match cli.command.unwrap_or(Commands::Start) {
         Commands::Start => cmd_start().await,
         Commands::Stop => cmd_stop().await,
         Commands::Status => cmd_status().await,

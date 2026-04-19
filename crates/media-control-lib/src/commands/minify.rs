@@ -4,15 +4,16 @@
 //! (configurable via `positioning.minified_scale`). All positioning and
 //! avoidance rules still apply — just with smaller dimensions.
 
-use super::{
-    CommandContext, get_media_window, reposition_to_default, suppress_avoider, toggle_minified,
-};
+use super::{CommandContext, get_media_window, reposition_to_default, toggle_minified};
 use crate::error::Result;
 
 /// Toggle minified mode, resize, and reposition the media window.
+///
+/// Performs the actionability checks (media window present, not fullscreen)
+/// BEFORE flipping the persistent minified-state flag. Otherwise a no-op
+/// invocation (no window, or fullscreen) would silently leave the on-disk
+/// state out of sync with what's actually on screen.
 pub async fn minify(ctx: &CommandContext) -> Result<()> {
-    let now_minified = toggle_minified().await?;
-
     let Some(window) = get_media_window(ctx).await? else {
         return Ok(());
     };
@@ -21,9 +22,12 @@ pub async fn minify(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     }
 
-    // Suppress BEFORE the reposition batch — the movewindow event would
-    // otherwise race the daemon and bounce the window back.
-    suppress_avoider().await;
+    // Now safe to flip persistent state — we know the reposition will follow.
+    let now_minified = toggle_minified().await?;
+
+    // `reposition_to_default` self-suppresses immediately before its dispatch,
+    // so we don't need a redundant suppress here — the contract is documented
+    // in commands/mod.rs::reposition_to_default.
     reposition_to_default(ctx, &window.address).await?;
 
     tracing::debug!(
