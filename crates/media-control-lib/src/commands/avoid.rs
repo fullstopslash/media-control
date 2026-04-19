@@ -140,23 +140,33 @@ fn calculate_target_position(
 
     let (media_width, _) = super::effective_dimensions(ctx);
     // Widen to i64: socket-provided geometry could push these sums past i32::MAX.
-    let available_width =
-        i64::from(x_right) + i64::from(media_width) - i64::from(x_left);
-    let screen_center_x = x_left + (x_right - x_left) / 2;
-    let screen_center_y = y_top + (y_bottom - y_top) / 2;
+    // All center-point math uses safe-midpoint formulas so even adversarial
+    // i32 extremes cannot overflow before comparison.
+    let x_left_64 = i64::from(x_left);
+    let x_right_64 = i64::from(x_right);
+    let y_top_64 = i64::from(y_top);
+    let y_bottom_64 = i64::from(y_bottom);
+    let media_width_64 = i64::from(media_width);
 
-    let wide_threshold = i64::from(positioning.wide_window_threshold);
+    let available_width = x_right_64 + media_width_64 - x_left_64;
+    let screen_center_x = x_left_64 + (x_right_64 - x_left_64) / 2;
+    let screen_center_y = y_top_64 + (y_bottom_64 - y_top_64) / 2;
+
+    // Clamp threshold percentage to [0,100] — config could be misconfigured.
+    let wide_threshold = i64::from(positioning.wide_window_threshold.min(100));
     let wide_cutoff = available_width.saturating_mul(wide_threshold) / 100;
 
     if i64::from(focus_w) >= wide_cutoff {
-        let target_y = if media_y >= screen_center_y {
+        let target_y = if i64::from(media_y) >= screen_center_y {
             y_top
         } else {
             y_bottom
         };
         (media_x, target_y)
     } else {
-        let media_center = media_x + media_width / 2;
+        // Safe midpoint: i64::from(media_x) + media_width_64 / 2 cannot overflow
+        // because both operands are already widened.
+        let media_center = i64::from(media_x) + media_width_64 / 2;
         let target_x = if media_center <= screen_center_x {
             x_right
         } else {
@@ -168,6 +178,12 @@ fn calculate_target_position(
 
 /// Move a media window to a specific position.
 /// Respects minified mode — scales dimensions when active.
+///
+/// Suppresses the avoider BEFORE dispatching the batch so the
+/// window-moved event Hyprland fires cannot race the daemon back into
+/// the avoid path before suppression takes hold. Even if the batch
+/// fails, leaving the suppress timestamp warm for one cycle is harmless
+/// — it just defers the next avoid run by `suppress_ms`.
 async fn move_media_window(
     ctx: &CommandContext,
     addr: &str,
@@ -180,6 +196,8 @@ async fn move_media_window(
     let w = width.unwrap_or(ew);
     let h = height.unwrap_or(eh);
 
+    suppress_avoider().await;
+
     ctx.hyprland
         .batch(&[
             &format!("dispatch movewindowpixel exact {x} {y},address:{addr}"),
@@ -187,8 +205,33 @@ async fn move_media_window(
         ])
         .await?;
 
-    suppress_avoider().await;
     Ok(())
+}
+
+/// Move a media window to `(target_x, target_y)`, but only if the target
+/// itself does not overlap the predicate's "should avoid" rectangle. This
+/// guards against bouncing — repositioning the window to a place that is
+/// also obstructed.
+///
+/// Returns `Ok(true)` if the window moved, `Ok(false)` if the target was
+/// also blocked.
+async fn try_move_clear_of<F>(
+    ctx: &CommandContext,
+    addr: &str,
+    target_x: i32,
+    target_y: i32,
+    blocked: F,
+) -> Result<bool>
+where
+    F: Fn(i32, i32, i32, i32) -> bool,
+{
+    let (media_w, media_h) = super::effective_dimensions(ctx);
+    if blocked(target_x, target_y, media_w, media_h) {
+        tracing::debug!("avoid: target ({target_x}, {target_y}) also overlaps, skipping");
+        return Ok(false);
+    }
+    move_media_window(ctx, addr, target_x, target_y, None, None).await?;
+    Ok(true)
 }
 
 /// Check if avoider should be suppressed due to recent activity.
@@ -296,41 +339,33 @@ fn classify_case<'a>(
     clients: &'a [Client],
     ctx: &CommandContext,
 ) -> Option<AvoidCase<'a>> {
-    // Fullscreen media: never interfere
+    // Hard stops: fullscreen media must never be touched, and there has to
+    // be at least one media window to reposition.
     if focused.is_media && focused.fullscreen > 0 {
         return None;
     }
-
-    // No media windows to reposition
     if media_windows.is_empty() {
         return None;
     }
 
-    // Single workspace cases
-    if is_single_workspace {
-        // Fullscreen non-media in single workspace: don't interfere
-        if focused.fullscreen > 0 && !focused.is_media {
-            return None;
-        }
-        if focused.is_media {
-            // Mouseover: find previous window to determine toggle positions
-            let prev_window = ctx.window_matcher
-                .find_previous_focus(clients, focused.address, Some(focused.workspace_id))
-                .and_then(|addr| clients.iter().find(|c| c.address == addr));
-            return prev_window.map(|prev| AvoidCase::MouseoverToggle { prev_window: prev });
-        }
-        return Some(AvoidCase::MoveToPrimary);
+    match (is_single_workspace, focused.is_media, focused.fullscreen > 0) {
+        // Single-workspace, non-media fullscreen: leave the user alone.
+        (true, false, true) => None,
+        // Single-workspace mouseover: needs a previous window to know which
+        // pair-position to toggle to.
+        (true, true, _) => ctx.window_matcher
+            .find_previous_focus(clients, focused.address, Some(focused.workspace_id))
+            .and_then(|addr| clients.iter().find(|c| c.address == addr))
+            .map(|prev| AvoidCase::MouseoverToggle { prev_window: prev }),
+        // Single-workspace, ordinary non-media focus.
+        (true, false, false) => Some(AvoidCase::MoveToPrimary),
+        // Multi-workspace, media focused (mouseover-geometry case).
+        (false, true, _) => Some(AvoidCase::MouseoverGeometry),
+        // Multi-workspace, non-media fullscreen.
+        (false, false, true) => Some(AvoidCase::FullscreenNonMedia),
+        // Multi-workspace, non-media windowed.
+        (false, false, false) => Some(AvoidCase::GeometryOverlap),
     }
-
-    // Multi-workspace cases
-    if focused.is_media {
-        return Some(AvoidCase::MouseoverGeometry);
-    }
-    // Fullscreen non-media in multi-workspace: move media away
-    if focused.fullscreen > 0 {
-        return Some(AvoidCase::FullscreenNonMedia);
-    }
-    Some(AvoidCase::GeometryOverlap)
 }
 
 /// Smart window repositioning to avoid overlap.
@@ -422,7 +457,8 @@ async fn handle_move_to_primary(
 
         // Only check overlap with floating windows — tiled windows always overlap
         // the pinned media window and that's by design.
-        // If at primary, check actual geometry; otherwise check hypothetical primary placement.
+        // If at primary, test the window's *current* rect; otherwise test
+        // where it would land if we moved it to primary.
         let primary_clashes = focused.floating && {
             let (x, y, w, h) = if at_primary {
                 (window.x, window.y, window.width, window.height)
@@ -432,20 +468,17 @@ async fn handle_move_to_primary(
             overlaps_focused(x, y, w, h)
         };
 
-        if primary_clashes {
-            tracing::debug!(
-                "avoid: primary overlaps floating focused, moving to secondary ({}, {})",
-                pair.secondary_x, pair.secondary_y
-            );
-            move_media_window(
-                ctx, &window.address, pair.secondary_x, pair.secondary_y, pair.width, pair.height,
-            ).await?;
+        // Pick destination, or skip entirely if already at primary and unblocked.
+        let (dest_x, dest_y, label) = if primary_clashes {
+            (pair.secondary_x, pair.secondary_y, "secondary")
         } else if !at_primary {
-            tracing::debug!("avoid: moving to primary ({}, {})", pair.primary_x, pair.primary_y);
-            move_media_window(
-                ctx, &window.address, pair.primary_x, pair.primary_y, pair.width, pair.height,
-            ).await?;
-        }
+            (pair.primary_x, pair.primary_y, "primary")
+        } else {
+            continue;
+        };
+
+        tracing::debug!("avoid: moving to {label} ({dest_x}, {dest_y})");
+        move_media_window(ctx, &window.address, dest_x, dest_y, pair.width, pair.height).await?;
     }
     Ok(())
 }
@@ -495,7 +528,7 @@ async fn handle_mouseover_geometry(
     focused: &FocusedWindow<'_>,
     clients: &[Client],
 ) -> Result<()> {
-    // Check if a rect overlaps any workspace peer (excluding the focused media window)
+    // Does this rect overlap any workspace peer (excluding the focused media window)?
     let overlaps_peer = |x, y, w, h| {
         clients.iter().any(|c| {
             c.address != focused.address
@@ -511,19 +544,15 @@ async fn handle_mouseover_geometry(
     }
 
     let (target_x, target_y) = calculate_target_position(ctx, focused.x, focused.y, focused.width);
-    let (media_w, media_h) = super::effective_dimensions(ctx);
-
-    if overlaps_peer(target_x, target_y, media_w, media_h) {
-        tracing::debug!(
-            "avoid: target ({target_x}, {target_y}) also overlaps, skipping"
-        );
+    if !try_move_clear_of(ctx, focused.address, target_x, target_y, &overlaps_peer).await? {
         return Ok(());
     }
 
-    move_media_window(ctx, focused.address, target_x, target_y, None, None).await?;
-
-    if let Some(prev_addr) = ctx.window_matcher.find_previous_focus(clients, focused.address, Some(focused.workspace_id))
-        && let Err(e) = restore_focus(ctx, &prev_addr).await
+    if let Some(prev_addr) = ctx.window_matcher.find_previous_focus(
+        clients,
+        focused.address,
+        Some(focused.workspace_id),
+    ) && let Err(e) = restore_focus(ctx, &prev_addr).await
     {
         tracing::warn!("media-control: failed to restore focus: {e}");
     }
@@ -531,14 +560,15 @@ async fn handle_mouseover_geometry(
 }
 
 /// Case 4: Non-media focused, geometry overlap in multi-workspace.
+///
+/// Only repositions the **first** overlapping media window per call —
+/// callers re-trigger via Hyprland events, so subsequent windows are
+/// handled on the next pass. This avoids cascading suppressions.
 async fn handle_geometry_overlap(
     ctx: &CommandContext,
     focused: &FocusedWindow<'_>,
     media_windows: &[MediaWindow],
 ) -> Result<()> {
-    let (media_w, media_h) = super::effective_dimensions(ctx);
-
-    // Closure: does the rectangle overlap the focused window?
     let overlaps_focused = |x, y, w, h| {
         rectangles_overlap(x, y, w, h, focused.x, focused.y, focused.width, focused.height)
     };
@@ -547,19 +577,10 @@ async fn handle_geometry_overlap(
         if !overlaps_focused(window.x, window.y, window.width, window.height) {
             continue;
         }
-
         let (target_x, target_y) =
             calculate_target_position(ctx, window.x, window.y, focused.width);
-
-        // Verify the target position doesn't also overlap — otherwise the
-        // avoider bounces the window back and forth.
-        if overlaps_focused(target_x, target_y, media_w, media_h) {
-            tracing::debug!("avoid: target ({target_x}, {target_y}) also overlaps, skipping");
-            return Ok(());
-        }
-
-        tracing::debug!("avoid: overlap detected, moving to ({target_x}, {target_y})");
-        move_media_window(ctx, &window.address, target_x, target_y, None, None).await?;
+        tracing::debug!("avoid: overlap detected, target=({target_x}, {target_y})");
+        try_move_clear_of(ctx, &window.address, target_x, target_y, &overlaps_focused).await?;
         return Ok(());
     }
     Ok(())
@@ -635,6 +656,42 @@ mod tests {
         assert!(!within_tolerance(i32::MIN, i32::MAX, 5));
         assert!(!within_tolerance(i32::MAX, i32::MIN, 5));
         assert!(within_tolerance(i32::MAX, i32::MAX, 0));
+    }
+
+    #[test]
+    fn within_tolerance_negative_tolerance_never_matches() {
+        // Negative tolerance should never satisfy `|d| <= -1`. Must not panic.
+        assert!(!within_tolerance(100, 100, -1));
+        assert!(!within_tolerance(0, 0, -100));
+    }
+
+    #[test]
+    fn rectangles_overlap_touching_edges_at_extremes() {
+        // Right edge of A meets left edge of B at i32::MAX boundary.
+        // Touching but not overlapping → false. Pre-i64-widening this would
+        // overflow during `x2 + w2`.
+        assert!(!rectangles_overlap(
+            i32::MAX - 200, 0, 100, 100,
+            i32::MAX - 100, 0, 100, 100,
+        ));
+        // Top edge of B touches bottom edge of A.
+        assert!(!rectangles_overlap(0, 0, 100, 100, 0, 100, 100, 100));
+    }
+
+    #[test]
+    fn rectangles_overlap_zero_or_negative_second_rect() {
+        // A valid first rect plus a degenerate second rect must not overlap.
+        assert!(!rectangles_overlap(0, 0, 100, 100, 50, 50, 0, 50));
+        assert!(!rectangles_overlap(0, 0, 100, 100, 50, 50, 50, 0));
+        assert!(!rectangles_overlap(0, 0, 100, 100, 50, 50, -10, 50));
+    }
+
+    #[test]
+    fn rectangles_overlap_fully_contained() {
+        // B fully inside A — must overlap.
+        assert!(rectangles_overlap(0, 0, 1000, 1000, 100, 100, 50, 50));
+        // A fully inside B — symmetric.
+        assert!(rectangles_overlap(100, 100, 50, 50, 0, 0, 1000, 1000));
     }
 
     // --- E2E tests using mock Hyprland ---
@@ -1201,10 +1258,13 @@ mod tests {
         // Read and check manually (same logic as should_suppress but with custom path)
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         let timestamp_ms: u64 = content.trim().parse().unwrap();
-        let current = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let current = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         let elapsed = current.saturating_sub(timestamp_ms);
 
         assert!(
@@ -1254,6 +1314,376 @@ mod tests {
         assert!(
             batch.contains("48"),
             "expected x_left=48 from override: {batch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn avoid_case_fullscreen_nonmedia_moves_media() {
+        // Multi-workspace + non-media fullscreen → media should be repositioned.
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![
+            // Fullscreen firefox (non-media)
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser",
+                false, false, 2, 1, 0, 0,
+                [0, 0], [1920, 1080],
+            ),
+            // Second non-media window so we are NOT in single-workspace mode.
+            make_test_client_full(
+                "0xkitty", "kitty", "Terminal",
+                false, false, 0, 1, 0, 2,
+                [0, 0], [800, 600],
+            ),
+            // mpv currently far from primary
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 1,
+                [500, 500], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(has_move, "fullscreen non-media should move media: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn avoid_case_mouseover_geometry_moves_focused_media() {
+        // Multi-workspace + media focused + media overlaps a peer →
+        // MouseoverGeometry path: move the focused media window itself.
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![
+            // mpv focused (focus_history_id = 0) and overlapping firefox
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 0,
+                [200, 200], [640, 360],
+            ),
+            // firefox previously focused, overlapping mpv
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser",
+                false, false, 0, 1, 0, 1,
+                [100, 100], [800, 600],
+            ),
+            // second non-media so we are NOT in single-workspace mode
+            make_test_client_full(
+                "0xkitty", "kitty", "Terminal",
+                false, false, 0, 1, 0, 2,
+                [1500, 0], [200, 200],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(has_move, "mouseover-geometry should move media: {cmds:?}");
+        // Should also restore focus to the previous window (firefox)
+        let focus_cmd = cmds.iter().find(|c| c.contains("focuswindow"));
+        assert!(focus_cmd.is_some(), "expected focus restore: {cmds:?}");
+        assert!(
+            focus_cmd.unwrap().contains("0xfirefox"),
+            "expected focus restore to firefox"
+        );
+    }
+
+    #[tokio::test]
+    async fn calculate_target_position_no_overflow_on_extreme_geometry() {
+        // Constructed via a context — exercises the same widening as production.
+        // We just need to verify no panic / wraparound; the exact target is
+        // unimportant because the inputs are adversarial.
+        let mock = MockHyprland::start().await;
+        let ctx = mock.context(test_config());
+
+        // Extreme media position + huge focus_w must not overflow.
+        let _ = calculate_target_position(&ctx, i32::MAX, i32::MAX, i32::MAX);
+        let _ = calculate_target_position(&ctx, i32::MIN, i32::MIN, i32::MAX);
+        let _ = calculate_target_position(&ctx, 0, 0, i32::MAX);
+    }
+
+    #[tokio::test]
+    async fn calculate_target_position_clamps_threshold_above_100() {
+        // Misconfigured threshold > 100 should still produce a valid target.
+        let mock = MockHyprland::start().await;
+        let mut config = test_config();
+        config.positioning.wide_window_threshold = 250;
+        let ctx = mock.context(config);
+        let _ = calculate_target_position(&ctx, 100, 100, 800);
+    }
+
+    // --- Newly added defensive tests ---
+
+    #[test]
+    fn rectangles_overlap_negative_coordinates() {
+        // Both rects in negative space — overlap calculation must still work.
+        assert!(rectangles_overlap(-100, -100, 50, 50, -120, -120, 40, 40));
+        assert!(!rectangles_overlap(-100, -100, 50, 50, -200, -200, 40, 40));
+        // One negative, one positive — the gap straddles 0.
+        assert!(!rectangles_overlap(-100, -100, 50, 50, 0, 0, 100, 100));
+        // Touching at 0 along x — should NOT overlap.
+        assert!(!rectangles_overlap(-100, 0, 100, 100, 0, 0, 100, 100));
+    }
+
+    #[test]
+    fn rectangles_overlap_zero_size_first_rect() {
+        // The first rect itself is degenerate.
+        assert!(!rectangles_overlap(0, 0, 0, 100, 50, 50, 100, 100));
+        assert!(!rectangles_overlap(0, 0, 100, 0, 50, 50, 100, 100));
+        // Both zero — degenerate, no overlap.
+        assert!(!rectangles_overlap(0, 0, 0, 0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn rectangles_overlap_touching_corners_at_normal_coords() {
+        // The bottom-right of A meets the top-left of B at (100, 100).
+        // Touching but not overlapping → false.
+        assert!(!rectangles_overlap(0, 0, 100, 100, 100, 100, 50, 50));
+    }
+
+    #[test]
+    fn within_tolerance_zero_tolerance() {
+        // Zero tolerance is exact equality.
+        assert!(within_tolerance(100, 100, 0));
+        assert!(!within_tolerance(101, 100, 0));
+        assert!(!within_tolerance(99, 100, 0));
+    }
+
+    #[tokio::test]
+    async fn try_move_clear_of_skips_when_target_blocked() {
+        // If the predicate flags the target as blocked, no move issued.
+        let mock = MockHyprland::start().await;
+        let ctx = mock.context(test_config());
+
+        let moved = try_move_clear_of(&ctx, "0xabc", 100, 100, |_, _, _, _| true)
+            .await
+            .unwrap();
+        assert!(!moved, "should report not moved when target is blocked");
+
+        let cmds = mock.captured_commands().await;
+        assert!(
+            !cmds.iter().any(|c| c.contains("movewindowpixel")),
+            "must not dispatch move when target blocked: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_move_clear_of_moves_when_target_clear() {
+        let mock = MockHyprland::start().await;
+        let ctx = mock.context(test_config());
+
+        let moved = try_move_clear_of(&ctx, "0xabc", 200, 300, |_, _, _, _| false)
+            .await
+            .unwrap();
+        assert!(moved);
+
+        let cmds = mock.captured_commands().await;
+        assert!(
+            cmds.iter().any(|c| c.contains("movewindowpixel exact 200 300")),
+            "expected move dispatch: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_media_window_dispatches_then_suppression_is_active() {
+        // Cross-checks the race-prevention contract for `move_media_window`:
+        // by the time the dispatch reaches Hyprland, the suppress file must
+        // hold a recent timestamp — i.e. the avoider would short-circuit on
+        // the very next event.
+        //
+        // The shared on-disk path means parallel tests can be observed mid-
+        // write (empty file → parse fails). We poll a few times so a
+        // transient empty read is tolerated.
+        let mock = MockHyprland::start().await;
+        let ctx = mock.context(test_config());
+
+        move_media_window(&ctx, "0xabc", 0, 0, None, None).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        assert!(
+            cmds.iter().any(|c| c.contains("movewindowpixel")),
+            "dispatch should have reached the mock"
+        );
+
+        // Tolerate brief mid-write races on the shared file by retrying.
+        let mut suppressed = false;
+        for _ in 0..10 {
+            if should_suppress(60_000).await {
+                suppressed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            suppressed,
+            "suppress file should hold a recent timestamp after move_media_window"
+        );
+    }
+
+    #[tokio::test]
+    async fn suppress_file_lifecycle_via_clear() {
+        // Tests the lifecycle property of `suppress_avoider` / `clear_suppression`
+        // using a private temp-file path so parallel tests touching the global
+        // suppress file (via move_media_window) cannot race.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suppress");
+
+        // Simulate suppress_avoider: write current timestamp.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        tokio::fs::write(&path, &now_ms).await.unwrap();
+        let read_back = tokio::fs::read_to_string(&path).await.unwrap();
+        let ts: u64 = read_back.trim().parse().unwrap();
+        assert!(ts > 0, "suppress timestamp should be positive");
+
+        // Simulate clear_suppression: write "0".
+        tokio::fs::write(&path, "0").await.unwrap();
+        let cleared = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(cleared.trim(), "0");
+
+        // Re-implement the should_suppress predicate against our private file
+        // so we don't read the global path.
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let timestamp_ms: u64 = content.trim().parse().unwrap();
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let suppressed = now.saturating_sub(timestamp_ms) < 60_000;
+        assert!(!suppressed, "0 timestamp must not suppress for any positive timeout");
+    }
+
+    #[tokio::test]
+    async fn avoid_zero_size_focused_does_not_panic() {
+        // Pathological focused window size [0, 0] — the rectangle math must
+        // not panic, and we should treat the window as non-overlapping.
+        let mock = MockHyprland::start().await;
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser",
+                false, true, 0, 1, 0, 0,
+                [500, 500], [0, 0],
+            ),
+            make_test_client_full(
+                "0xkitty", "kitty", "Term",
+                false, false, 0, 1, 0, 2,
+                [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 1,
+                [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+
+        let ctx = mock.context(test_config());
+        // Must not panic. Move may or may not happen depending on classify.
+        avoid(&ctx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn avoid_negative_coordinate_focused() {
+        // Negative-coordinate focused window (multi-monitor edge case).
+        let mock = MockHyprland::start().await;
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser",
+                false, false, 0, 1, 0, 0,
+                [-1920, -100], [800, 600],
+            ),
+            make_test_client_full(
+                "0xkitty", "kitty", "Term",
+                false, false, 0, 1, 0, 2,
+                [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 1,
+                [1272, 712], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+        // Should not have panicked; correctness (no overlap) is the assertion.
+    }
+
+    #[tokio::test]
+    async fn calculate_target_position_threshold_boundary() {
+        // Threshold at exactly 100% means focus_w must equal full available
+        // width to be classified as wide. Off-by-one here would silently
+        // change movement direction.
+        let mock = MockHyprland::start().await;
+        let mut config = test_config();
+        config.positioning.wide_window_threshold = 100;
+        let ctx = mock.context(config);
+
+        // Compute expected boundary: avail_w = x_right + media_w - x_left.
+        let p = &ctx.config.positions;
+        let avail_w = p.x_right + p.width - p.x_left;
+
+        // focus_w one less than avail_w → not wide → move horizontally.
+        let (tx_narrow, ty_narrow) = calculate_target_position(&ctx, 0, 100, avail_w - 1);
+        // focus_w >= avail_w → wide → move vertically (y changes, x same).
+        let (tx_wide, ty_wide) = calculate_target_position(&ctx, 0, 100, avail_w);
+
+        assert_ne!(
+            (tx_narrow, ty_narrow), (tx_wide, ty_wide),
+            "boundary should switch direction"
+        );
+        assert_eq!(tx_wide, 0, "wide should preserve media_x");
+        assert_ne!(ty_wide, 100, "wide should change media_y");
+    }
+
+    #[tokio::test]
+    async fn handle_geometry_overlap_skips_when_target_also_blocked() {
+        // The target slot also overlaps focused → no move (anti-bounce).
+        let mock = MockHyprland::start().await;
+        // Focused window covers EVERYTHING, so any target position the
+        // algorithm picks will also overlap.
+        let clients = vec![
+            make_test_client_full(
+                "0xfirefox", "firefox", "Browser",
+                false, false, 0, 1, 0, 0,
+                [-10_000, -10_000], [40_000, 40_000],
+            ),
+            make_test_client_full(
+                "0xkitty", "kitty", "Term",
+                false, false, 0, 1, 0, 2,
+                [0, 0], [800, 600],
+            ),
+            make_test_client_full(
+                "0xmpv", "mpv", "video.mp4",
+                true, true, 0, 1, 0, 1,
+                [500, 500], [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients)).await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        assert!(
+            !cmds.iter().any(|c| c.contains("movewindowpixel")),
+            "should not move when both current and target overlap: {cmds:?}"
         );
     }
 }

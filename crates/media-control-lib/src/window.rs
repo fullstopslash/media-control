@@ -93,6 +93,13 @@ pub struct MatchResult {
     pub always_pin: bool,
 }
 
+/// Pinned media window — highest match priority.
+pub const PRIORITY_PINNED: u8 = 1;
+/// Focused media window — second priority.
+pub const PRIORITY_FOCUSED: u8 = 2;
+/// Any matching media window — lowest priority.
+pub const PRIORITY_ANY: u8 = 3;
+
 /// A media window with all relevant metadata.
 #[derive(Debug, Clone)]
 pub struct MediaWindow {
@@ -122,7 +129,7 @@ pub struct MediaWindow {
     pub workspace_id: i32,
     /// From matching pattern's always_pin field.
     pub always_pin: bool,
-    /// Match priority (1=pinned, 2=focused, 3=any).
+    /// Match priority — see [`PRIORITY_PINNED`], [`PRIORITY_FOCUSED`], [`PRIORITY_ANY`].
     pub priority: u8,
     /// Focus history ID from Hyprland (lower = more recently focused).
     pub focus_history_id: i32,
@@ -263,11 +270,11 @@ impl WindowMatcher {
             }
         }
 
-        // Highest priority wins (1 = pinned, 2 = focused, 3 = any).
+        // Highest priority wins.
         pinned
-            .map(|(c, m)| (c, m, 1u8))
-            .or_else(|| focused.map(|(c, m)| (c, m, 2)))
-            .or_else(|| any.map(|(c, m)| (c, m, 3)))
+            .map(|(c, m)| (c, m, PRIORITY_PINNED))
+            .or_else(|| focused.map(|(c, m)| (c, m, PRIORITY_FOCUSED)))
+            .or_else(|| any.map(|(c, m)| (c, m, PRIORITY_ANY)))
             .map(|(c, m, p)| MediaWindow::from_client(c, &m, p))
     }
 
@@ -281,7 +288,11 @@ impl WindowMatcher {
             .filter(|c| c.mapped && !c.hidden)
             .filter_map(|client| {
                 let match_result = self.matches(client)?;
-                let priority = if client.pinned { 1 } else { 3 };
+                let priority = if client.pinned {
+                    PRIORITY_PINNED
+                } else {
+                    PRIORITY_ANY
+                };
                 Some(MediaWindow::from_client(client, &match_result, priority))
             })
             .collect();
@@ -980,5 +991,64 @@ mod tests {
         client.hidden = true;
 
         assert!(matcher.find_media_window(&[client], None).is_none());
+    }
+
+    #[test]
+    fn find_media_windows_filters_hidden_and_unmapped() {
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns);
+
+        let mut hidden = make_client_full("0x1", "mpv", "h", true, true, 0, 1, 0, 0);
+        hidden.hidden = true;
+        let mut unmapped = make_client_full("0x2", "mpv", "u", true, true, 0, 1, 0, 1);
+        unmapped.mapped = false;
+        let visible = make_client_full("0x3", "mpv", "v", true, true, 0, 1, 0, 2);
+
+        let windows = matcher.find_media_windows(&[hidden, unmapped, visible], 0);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].address, "0x3");
+    }
+
+    #[test]
+    fn find_media_window_first_pinned_wins_when_multiple_match() {
+        // Two pinned matches: the first one in client order is selected
+        // (the slot is filled once and never overwritten).
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns);
+
+        let clients = vec![
+            make_client("0x1", "mpv", "first-pinned", true, true),
+            make_client("0x2", "mpv", "second-pinned", true, true),
+        ];
+        let result = matcher.find_media_window(&clients, None).unwrap();
+        assert_eq!(result.address, "0x1");
+        assert_eq!(result.priority, PRIORITY_PINNED);
+    }
+
+    #[test]
+    fn find_media_windows_filters_by_monitor() {
+        let patterns = vec![Pattern {
+            key: "class".to_string(),
+            value: "mpv".to_string(),
+            ..Default::default()
+        }];
+        let matcher = WindowMatcher::new(&patterns);
+
+        let clients = vec![
+            make_client_full("0x1", "mpv", "mon0", false, true, 0, 1, 0, 0),
+            make_client_full("0x2", "mpv", "mon1", false, true, 0, 1, 1, 1),
+            make_client_full("0x3", "mpv", "mon2", false, true, 0, 1, 2, 2),
+        ];
+        let on_mon1 = matcher.find_media_windows(&clients, 1);
+        assert_eq!(on_mon1.len(), 1);
+        assert_eq!(on_mon1[0].address, "0x2");
     }
 }

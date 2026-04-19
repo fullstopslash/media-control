@@ -21,8 +21,10 @@ pub async fn minify(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     }
 
-    reposition_to_default(ctx, &window.address).await?;
+    // Suppress BEFORE the reposition batch — the movewindow event would
+    // otherwise race the daemon and bounce the window back.
     suppress_avoider().await;
+    reposition_to_default(ctx, &window.address).await?;
 
     tracing::debug!(
         "minify: {}",

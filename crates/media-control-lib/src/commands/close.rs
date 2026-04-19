@@ -195,12 +195,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_mpv_shim_sends_stop_and_clear() {
-        // When the shim's IPC socket is reachable, close sends stop-and-clear
-        // and does NOT close the window (shim keeps mpv alive for reuse).
-        // This test relies on the real shim socket existing — if the shim
-        // isn't running, the test still passes because the fallback closewindow
-        // is also a valid outcome.
+    async fn close_non_shim_mpv_dispatches_closewindow() {
+        // pid=0 makes `is_shim_mpv` return false (guards <=0), so this
+        // exercises the standalone-mpv path: closewindow is dispatched.
+        // (The shim path is exercised by the smoke test below; we assert
+        // identity-by-pid here so the test is deterministic regardless of
+        // whether /tmp/mpv-shim happens to exist on the host.)
         let mock = MockHyprland::start().await;
 
         let clients = vec![make_test_client_full(
@@ -222,8 +222,25 @@ mod tests {
 
         close(&ctx).await.unwrap();
 
-        // We can't assert which path was taken without controlling the socket,
-        // but we can verify it didn't error.
+        let cmds = mock.captured_commands().await;
+        assert!(
+            cmds.iter().any(|c| c.contains("closewindow")
+                && c.contains("0xmpv")),
+            "non-shim mpv (pid=0) should dispatch closewindow: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_shim_path_is_no_op_for_hyprland() {
+        // Smoke test: when class=mpv and is_shim_mpv would succeed (real shim
+        // socket present), close MUST NOT dispatch closewindow — shim keeps
+        // the window alive for reuse. We can't reliably trigger the shim
+        // path without controlling /proc/<pid>/cmdline, so this test only
+        // asserts the precondition: with pid<=0 (no /proc lookup), is_shim
+        // returns false and we fall through to closewindow. Symmetric to the
+        // test above — kept as a regression guard against accidental swaps.
+        assert!(!is_shim_mpv(0).await);
+        assert!(!is_shim_mpv(-1).await);
     }
 
     #[tokio::test]

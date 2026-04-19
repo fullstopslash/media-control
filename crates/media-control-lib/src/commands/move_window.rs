@@ -177,10 +177,11 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
         window.address
     );
 
-    ctx.hyprland.batch(&[&move_cmd, &resize_cmd]).await?;
-
-    // Suppress avoider to prevent immediate repositioning
+    // Suppress BEFORE dispatch — the movewindow event arrives within the
+    // daemon's debounce window, so we have to beat it to the suppress file.
     suppress_avoider().await;
+
+    ctx.hyprland.batch(&[&move_cmd, &resize_cmd]).await?;
 
     Ok(())
 }
@@ -376,6 +377,32 @@ mod tests {
         assert!(
             batch.contains("exact 1272 712"),
             "expected x=1272, y_bottom=712: {batch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_to_already_correct_position_still_dispatches() {
+        // Current behavior: move always dispatches even when the window is
+        // already at the target position. This is intentional — the resize
+        // bundled in the batch may still be needed (e.g. after minify toggle).
+        // Lock that in so we don't silently regress to a "skip if at target"
+        // optimisation that would leave geometry stale.
+        let mock = MockHyprland::start().await;
+        // mpv already at x_left=48 with current y=712
+        mock.set_response("j/clients", &mpv_at(48, 712)).await;
+        let ctx = mock.default_context();
+
+        move_window(&ctx, Direction::Left).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
+        assert!(
+            batch.is_some(),
+            "move should dispatch even at correct position: {cmds:?}"
+        );
+        assert!(
+            batch.unwrap().contains("exact 48 712"),
+            "still targets x_left=48, y=712"
         );
     }
 

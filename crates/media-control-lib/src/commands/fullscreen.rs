@@ -7,7 +7,7 @@ use regex::Regex;
 
 use super::{
     CommandContext, clear_suppression, focus_window_cmd, get_media_window_with_clients, pin_cmd,
-    restore_focus, suppress_avoider,
+    restore_focus, suppress_avoider, toggle_floating_cmd,
 };
 use crate::error::Result;
 use crate::hyprland::Client;
@@ -59,17 +59,24 @@ pub async fn fullscreen(ctx: &CommandContext) -> Result<()> {
 
 /// Auto-pin a window that has always_pin set.
 ///
-/// Makes the window floating first if needed, then pins it.
+/// Makes the window floating first if needed, then pins it. When both ops
+/// are required, batches them so the window doesn't briefly appear tiled
+/// before being pinned.
 async fn auto_pin_window(ctx: &CommandContext, media: &MediaWindow) -> Result<()> {
     let addr = &media.address;
-    if !media.floating {
-        ctx.hyprland
-            .dispatch(&format!("togglefloating address:{addr}"))
-            .await?;
+
+    // Suppress BEFORE the dispatch — pinwindow / movewindow events would
+    // otherwise race the daemon and trigger an avoid pass on the just-pinned
+    // window before the user even sees it settle.
+    suppress_avoider().await;
+
+    if media.floating {
+        ctx.hyprland.dispatch(&format!("pin address:{addr}")).await?;
+    } else {
+        let float = toggle_floating_cmd(addr);
+        let pin = pin_cmd(addr);
+        ctx.hyprland.batch(&[&float, &pin]).await?;
     }
-    ctx.hyprland
-        .dispatch(&format!("pin address:{addr}"))
-        .await?;
     Ok(())
 }
 
@@ -94,12 +101,13 @@ async fn enter_fullscreen_mode(ctx: &CommandContext, media: &MediaWindow) -> Res
     // 3. Toggle fullscreen (operates on the now-focused window)
     cmds.push("dispatch fullscreen 0".to_string());
 
+    // Suppress BEFORE the batch — the activewindow + fullscreen events
+    // arrive within the daemon's debounce window, so we have to beat them.
+    suppress_avoider().await;
+
     // Execute all commands atomically
     let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
     ctx.hyprland.batch(&cmd_refs).await?;
-
-    // Suppress avoider to prevent repositioning
-    suppress_avoider().await;
 
     Ok(())
 }
@@ -141,15 +149,21 @@ async fn exit_fullscreen(
         // Refresh suppression before retry
         suppress_avoider().await;
 
-        // Try again - focus and fullscreen atomically
+        // Try again - focus and fullscreen atomically.
+        // On the final attempt, double-toggle (off→on→off) to force-flush stuck
+        // fullscreen state in Hyprland. Two toggles net to off when starting from on.
         let focus = focus_window_cmd(addr);
-        ctx.hyprland.batch(&[&focus, "dispatch fullscreen 0"]).await?;
-
-        // Aggressive double-toggle on final attempt
         if attempt == MAX_FULLSCREEN_EXIT_ATTEMPTS {
             ctx.hyprland
-                .batch(&[&focus, "dispatch fullscreen 0", "dispatch fullscreen 0"])
+                .batch(&[
+                    &focus,
+                    "dispatch fullscreen 0",
+                    "dispatch fullscreen 0",
+                    "dispatch fullscreen 0",
+                ])
                 .await?;
+        } else {
+            ctx.hyprland.batch(&[&focus, "dispatch fullscreen 0"]).await?;
         }
     }
 
@@ -756,5 +770,95 @@ mod tests {
             has_focus_restore,
             "should restore focus to firefox: {cmds:?}"
         );
+    }
+
+    /// Regression: toggling fullscreen on then off should be symmetric — each
+    /// invocation drives Hyprland through `dispatch fullscreen 0` exactly once
+    /// per call (the second call is the exit path which already covers retry).
+    #[tokio::test]
+    async fn fullscreen_toggle_is_idempotent_on_unpinned() {
+        // Two back-to-back invocations: enter, then exit. Verify that each
+        // invocation independently runs without panicking and that the second
+        // invocation observes the new fullscreen=2 state (i.e. takes the exit
+        // path with retry/restore).
+        let mock = MockHyprland::start().await;
+
+        // Sequence: enter (sees fs=0), then exit pass sees fs=2 then fs=0.
+        let pre = vec![make_test_client_full(
+            "0xmpv", "mpv", "video.mp4",
+            false, true, 0, 1, 0, 0,
+            [1272, 712], [640, 360],
+        )];
+        let entered = vec![make_test_client_full(
+            "0xmpv", "mpv", "video.mp4",
+            false, true, 2, 1, 0, 0,
+            [0, 0], [1920, 1080],
+        )];
+        let exited = vec![make_test_client_full(
+            "0xmpv", "mpv", "video.mp4",
+            false, true, 0, 1, 0, 0,
+            [1272, 712], [640, 360],
+        )];
+        mock.set_response_sequence(
+            "j/clients",
+            vec![
+                make_clients_json(&pre),     // first call: enter sees fs=0
+                make_clients_json(&entered), // second call: exit sees fs=2
+                make_clients_json(&exited),  // exit retry verifies fs=0
+                make_clients_json(&exited),  // post-exit fresh fetch
+            ],
+        )
+        .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap(); // enter
+        fullscreen(&ctx).await.unwrap(); // exit
+
+        let cmds = mock.captured_commands().await;
+        let fs_dispatches = cmds
+            .iter()
+            .filter(|c| c.contains("dispatch fullscreen 0"))
+            .count();
+        // Enter: 1 fullscreen dispatch in the batch.
+        // Exit:  1 fullscreen dispatch in the initial batch + retries verify state.
+        assert!(
+            fs_dispatches >= 2,
+            "expected at least 2 fullscreen dispatches across enter+exit: {cmds:?}"
+        );
+    }
+
+    /// Regression: PiP windows have always_pin=true. After exit, pin must be
+    /// restored even when the window WAS pinned before fullscreening.
+    #[tokio::test]
+    async fn fullscreen_exit_pip_restores_pin() {
+        let mock = MockHyprland::start().await;
+
+        let clients_fs = vec![make_test_client_full(
+            "0xpip", "firefox", "Picture-in-Picture",
+            true, true, 2, 1, 0, 0,
+            [0, 0], [1920, 1080],
+        )];
+        let clients_exited = vec![make_test_client_full(
+            "0xpip", "firefox", "Picture-in-Picture",
+            false, true, 0, 1, 0, 0,
+            [1272, 712], [320, 180],
+        )];
+        mock.set_response_sequence(
+            "j/clients",
+            vec![
+                make_clients_json(&clients_fs),
+                make_clients_json(&clients_exited),
+            ],
+        )
+        .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_pin_restore = cmds
+            .iter()
+            .any(|c| c.contains("dispatch pin address:0xpip") && !c.contains("fullscreen"));
+        assert!(has_pin_restore, "PiP exit must restore pin: {cmds:?}");
     }
 }

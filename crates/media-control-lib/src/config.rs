@@ -27,7 +27,6 @@
 //!
 //! [positioning]
 //! wide_window_threshold = 90
-//! workspace_switch_timeout = 2
 //! position_tolerance = 5
 //! default_x = "x_right"
 //! default_y = "y_bottom"
@@ -37,6 +36,7 @@
 //! pref_x = "x_left"
 //! ```
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -67,6 +67,27 @@ pub enum ConfigError {
 
     #[error("home directory not found")]
     NoHomeDir,
+
+    /// A field's value violates its documented invariants.
+    ///
+    /// `field` names the offending key; `reason` describes the constraint.
+    #[error("invalid value for {field}: {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: String,
+    },
+
+    /// A user-supplied regex failed to compile.
+    ///
+    /// Pre-validating these at load time avoids silently broken matches in
+    /// the daemon hot path (where errors would otherwise be swallowed).
+    #[error("invalid regex for {field} ({pattern:?}): {source}")]
+    InvalidRegex {
+        field: &'static str,
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
 }
 
 /// Result type alias for configuration operations.
@@ -118,13 +139,20 @@ impl Config {
     /// Load configuration from a specific path.
     ///
     /// The file is size-capped at [`MAX_CONFIG_FILE_BYTES`] to prevent OOM
-    /// on a malformed (or symlinked) input.
+    /// on a malformed (or symlinked) input. The cap is enforced both via
+    /// `metadata` (fast-path rejection) and via a bounded reader (defense
+    /// against TOCTOU growth between metadata and read).
+    ///
+    /// After parsing, [`Config::validate`] is invoked to surface invalid
+    /// numeric ranges or malformed regexes at load time rather than at
+    /// daemon hot-path execution.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file cannot be read or exceeds the size cap
     /// - The TOML content is malformed
+    /// - Validation of any field fails
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_CONFIG_FILE_BYTES {
@@ -133,9 +161,132 @@ impl Config {
                 max: MAX_CONFIG_FILE_BYTES,
             });
         }
-        let content = std::fs::read_to_string(path)?;
+
+        // Bounded read: even if the file grows after the metadata check
+        // (TOCTOU) or is a special file lying about its size, we cap memory.
+        let file = std::fs::File::open(path)?;
+        let mut content = String::new();
+        file.take(MAX_CONFIG_FILE_BYTES + 1)
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
+            return Err(ConfigError::TooLarge {
+                size: content.len() as u64,
+                max: MAX_CONFIG_FILE_BYTES,
+            });
+        }
+
         let config: Config = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Validate configuration invariants surfaced at load time.
+    ///
+    /// Currently checks:
+    /// - `positioning.wide_window_threshold` is in `0..=100` (percentage).
+    /// - `positioning.minified_scale` is finite and in `(0.0, 1.0]`.
+    /// - `positioning.debounce_ms` and `suppress_ms` are within sane bounds
+    ///   (a 60 s ceiling — anything larger is almost certainly a typo and
+    ///   would freeze the daemon).
+    /// - `positions.width` and `positions.height` are positive.
+    /// - Every `patterns[].value` regex compiles.
+    /// - Every `positioning.overrides[].focused_title` regex compiles
+    ///   (within the same NFA size cap used at runtime).
+    ///
+    /// Validating up front avoids silent fallback in the avoider hot path,
+    /// where a malformed regex would otherwise silently never match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidValue`] for out-of-range numerics or
+    /// [`ConfigError::InvalidRegex`] for any regex that fails to compile.
+    pub fn validate(&self) -> Result<()> {
+        Self::validate_positioning(&self.positioning)?;
+        Self::validate_positions(&self.positions)?;
+        Self::validate_pattern_regexes(&self.patterns)?;
+        Self::validate_override_regexes(&self.positioning.overrides)
+    }
+
+    /// Validate numeric ranges on `[positioning]`.
+    fn validate_positioning(p: &Positioning) -> Result<()> {
+        if p.wide_window_threshold > 100 {
+            return Err(ConfigError::InvalidValue {
+                field: "positioning.wide_window_threshold",
+                reason: format!("must be in 0..=100 (got {})", p.wide_window_threshold),
+            });
+        }
+        let scale = p.minified_scale;
+        if !scale.is_finite() || scale <= 0.0 || scale > 1.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "positioning.minified_scale",
+                reason: format!("must be finite in (0.0, 1.0] (got {scale})"),
+            });
+        }
+        // Cap timeouts at 60 s. The type bound (u16) already caps at 65 535,
+        // but a single 60 s+ debounce or suppression window would freeze the
+        // avoider daemon — almost certainly a misconfiguration.
+        const MS_CEILING: u16 = 60_000;
+        if p.debounce_ms > MS_CEILING {
+            return Err(ConfigError::InvalidValue {
+                field: "positioning.debounce_ms",
+                reason: format!("must be <= {MS_CEILING} (got {})", p.debounce_ms),
+            });
+        }
+        if p.suppress_ms > MS_CEILING {
+            return Err(ConfigError::InvalidValue {
+                field: "positioning.suppress_ms",
+                reason: format!("must be <= {MS_CEILING} (got {})", p.suppress_ms),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate numeric ranges on `[positions]`.
+    fn validate_positions(p: &Positions) -> Result<()> {
+        if p.width <= 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "positions.width",
+                reason: format!("must be > 0 (got {})", p.width),
+            });
+        }
+        if p.height <= 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "positions.height",
+                reason: format!("must be > 0 (got {})", p.height),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate that every `patterns[].value` regex compiles.
+    fn validate_pattern_regexes(patterns: &[Pattern]) -> Result<()> {
+        for p in patterns {
+            Regex::new(&p.value).map_err(|source| ConfigError::InvalidRegex {
+                field: "patterns[].value",
+                pattern: p.value.clone(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Validate that every override's `focused_title` regex compiles within
+    /// the NFA size cap that the daemon enforces at runtime.
+    fn validate_override_regexes(overrides: &[PositionOverride]) -> Result<()> {
+        for o in overrides {
+            if o.focused_title.is_empty() {
+                continue;
+            }
+            RegexBuilder::new(&o.focused_title)
+                .size_limit(TITLE_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|source| ConfigError::InvalidRegex {
+                    field: "positioning.overrides[].focused_title",
+                    pattern: o.focused_title.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
     }
 
     /// Get the default configuration file path.
@@ -288,9 +439,6 @@ pub struct Positioning {
     /// Wide windows trigger vertical repositioning instead of horizontal.
     pub wide_window_threshold: u8,
 
-    /// Seconds after workspace switch during which single-workspace positioning is applied.
-    pub workspace_switch_timeout: u8,
-
     /// Pixels of tolerance for position comparison.
     /// Windows within this distance of the target are considered correctly positioned.
     pub position_tolerance: u8,
@@ -335,7 +483,6 @@ impl Default for Positioning {
     fn default() -> Self {
         Self {
             wide_window_threshold: 90,
-            workspace_switch_timeout: 2,
             position_tolerance: 5,
             debounce_ms: 15,
             suppress_ms: 150,
@@ -492,7 +639,6 @@ height = 360
 
 [positioning]
 wide_window_threshold = 85
-workspace_switch_timeout = 3
 position_tolerance = 10
 default_x = "x_left"
 default_y = "y_top"
@@ -541,7 +687,6 @@ pref_height = 450
         let config: Config = toml::from_str(SAMPLE_CONFIG).expect("failed to parse config");
 
         assert_eq!(config.positioning.wide_window_threshold, 85);
-        assert_eq!(config.positioning.workspace_switch_timeout, 3);
         assert_eq!(config.positioning.position_tolerance, 10);
         assert_eq!(config.positioning.default_x, "x_left");
         assert_eq!(config.positioning.default_y, "y_top");
@@ -588,7 +733,6 @@ value = "mpv"
 
         // Positioning defaults
         assert_eq!(config.positioning.wide_window_threshold, 90);
-        assert_eq!(config.positioning.workspace_switch_timeout, 2);
         assert_eq!(config.positioning.position_tolerance, 5);
         assert_eq!(config.positioning.default_x, "x_right");
         assert_eq!(config.positioning.default_y, "y_bottom");
@@ -702,7 +846,7 @@ wide_window_threshold = 75
 
         assert_eq!(config.positioning.wide_window_threshold, 75);
         // Defaults for unspecified fields
-        assert_eq!(config.positioning.workspace_switch_timeout, 2);
+        assert_eq!(config.positioning.position_tolerance, 5);
         assert_eq!(config.positioning.default_x, "x_right");
     }
 
@@ -808,5 +952,179 @@ pref_x = "x_left"
             result.is_some(),
             "title-only override should match any class"
         );
+    }
+
+    // --- Validation tests ---
+
+    #[test]
+    fn validate_accepts_default_config() {
+        let config = Config::default();
+        assert!(
+            config.validate().is_ok(),
+            "Default config must satisfy its own invariants"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_threshold_above_100() {
+        let mut config = Config::default();
+        config.positioning.wide_window_threshold = 101;
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidValue {
+                    field: "positioning.wide_window_threshold",
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_minified_scale_zero() {
+        let mut config = Config::default();
+        config.positioning.minified_scale = 0.0;
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidValue {
+                field: "positioning.minified_scale",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_minified_scale_negative_or_nan() {
+        for bad in [-0.5_f32, f32::NAN, f32::INFINITY, 2.0] {
+            let mut config = Config::default();
+            config.positioning.minified_scale = bad;
+            assert!(
+                config.validate().is_err(),
+                "scale={bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_oversize_debounce_ms() {
+        let mut config = Config::default();
+        config.positioning.debounce_ms = 60_001;
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidValue {
+                field: "positioning.debounce_ms",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_oversize_suppress_ms() {
+        let mut config = Config::default();
+        config.positioning.suppress_ms = 60_001;
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidValue {
+                field: "positioning.suppress_ms",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_zero_debounce_and_suppress() {
+        // Zero is meaningful (disable debounce / suppression), so the
+        // validator must not reject it.
+        let mut config = Config::default();
+        config.positioning.debounce_ms = 0;
+        config.positioning.suppress_ms = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_or_negative_dimensions() {
+        let mut config = Config::default();
+        config.positions.width = 0;
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidValue { field: "positions.width", .. }
+        ));
+
+        let mut config = Config::default();
+        config.positions.height = -1;
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidValue { field: "positions.height", .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_pattern_regex() {
+        let mut config = Config::default();
+        config.patterns.push(Pattern {
+            key: "title".into(),
+            value: "[unclosed".into(),
+            pinned_only: false,
+            always_pin: false,
+        });
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidRegex { field: "patterns[].value", .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_override_title_regex() {
+        let mut config = Config::default();
+        config.positioning.overrides.push(PositionOverride {
+            focused_class: String::new(),
+            focused_title: "[unclosed".into(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidRegex {
+                field: "positioning.overrides[].focused_title",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn load_from_path_runs_validation() {
+        // Sanity: load_from_path must reject configs whose post-parse state
+        // violates `validate()`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[positioning]
+wide_window_threshold = 250
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from_path(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "positioning.wide_window_threshold",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn load_from_path_caps_size() {
+        // A multi-megabyte file should be rejected by the metadata pre-check.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge.toml");
+        // 2 MiB of comment lines — fast to write, oversized for the cap.
+        let blob = "# ".to_string() + &"x".repeat(2 * 1024 * 1024);
+        std::fs::write(&path, blob).expect("write");
+        let err = Config::load_from_path(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::TooLarge { .. }));
     }
 }

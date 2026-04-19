@@ -1,6 +1,10 @@
 //! Error types for the media-control library.
+//!
+//! `MediaControlError` is the unified error type returned by command-level
+//! APIs. Subsystem errors (`config::ConfigError`, `jellyfin::JellyfinError`,
+//! `hyprland::HyprlandError`) bridge into it via `#[from]` so the original
+//! source — and its `Display`/`source()` chain — is preserved end-to-end.
 
-use std::path::PathBuf;
 use thiserror::Error;
 
 /// Result type alias using [`MediaControlError`].
@@ -30,66 +34,6 @@ impl std::fmt::Display for MpvIpcErrorKind {
     }
 }
 
-/// Errors that can occur during media control operations.
-#[derive(Debug, Error)]
-pub enum MediaControlError {
-    /// Hyprland IPC communication error.
-    #[error("hyprland IPC error: {kind}")]
-    HyprlandIpc {
-        kind: HyprlandIpcErrorKind,
-        #[source]
-        source: Option<std::io::Error>,
-    },
-
-    /// Configuration error.
-    #[error("config error: {kind}")]
-    Config {
-        kind: ConfigErrorKind,
-        path: Option<PathBuf>,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    /// Jellyfin API error.
-    #[error("jellyfin error: {kind}")]
-    Jellyfin {
-        kind: JellyfinErrorKind,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    /// No matching media window found.
-    #[error("no media window found matching pattern")]
-    WindowNotFound,
-
-    /// mpv IPC communication error.
-    #[error("mpv IPC error: {kind}")]
-    MpvIpc {
-        kind: MpvIpcErrorKind,
-        message: String,
-    },
-
-    /// General I/O error.
-    #[error("I/O error")]
-    Io(#[from] std::io::Error),
-
-    /// Regex compilation error.
-    #[error("regex error")]
-    Regex(#[from] regex::Error),
-
-    /// JSON parsing error.
-    #[error("JSON error")]
-    Json(#[from] serde_json::Error),
-
-    /// TOML parsing error.
-    #[error("TOML parse error")]
-    Toml(#[from] toml::de::Error),
-
-    /// HTTP request error.
-    #[error("HTTP request error")]
-    Http(#[from] reqwest::Error),
-}
-
 /// Specific kinds of Hyprland IPC errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HyprlandIpcErrorKind {
@@ -111,49 +55,55 @@ impl std::fmt::Display for HyprlandIpcErrorKind {
     }
 }
 
-/// Specific kinds of configuration errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigErrorKind {
-    /// Configuration file not found.
-    NotFound,
-    /// Failed to parse configuration file.
-    ParseError,
-    /// Configuration validation failed.
-    ValidationError,
-}
+/// Errors that can occur during media control operations.
+#[derive(Debug, Error)]
+pub enum MediaControlError {
+    /// Hyprland IPC communication error.
+    #[error("hyprland IPC error: {kind}")]
+    HyprlandIpc {
+        kind: HyprlandIpcErrorKind,
+        #[source]
+        source: Option<std::io::Error>,
+    },
 
-impl std::fmt::Display for ConfigErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "file not found"),
-            Self::ParseError => write!(f, "parse error"),
-            Self::ValidationError => write!(f, "validation error"),
-        }
-    }
-}
+    /// Configuration error (typed source, no `Box<dyn Error>`).
+    #[error("config error: {0}")]
+    Config(#[from] crate::config::ConfigError),
 
-/// Specific kinds of Jellyfin API errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JellyfinErrorKind {
-    /// Authentication failed.
-    AuthFailed,
-    /// No active session found.
-    SessionNotFound,
-    /// API request failed.
-    ApiError,
-    /// Credentials file not found or invalid.
-    CredentialsError,
-}
+    /// Jellyfin API error (typed source, no `Box<dyn Error>`).
+    #[error("jellyfin error: {0}")]
+    Jellyfin(#[from] crate::jellyfin::JellyfinError),
 
-impl std::fmt::Display for JellyfinErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AuthFailed => write!(f, "authentication failed"),
-            Self::SessionNotFound => write!(f, "no active session found"),
-            Self::ApiError => write!(f, "API request failed"),
-            Self::CredentialsError => write!(f, "credentials error"),
-        }
-    }
+    /// No matching media window found.
+    #[error("no media window found matching pattern")]
+    WindowNotFound,
+
+    /// mpv IPC communication error.
+    #[error("mpv IPC error: {kind}")]
+    MpvIpc {
+        kind: MpvIpcErrorKind,
+        message: String,
+    },
+
+    /// General I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Regex compilation error.
+    #[error("regex error: {0}")]
+    Regex(#[from] regex::Error),
+
+    /// JSON parsing error.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// TOML parsing error.
+    #[error("TOML parse error: {0}")]
+    Toml(#[from] toml::de::Error),
+
+    /// HTTP request error.
+    #[error("HTTP request error: {0}")]
+    Http(#[from] reqwest::Error),
 }
 
 impl From<crate::hyprland::HyprlandError> for MediaControlError {
@@ -164,11 +114,9 @@ impl From<crate::hyprland::HyprlandError> for MediaControlError {
                 kind: HyprlandIpcErrorKind::SocketNotFound,
                 source: None,
             },
-            HyprlandError::ConnectionFailed(e) => Self::HyprlandIpc {
-                kind: HyprlandIpcErrorKind::ConnectionFailed,
-                source: Some(e),
-            },
-            HyprlandError::WriteFailed(e) | HyprlandError::ReadFailed(e) => Self::HyprlandIpc {
+            HyprlandError::ConnectionFailed(e)
+            | HyprlandError::WriteFailed(e)
+            | HyprlandError::ReadFailed(e) => Self::HyprlandIpc {
                 kind: HyprlandIpcErrorKind::ConnectionFailed,
                 source: Some(e),
             },
@@ -185,92 +133,6 @@ impl From<crate::hyprland::HyprlandError> for MediaControlError {
 }
 
 impl MediaControlError {
-    /// Create a Hyprland IPC connection error.
-    pub fn hyprland_connection(source: std::io::Error) -> Self {
-        Self::HyprlandIpc {
-            kind: HyprlandIpcErrorKind::ConnectionFailed,
-            source: Some(source),
-        }
-    }
-
-    /// Create a Hyprland IPC parse error.
-    pub fn hyprland_parse() -> Self {
-        Self::HyprlandIpc {
-            kind: HyprlandIpcErrorKind::ParseError,
-            source: None,
-        }
-    }
-
-    /// Create a Hyprland socket not found error.
-    pub fn hyprland_socket_not_found() -> Self {
-        Self::HyprlandIpc {
-            kind: HyprlandIpcErrorKind::SocketNotFound,
-            source: None,
-        }
-    }
-
-    /// Create a config not found error.
-    pub fn config_not_found(path: impl Into<PathBuf>) -> Self {
-        Self::Config {
-            kind: ConfigErrorKind::NotFound,
-            path: Some(path.into()),
-            source: None,
-        }
-    }
-
-    /// Create a config parse error.
-    pub fn config_parse(
-        path: impl Into<PathBuf>,
-        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Self {
-        Self::Config {
-            kind: ConfigErrorKind::ParseError,
-            path: Some(path.into()),
-            source: Some(source.into()),
-        }
-    }
-
-    /// Create a config validation error.
-    pub fn config_validation(msg: impl std::fmt::Display) -> Self {
-        Self::Config {
-            kind: ConfigErrorKind::ValidationError,
-            path: None,
-            source: Some(msg.to_string().into()),
-        }
-    }
-
-    /// Create a Jellyfin authentication error.
-    pub fn jellyfin_auth() -> Self {
-        Self::Jellyfin {
-            kind: JellyfinErrorKind::AuthFailed,
-            source: None,
-        }
-    }
-
-    /// Create a Jellyfin session not found error.
-    pub fn jellyfin_session_not_found() -> Self {
-        Self::Jellyfin {
-            kind: JellyfinErrorKind::SessionNotFound,
-            source: None,
-        }
-    }
-
-    /// Create a Jellyfin API error.
-    pub fn jellyfin_api(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self::Jellyfin {
-            kind: JellyfinErrorKind::ApiError,
-            source: Some(source.into()),
-        }
-    }
-
-    /// Create a Jellyfin credentials error.
-    pub fn jellyfin_credentials() -> Self {
-        Self::Jellyfin {
-            kind: JellyfinErrorKind::CredentialsError,
-            source: None,
-        }
-    }
-
     /// Create an mpv IPC no-socket error.
     pub fn mpv_no_socket() -> Self {
         Self::MpvIpc {
@@ -293,6 +155,7 @@ impl MediaControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
 
     #[test]
     fn io_error_converts() {
@@ -324,30 +187,36 @@ mod tests {
     }
 
     #[test]
-    fn hyprland_errors_display_correctly() {
-        let err = MediaControlError::hyprland_socket_not_found();
-        assert!(err.to_string().contains("socket not found"));
-
-        let err = MediaControlError::hyprland_parse();
-        assert!(err.to_string().contains("parse"));
+    fn config_error_bridges_via_from_and_preserves_source() {
+        // ConfigError::Parse wraps a real toml::de::Error; the bridge must
+        // preserve the chain so callers can still inspect the cause.
+        let toml_err: toml::de::Error = toml::from_str::<String>("not = valid { toml").unwrap_err();
+        let cfg_err = crate::config::ConfigError::Parse(toml_err);
+        let err: MediaControlError = cfg_err.into();
+        assert!(matches!(err, MediaControlError::Config(_)));
+        // source() should yield the inner ConfigError, then its toml source.
+        assert!(err.source().is_some(), "Config variant must expose source");
     }
 
     #[test]
-    fn config_errors_display_correctly() {
-        let err = MediaControlError::config_not_found("/test/path");
-        assert!(err.to_string().contains("not found"));
-
-        let err = MediaControlError::config_validation("missing field");
-        assert!(err.to_string().contains("validation"));
+    fn jellyfin_error_bridges_via_from_and_preserves_source() {
+        let jf_err = crate::jellyfin::JellyfinError::NoMpvSession;
+        let err: MediaControlError = jf_err.into();
+        assert!(matches!(err, MediaControlError::Jellyfin(_)));
+        // The Display chain must mention "no active MPV session" — proving
+        // the inner error wasn't lost during the bridge.
+        assert!(err.to_string().contains("no active MPV session"));
     }
 
     #[test]
-    fn jellyfin_errors_display_correctly() {
-        let err = MediaControlError::jellyfin_auth();
-        assert!(err.to_string().contains("authentication"));
-
-        let err = MediaControlError::jellyfin_session_not_found();
-        assert!(err.to_string().contains("session"));
+    fn hyprland_io_source_preserved() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "boom");
+        let err = MediaControlError::HyprlandIpc {
+            kind: HyprlandIpcErrorKind::ConnectionFailed,
+            source: Some(io_err),
+        };
+        let src = err.source().expect("source must be present");
+        assert!(src.to_string().contains("boom"));
     }
 
     #[test]
@@ -363,6 +232,9 @@ mod tests {
 
         let err = MediaControlError::mpv_connection_failed("test failure");
         assert!(err.to_string().contains("connection failed"));
+        // Inner message must surface in the chain (check via Debug since
+        // mpv variants encode the message in a non-source field).
+        assert!(format!("{err:?}").contains("test failure"));
     }
 
     #[test]
@@ -379,6 +251,22 @@ mod tests {
         assert_eq!(
             MpvIpcErrorKind::ResponseError.to_string(),
             "mpv returned an error"
+        );
+    }
+
+    #[test]
+    fn hyprland_error_kind_display() {
+        assert_eq!(
+            HyprlandIpcErrorKind::ConnectionFailed.to_string(),
+            "failed to connect to Hyprland socket"
+        );
+        assert_eq!(
+            HyprlandIpcErrorKind::ParseError.to_string(),
+            "failed to parse Hyprland response"
+        );
+        assert_eq!(
+            HyprlandIpcErrorKind::SocketNotFound.to_string(),
+            "Hyprland socket not found"
         );
     }
 

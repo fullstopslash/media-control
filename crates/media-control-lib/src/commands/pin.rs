@@ -66,9 +66,13 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
         ctx.hyprland.batch(&cmd_refs).await?;
     }
 
+    // Suppress BEFORE the move/resize batch — the resulting movewindow
+    // events would otherwise race the daemon and trigger an avoid pass on
+    // the freshly pinned window.
+    suppress_avoider().await;
+
     // Position to configured default corner (adjusted for minified mode)
     super::reposition_to_default(ctx, &media.address).await?;
-    suppress_avoider().await;
 
     Ok(())
 }

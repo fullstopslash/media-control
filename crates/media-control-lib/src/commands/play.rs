@@ -18,12 +18,27 @@ pub enum PlayTarget {
     ItemId(String),
 }
 
+/// Maximum accepted length for an item-id token.
+///
+/// Real shim/Jellyfin IDs are 32 hex chars; we allow some headroom for
+/// store-prefixed forms but cap to defend the IPC path against pathological
+/// CLI input (e.g. a megabyte-long argument).
+const ITEM_ID_MAX_LEN: usize = 128;
+
 impl PlayTarget {
     /// Parse a target string from the CLI.
+    ///
+    /// Recognises three forms:
+    /// 1. `"next-up"` — play next-up from the active store
+    /// 2. A 32-128 character ASCII-hex string — a specific item ID
+    /// 3. Anything else — treated as a store/context name
+    #[must_use]
     pub fn parse(s: &str) -> Self {
         match s {
             "next-up" => Self::NextUp,
-            id if id.len() >= 32 && id.chars().all(|c| c.is_ascii_hexdigit()) => {
+            id if (32..=ITEM_ID_MAX_LEN).contains(&id.len())
+                && id.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
                 Self::ItemId(id.to_string())
             }
             // Everything else is a store/context name
@@ -99,9 +114,20 @@ mod tests {
 
     #[test]
     fn parse_empty_string_is_store() {
-        assert_eq!(
-            PlayTarget::parse(""),
-            PlayTarget::Store(String::new())
-        );
+        assert_eq!(PlayTarget::parse(""), PlayTarget::Store(String::new()));
+    }
+
+    #[test]
+    fn parse_overlong_hex_is_store() {
+        // Above ITEM_ID_MAX_LEN, valid hex must NOT be classified as an item ID;
+        // otherwise a megabyte-long CLI arg would be sent verbatim over IPC.
+        let huge = "a".repeat(ITEM_ID_MAX_LEN + 1);
+        assert_eq!(PlayTarget::parse(&huge), PlayTarget::Store(huge));
+    }
+
+    #[test]
+    fn parse_max_len_hex_is_item_id() {
+        let max = "b".repeat(ITEM_ID_MAX_LEN);
+        assert_eq!(PlayTarget::parse(&max), PlayTarget::ItemId(max));
     }
 }

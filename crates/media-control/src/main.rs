@@ -5,27 +5,37 @@
 //! # Usage
 //!
 //! ```bash
-//! # Toggle fullscreen
+//! # Window management
 //! media-control fullscreen
-//!
-//! # Move window (use direction names or vim-style keys)
-//! media-control move right
-//! media-control move l  # vim-style: h=left, j=down, k=up, l=right
-//!
-//! # Close media window
+//! media-control move right            # or vim-style: h, j, k, l
 //! media-control close
-//!
-//! # Toggle pin-and-float mode
+//! media-control focus --launch "..."  # focus or spawn fallback
+//! media-control avoid                 # usually invoked by the daemon
 //! media-control pin-and-float
+//! media-control minify                # toggle smaller window mode
 //!
-//! # Jellyfin integration
+//! # Library/store control (delegated to mpv-shim via IPC)
 //! media-control mark-watched
 //! media-control mark-watched-and-stop
 //! media-control mark-watched-and-next
+//! media-control next                  # next item via per-library strategy
+//! media-control prev
+//! media-control next-series           # series-level navigation
+//! media-control prev-series
+//! media-control keep                  # tag as keep
+//! media-control favorite              # toggle favorite
+//! media-control delete                # remove/unfollow/delete (store-specific)
+//! media-control add-o                 # increment Stash o-counter
 //!
-//! # Chapter navigation
-//! media-control chapter next
-//! media-control chapter prev
+//! # Playback / mpv IPC
+//! media-control chapter next          # next or prev
+//! media-control seek 50               # jump to 50% (0-100)
+//! media-control play next-up          # or store name (jellyfin, twitch, …) or item id
+//! media-control random show           # optional store-specific type
+//! media-control status --json         # machine-readable status (waybar)
+//!
+//! # Tooling
+//! media-control completions zsh       # bash | zsh | fish | elvish | powershell
 //! ```
 
 use std::path::PathBuf;
@@ -129,15 +139,17 @@ enum Commands {
         percent: u8,
     },
 
-    /// Play a Jellyfin item (next-up, recent-pinchflat, or item ID)
+    /// Start playback via mpv-shim (next-up, store name, or item ID)
     Play {
-        /// What to play: next-up, recent-pinchflat, or a Jellyfin item ID
+        /// What to play: `next-up`, a store name (jellyfin, twitch, pinchflat, ...),
+        /// or a 32+ character hex item ID
         target: String,
     },
 
     /// Pick and play a random item from the active store
     Random {
-        /// Optional type filter (store-specific: show, movie, scene, performer, studio)
+        /// Optional type filter (store-specific: e.g. show/series/movie for Jellyfin,
+        /// scene/performer/studio for Stash)
         #[arg(name = "TYPE")]
         random_type: Option<String>,
     },

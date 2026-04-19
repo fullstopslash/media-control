@@ -165,6 +165,26 @@ impl HyprlandClient {
         Self { socket_path }
     }
 
+    /// Per-attempt timeout. The full `command()` may make two attempts so
+    /// the worst-case wall time is roughly `2 * COMMAND_TIMEOUT + RETRY_DELAY`.
+    const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Delay between the initial attempt and the single retry.
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    /// Run `command_inner` with a single per-attempt timeout, mapping
+    /// elapsed → `ConnectionFailed(TimedOut)` so the caller can decide
+    /// whether to retry.
+    async fn command_attempt(&self, cmd: &str, label: &'static str) -> Result<String> {
+        tokio::time::timeout(Self::COMMAND_TIMEOUT, self.command_inner(cmd))
+            .await
+            .map_err(|_| {
+                HyprlandError::ConnectionFailed(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    label,
+                ))
+            })?
+    }
+
     /// Send a raw command and return the response.
     ///
     /// This is the low-level method that all other methods use.
@@ -173,35 +193,19 @@ impl HyprlandClient {
     /// 2. Write command bytes
     /// 3. Read response (may be empty, "ok", or JSON)
     ///
-    /// Times out after 2 seconds if Hyprland is unresponsive.
-    /// Retries once after 50ms on connection failure (covers transient
-    /// socket busy during compositor transitions like fullscreen toggle).
+    /// Times out after 2 seconds per attempt. Retries once after 50ms on
+    /// connection failure (covers transient socket busy during compositor
+    /// transitions like fullscreen toggle).
     pub async fn command(&self, cmd: &str) -> Result<String> {
-        const TIMEOUT: Duration = Duration::from_secs(2);
-
-        let result = tokio::time::timeout(TIMEOUT, self.command_inner(cmd))
+        match self
+            .command_attempt(cmd, "Hyprland IPC timed out after 2s")
             .await
-            .map_err(|_| {
-                HyprlandError::ConnectionFailed(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Hyprland IPC timed out after 2s",
-                ))
-            })?;
-
-        match result {
+        {
             Ok(resp) => Ok(resp),
             Err(HyprlandError::ConnectionFailed(_)) => {
-                // Retry once after brief pause — Hyprland socket can refuse
-                // connections during compositor transitions
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                tokio::time::timeout(TIMEOUT, self.command_inner(cmd))
+                tokio::time::sleep(Self::RETRY_DELAY).await;
+                self.command_attempt(cmd, "Hyprland IPC timed out after 2s (retry)")
                     .await
-                    .map_err(|_| {
-                        HyprlandError::ConnectionFailed(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Hyprland IPC timed out after 2s (retry)",
-                        ))
-                    })?
             }
             Err(e) => Err(e),
         }
@@ -232,9 +236,32 @@ impl HyprlandClient {
         Ok(response)
     }
 
+    /// Check if a Hyprland IPC response indicates success.
+    #[inline]
+    fn is_success(response: &str) -> bool {
+        response.is_empty() || response.starts_with("ok")
+    }
+
+    /// Send a command and require a success response.
+    ///
+    /// On failure, the returned error includes both the failed command and
+    /// the response from Hyprland for debuggability.
+    async fn command_ok(&self, cmd: &str) -> Result<()> {
+        let response = self.command(cmd).await?;
+        if Self::is_success(&response) {
+            Ok(())
+        } else {
+            Err(HyprlandError::CommandFailed(format!(
+                "cmd={cmd:?} response={response:?}"
+            )))
+        }
+    }
+
     /// Execute a dispatch command.
     ///
     /// Wraps the action with `dispatch` prefix and validates the response.
+    /// On failure, the returned error includes the full dispatched command
+    /// string and Hyprland's response.
     ///
     /// # Example
     ///
@@ -247,22 +274,6 @@ impl HyprlandClient {
     /// # Ok(())
     /// # }
     /// ```
-    /// Check if a Hyprland IPC response indicates success.
-    #[inline]
-    fn is_success(response: &str) -> bool {
-        response.is_empty() || response.starts_with("ok")
-    }
-
-    /// Send a command and require a success response.
-    async fn command_ok(&self, cmd: &str) -> Result<()> {
-        let response = self.command(cmd).await?;
-        if Self::is_success(&response) {
-            Ok(())
-        } else {
-            Err(HyprlandError::CommandFailed(response))
-        }
-    }
-
     pub async fn dispatch(&self, action: &str) -> Result<()> {
         self.command_ok(&format!("dispatch {action}")).await
     }

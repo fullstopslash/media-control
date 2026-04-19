@@ -353,15 +353,39 @@ impl JellyfinClient {
             .ok_or(JellyfinError::InvalidCredentials("no credentials in file"))
     }
 
+    /// Sanitise a hostname (or arbitrary identifier) for safe inclusion in
+    /// HTTP header values.
+    ///
+    /// Strips anything outside `[A-Za-z0-9._-]`, collapses to a non-empty
+    /// fallback. This prevents a malformed `gethostname()` result (containing
+    /// `"`, `\`, control chars, or anything HTTP forbids) from corrupting the
+    /// `Authorization` header — which would either be rejected by
+    /// `HeaderValue::from_str` or, worse, be silently misinterpreted by the
+    /// upstream parser.
+    fn sanitize_header_value(input: &str) -> String {
+        let cleaned: String = input
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect();
+        if cleaned.is_empty() {
+            "media-control".to_string()
+        } else {
+            cleaned
+        }
+    }
+
     /// Build the default header bundle for Jellyfin API requests.
     ///
     /// Centralises the `Authorization` and `X-Emby-*` headers so secret
     /// material lives in headers (not URLs/logs) and header construction
-    /// failures map to a single, well-typed error.
+    /// failures map to a single, well-typed error. The `hostname` is
+    /// sanitised before interpolation so a hostile `gethostname()` cannot
+    /// inject quoting characters into the auth header.
     fn build_default_headers(credentials: &Credentials, hostname: &str) -> Result<HeaderMap> {
+        let safe_host = Self::sanitize_header_value(hostname);
         // Build authorization header in MediaBrowser format
         let auth_header = format!(
-            "MediaBrowser Client=\"media-control\", Device=\"{hostname}\", DeviceId=\"{}\", Version=\"1.0.0\", Token=\"{}\"",
+            "MediaBrowser Client=\"media-control\", Device=\"{safe_host}\", DeviceId=\"{}\", Version=\"1.0.0\", Token=\"{}\"",
             credentials.device_id, credentials.token
         );
 
@@ -379,7 +403,7 @@ impl JellyfinClient {
                 reqwest::header::HeaderName::from_static("x-emby-client"),
                 HeaderValue::from_static("media-control"),
             ),
-            mk("x-emby-device-name", hostname)?,
+            mk("x-emby-device-name", &safe_host)?,
             mk("x-emby-device-id", &credentials.device_id)?,
         ];
 
@@ -397,14 +421,11 @@ impl JellyfinClient {
     /// Returns an error if the HTTP client can't be built or a header value
     /// is invalid.
     pub fn new(credentials: Credentials) -> Result<Self> {
-        // Lossy is fine: hostname is purely identification, not a security
-        // boundary, and we want to avoid an extra allocation if the OsString
-        // is already valid UTF-8.
-        let hostname = gethostname::gethostname()
-            .to_string_lossy()
-            .into_owned();
-
-        let headers = Self::build_default_headers(&credentials, &hostname)?;
+        // Lossy is fine: hostname is identification, not a security boundary.
+        // `to_string_lossy()` returns a `Cow` that borrows the OsString when
+        // it's already UTF-8 — only an invalid sequence triggers an alloc.
+        let hostname = gethostname::gethostname();
+        let headers = Self::build_default_headers(&credentials, &hostname.to_string_lossy())?;
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
@@ -463,6 +484,42 @@ impl JellyfinClient {
         self.client
             .post(self.endpoint(path))
             .query(query)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// POST a JSON body to an endpoint, deserialising the response.
+    async fn post_json<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &B,
+    ) -> Result<R> {
+        Ok(self
+            .client
+            .post(self.endpoint(path))
+            .query(query)
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// POST a JSON body to an endpoint, ignoring the response.
+    async fn post_json_empty<B: Serialize>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &B,
+    ) -> Result<()> {
+        self.client
+            .post(self.endpoint(path))
+            .query(query)
+            .json(body)
             .send()
             .await?
             .error_for_status()?;
@@ -585,8 +642,7 @@ impl JellyfinClient {
         let response: ItemDetail = self.get_json(&path, &[]).await?;
         Ok(response
             .user_data
-            .map(|ud| ud.playback_position_ticks)
-            .unwrap_or(0))
+            .map_or(0, |ud| ud.playback_position_ticks))
     }
 
     /// Start playing an item in a session with optional resume position.
@@ -617,55 +673,54 @@ impl JellyfinClient {
     }
 
     /// Start playing multiple items in a session.
-    pub async fn play_items(&self, session_id: &str, item_ids: &[String]) -> Result<()> {
+    ///
+    /// Takes ownership of `item_ids` to avoid an extra clone — the underlying
+    /// `PlayCommand` payload owns its `Vec<String>` regardless.
+    pub async fn play_items(&self, session_id: &str, item_ids: Vec<String>) -> Result<()> {
         if item_ids.is_empty() {
             return Ok(());
         }
 
-        // Fetch playback parameters for the first item
         let playback_info = self.fetch_playback_info(&item_ids[0]).await?;
+        let command = self.build_play_command(item_ids, playback_info);
+        let path = format!("Sessions/{session_id}/Command/Play");
+        self.post_json_empty(&path, &[], &command).await
+    }
 
-        let command = PlayCommand {
-            item_ids: item_ids.to_vec(),
+    /// Build a [`PlayCommand`] payload from an owned id list and the
+    /// playback-info response for the first item.
+    ///
+    /// Extracted so `play_items` stays focused on transport concerns.
+    fn build_play_command(
+        &self,
+        item_ids: Vec<String>,
+        playback_info: PlaybackInfoResponse,
+    ) -> PlayCommand {
+        // Bind the first media source once — three downstream lookups would
+        // otherwise re-walk the slice and clone redundantly.
+        let first_source = playback_info.media_sources.first();
+        PlayCommand {
+            item_ids,
             play_command: "PlayNow".to_string(),
             play_session_id: Some(playback_info.play_session_id),
-            media_source_id: playback_info.media_sources.first().map(|s| s.id.clone()),
+            media_source_id: first_source.map(|s| s.id.clone()),
             start_index: 0,
             start_position_ticks: 0,
             controlling_user_id: Some(self.user_id.clone()),
-            audio_stream_index: playback_info
-                .media_sources
-                .first()
-                .and_then(|s| s.default_audio_stream_index),
-            subtitle_stream_index: playback_info
-                .media_sources
-                .first()
-                .and_then(|s| s.default_subtitle_stream_index),
-        };
-
-        let path = format!("Sessions/{session_id}/Command/Play");
-        self.client
-            .post(self.endpoint(&path))
-            .json(&command)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+            audio_stream_index: first_source.and_then(|s| s.default_audio_stream_index),
+            subtitle_stream_index: first_source.and_then(|s| s.default_subtitle_stream_index),
+        }
     }
 
     /// Fetch playback info for an item.
     async fn fetch_playback_info(&self, item_id: &str) -> Result<PlaybackInfoResponse> {
         let path = format!("Items/{item_id}/PlaybackInfo");
-        Ok(self
-            .client
-            .post(self.endpoint(&path))
-            .query(&[("UserId", self.user_id.as_str())])
-            .json(&serde_json::json!({}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        self.post_json(
+            &path,
+            &[("UserId", self.user_id.as_str())],
+            &serde_json::json!({}),
+        )
+        .await
     }
 
     /// Get remaining queue item IDs after the current item.
@@ -697,7 +752,7 @@ impl JellyfinClient {
             return Ok(());
         }
 
-        self.play_items(&session.id, &remaining).await
+        self.play_items(&session.id, remaining).await
     }
 
     /// Mark the current item as watched and advance to the next in queue.
@@ -717,7 +772,7 @@ impl JellyfinClient {
 
         // Try queue first, fall back to NextUp for the series
         if !remaining.is_empty() {
-            return self.play_items(&session_id, &remaining).await;
+            return self.play_items(&session_id, remaining).await;
         }
 
         // Queue empty — use NextUp API to find the next episode in the series
@@ -798,19 +853,16 @@ impl JellyfinClient {
     }
 
     /// Get the server URL.
-    #[allow(dead_code)] // Public API surface; retained for downstream callers.
     pub fn server_url(&self) -> &str {
         &self.server_url
     }
 
     /// Get the user ID.
-    #[allow(dead_code)] // Public API surface; retained for downstream callers.
     pub fn user_id(&self) -> &str {
         &self.user_id
     }
 
     /// Get the device ID.
-    #[allow(dead_code)] // Public API surface; retained for downstream callers.
     pub fn device_id(&self) -> &str {
         &self.device_id
     }
@@ -962,22 +1014,86 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_header_format() {
-        // Test that auth header components are correct
-        let hostname = "test-host";
-        let device_id = "test-device-id";
-        let token = "test-token";
+    fn build_default_headers_populates_all_fields() {
+        let creds = Credentials {
+            server: "http://example.com".into(),
+            user_id: "u1".into(),
+            token: "secret-token".into(),
+            device_id: "device-id-1".into(),
+        };
+        let headers = JellyfinClient::build_default_headers(&creds, "test-host")
+            .expect("headers should build");
 
-        let auth_header = format!(
-            "MediaBrowser Client=\"media-control\", Device=\"{}\", DeviceId=\"{}\", Version=\"1.0.0\", Token=\"{}\"",
-            hostname, device_id, token
+        let auth = headers
+            .get("authorization")
+            .expect("authorization header present")
+            .to_str()
+            .expect("authorization is ASCII");
+        assert!(auth.contains("Client=\"media-control\""));
+        assert!(auth.contains("Device=\"test-host\""));
+        assert!(auth.contains("DeviceId=\"device-id-1\""));
+        assert!(auth.contains("Token=\"secret-token\""));
+        assert!(auth.contains("Version=\"1.0.0\""));
+
+        assert_eq!(
+            headers.get("x-emby-token").and_then(|v| v.to_str().ok()),
+            Some("secret-token")
+        );
+        assert_eq!(
+            headers.get("x-emby-device-id").and_then(|v| v.to_str().ok()),
+            Some("device-id-1")
+        );
+        assert_eq!(
+            headers.get("x-emby-device-name").and_then(|v| v.to_str().ok()),
+            Some("test-host")
+        );
+        assert_eq!(
+            headers.get("x-emby-client").and_then(|v| v.to_str().ok()),
+            Some("media-control")
         );
 
-        assert!(auth_header.contains("Client=\"media-control\""));
-        assert!(auth_header.contains(&format!("Device=\"{}\"", hostname)));
-        assert!(auth_header.contains(&format!("DeviceId=\"{}\"", device_id)));
-        assert!(auth_header.contains(&format!("Token=\"{}\"", token)));
-        assert!(auth_header.contains("Version=\"1.0.0\""));
+        // Sensitive headers are flagged so tracing/logging won't leak them.
+        assert!(headers.get("authorization").unwrap().is_sensitive());
+        assert!(headers.get("x-emby-token").unwrap().is_sensitive());
+    }
+
+    #[test]
+    fn build_default_headers_sanitises_hostile_hostname() {
+        let creds = Credentials {
+            server: "http://example.com".into(),
+            user_id: "u1".into(),
+            token: "tok".into(),
+            device_id: "did".into(),
+        };
+        // Hostname contains quote, backslash and newline — characters that
+        // would either be rejected by `HeaderValue::from_str` or smuggle into
+        // the `Authorization` header as quoting-corrupting characters.
+        let headers = JellyfinClient::build_default_headers(&creds, "evil\"host\\\nname")
+            .expect("sanitised hostname should yield valid headers");
+        let auth = headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(!auth.contains('\n'), "newline must be stripped");
+        assert!(!auth.contains('\\'), "backslash must be stripped");
+        assert!(auth.contains("Device=\"evilhostname\""));
+    }
+
+    #[test]
+    fn sanitize_header_value_falls_back_for_empty_input() {
+        assert_eq!(
+            JellyfinClient::sanitize_header_value(""),
+            "media-control"
+        );
+        assert_eq!(
+            JellyfinClient::sanitize_header_value("!!!@@@"),
+            "media-control"
+        );
+        assert_eq!(
+            JellyfinClient::sanitize_header_value("waterbug.local"),
+            "waterbug.local"
+        );
+        assert_eq!(
+            JellyfinClient::sanitize_header_value("box-1_2.lan"),
+            "box-1_2.lan"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use super::{CommandContext, get_media_window, suppress_avoider};
+use super::{CommandContext, clear_suppression, get_media_window, suppress_avoider};
 use crate::error::Result;
 
 /// Focus the media window, or launch a command if no media window exists.
@@ -71,7 +71,8 @@ use crate::error::Result;
 /// # }
 /// ```
 pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> Result<bool> {
-    // Suppress avoider first to prevent repositioning during focus
+    // Suppress avoider BEFORE the focus dispatch — the activewindow event
+    // arrives within the daemon's debounce window, so we must beat it.
     suppress_avoider().await;
 
     // Try to find a media window
@@ -84,7 +85,12 @@ pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> 
         return Ok(true);
     }
 
-    // No media window found - launch command if provided
+    // No media window — clear the suppression we set above so the next
+    // legitimate event isn't dropped. Launch command (if any) won't generate
+    // the events we were guarding against.
+    clear_suppression().await;
+
+    // Launch command if provided
     if let Some(cmd) = launch_cmd {
         // Spawn in background (don't wait for it)
         Command::new("sh")

@@ -86,12 +86,9 @@ impl CommandContext {
     /// - The Hyprland socket is not available
     /// - Any pattern regex fails to compile
     pub fn new() -> Result<Self> {
-        let config = Config::load().map_err(|e| crate::error::MediaControlError::Config {
-            kind: crate::error::ConfigErrorKind::NotFound,
-            path: Config::default_path().ok(),
-            source: Some(Box::new(e)),
-        })?;
-
+        // `ConfigError` bridges via `#[from]` — preserves the typed source
+        // chain (path, regex, range failures) instead of `Box<dyn Error>`.
+        let config = Config::load()?;
         Self::with_config(config)
     }
 
@@ -176,8 +173,12 @@ pub fn get_media_window_with_clients(
 ///
 /// Sanitizes the env value to defend against path-traversal injection:
 /// the path must be absolute, contain no `..` components, and exist as a
-/// directory. On any failure, falls back to `/tmp`.
+/// directory. On any failure, falls back to `/tmp` and emits a one-shot
+/// warning since `/tmp` is world-writable on most systems.
 pub fn runtime_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
     fn sanitize(raw: &str) -> Option<PathBuf> {
         let p = PathBuf::from(raw);
         if !p.is_absolute() {
@@ -195,10 +196,15 @@ pub fn runtime_dir() -> PathBuf {
         Some(p)
     }
 
-    env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .and_then(|v| sanitize(&v))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    if let Some(dir) = env::var("XDG_RUNTIME_DIR").ok().and_then(|v| sanitize(&v)) {
+        return dir;
+    }
+    if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "XDG_RUNTIME_DIR unset or invalid; falling back to /tmp (world-writable, less secure)"
+        );
+    }
+    PathBuf::from("/tmp")
 }
 
 /// Get the path to the avoider suppress file.
@@ -236,6 +242,18 @@ pub async fn suppress_avoider() {
 /// to the avoider daemon, allowing it to run on the next event.
 pub async fn clear_suppression() {
     write_suppress_file("0").await;
+}
+
+/// Test-only mutex serializing access to process-wide state used by the
+/// suppress file and runtime-dir resolution: `$XDG_RUNTIME_DIR`,
+/// `$HYPRLAND_INSTANCE_SIGNATURE`, and the on-disk suppress file path.
+/// Any test that mutates these must hold this lock for the whole body
+/// or it will race with parallel tests touching the same globals.
+#[cfg(test)]
+pub(crate) fn suppress_file_test_mutex() -> &'static std::sync::Mutex<()> {
+    use std::sync::OnceLock;
+    static M: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// Build a `dispatch focuswindow address:<addr>` command string.
@@ -311,15 +329,28 @@ pub async fn toggle_minified() -> Result<bool> {
 }
 
 /// Get the effective window dimensions, accounting for minified mode.
+///
+/// Defends against pathological config (NaN, negative, or huge `minified_scale`)
+/// by clamping the scaled value into a sane range before converting back to
+/// `i32`. Without this, an `f32 → i32` saturating-cast on `NaN` or out-of-range
+/// values would yield `0` / `i32::MAX` and propagate into geometry math.
 pub fn effective_dimensions(ctx: &CommandContext) -> (i32, i32) {
     let w = ctx.config.positions.width;
     let h = ctx.config.positions.height;
-    if is_minified() {
-        let scale = ctx.config.positioning.minified_scale;
-        ((w as f32 * scale) as i32, (h as f32 * scale) as i32)
-    } else {
-        (w, h)
+    if !is_minified() {
+        return (w, h);
     }
+    let raw_scale = ctx.config.positioning.minified_scale;
+    let scale = if raw_scale.is_finite() {
+        raw_scale.clamp(0.0, 10.0)
+    } else {
+        1.0
+    };
+    // `clamp` rules out NaN/inf so the cast below is well-defined;
+    // truncation toward zero is fine for pixel dimensions.
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = |dim: i32| ((dim as f32) * scale).clamp(0.0, i32::MAX as f32) as i32;
+    (scaled(w), scaled(h))
 }
 
 /// Resolve a position name adjusted for minified mode.
@@ -377,8 +408,12 @@ const SOCKET_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Check that a path exists and is a Unix socket.
+///
+/// Uses `symlink_metadata` (lstat) — does NOT follow symlinks. This defends
+/// against an attacker placing a symlink at a predictable `/tmp` path that
+/// points to a file or socket they control.
 fn is_unix_socket(path: &Path) -> bool {
-    std::fs::metadata(path)
+    std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_socket())
         .unwrap_or(false)
 }
@@ -453,8 +488,10 @@ async fn mpv_ipc_exchange(
     let path = Path::new(socket_path);
 
     if !is_unix_socket(path) {
-        if path.exists() {
-            eprintln!("media-control: skipping {socket_path}: not a socket");
+        // Use lstat-based exists so a dangling symlink is reported, but a
+        // missing path stays quiet (typical case during startup).
+        if std::fs::symlink_metadata(path).is_ok() {
+            tracing::warn!("skipping {socket_path}: not a socket");
         }
         return Err(());
     }
@@ -463,21 +500,27 @@ async fn mpv_ipc_exchange(
     let mut stream = match connect_and_write(path, payload, true).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            eprintln!("media-control: timeout connecting to {socket_path}");
+            tracing::warn!("timeout connecting to {socket_path}");
             return Err(());
         }
-        Err(_) => return Err(()),
+        Err(e) => {
+            tracing::debug!("connect/write to {socket_path} failed: {e}");
+            return Err(());
+        }
     };
 
     if !read_response {
         return Ok(None);
     }
 
-    // Read response with timeout, skipping mpv event lines
+    // Read response with timeout, skipping mpv event lines.
+    // Reuse a single buffer to avoid per-line heap allocation when mpv
+    // floods events between our request and its response.
     let mut reader = BufReader::new(&mut stream);
     let read_result = timeout(SOCKET_RESPONSE_TIMEOUT, async {
+        let mut buf = String::with_capacity(256);
         loop {
-            let mut buf = String::new();
+            buf.clear();
             let n = reader.read_line(&mut buf).await?;
             if n == 0 {
                 // EOF — mpv closed the connection
@@ -522,26 +565,43 @@ pub async fn send_mpv_script_message_with_args(message: &str, args: &[&str]) -> 
     send_mpv_ipc_command(&payload).await
 }
 
+/// Try each candidate mpv socket path in turn, with optional retry passes.
+///
+/// On the first path that yields `Some(T)`, returns it. Otherwise returns
+/// `None` after all paths and retries are exhausted.
+async fn try_mpv_paths<T, F, Fut>(retries: u8, mut op: F) -> Option<T>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let paths = mpv_socket_paths();
+    for attempt in 0..=retries {
+        if attempt > 0 {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+        for path in &paths {
+            // Clone the owned PathBuf into a String to sidestep the
+            // closure-borrow-vs-future-lifetime tangle: `op` returns a future
+            // that may outlive the `&path` borrow, so we hand it an owned copy.
+            if let Some(v) = op(path.clone()).await {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Send a raw JSON command to mpv via IPC socket (fire-and-forget).
 ///
 /// Tries multiple socket paths with retry. Does not read the response —
 /// avoids blocking on mpv's event flood during rapid-fire commands.
 pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
-    let paths = mpv_socket_paths();
+    let ok = try_mpv_paths(1, |path| async move {
+        mpv_ipc_exchange(&path, payload, false).await.ok().map(|_| ())
+    })
+    .await;
 
-    for attempt in 0..2u8 {
-        if attempt > 0 {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-
-        for socket_path in &paths {
-            if mpv_ipc_exchange(socket_path, payload, false).await.is_ok() {
-                return Ok(());
-            }
-        }
-    }
-
-    Err(crate::error::MediaControlError::mpv_no_socket())
+    ok.ok_or_else(crate::error::MediaControlError::mpv_no_socket)
 }
 
 /// Query an mpv property and return its value.
@@ -561,19 +621,28 @@ pub async fn send_mpv_ipc_command(payload: &str) -> Result<()> {
 pub async fn query_mpv_property(property: &str) -> Result<serde_json::Value> {
     let payload = serde_json::json!({"command": ["get_property", property]}).to_string();
 
-    for socket_path in &mpv_socket_paths() {
-        if let Ok(Some(resp)) = mpv_ipc_exchange(socket_path, &payload, true).await {
-            let err_str = resp.get("error").and_then(|e| e.as_str());
-            if err_str == Some("success") {
-                return Ok(resp.get("data").cloned().unwrap_or(serde_json::Value::Null));
+    // Single attempt across paths (no retry) — caller wants a fast lookup.
+    let result = try_mpv_paths(0, |path| {
+        let payload = &payload;
+        async move {
+            match mpv_ipc_exchange(&path, payload, true).await {
+                Ok(Some(resp)) => Some(resp),
+                _ => None,
             }
-            return Err(crate::error::MediaControlError::mpv_connection_failed(
-                format!("mpv error: {}", err_str.unwrap_or("unknown")),
-            ));
         }
-    }
+    })
+    .await;
 
-    Err(crate::error::MediaControlError::mpv_no_socket())
+    let resp = result.ok_or_else(crate::error::MediaControlError::mpv_no_socket)?;
+
+    let err_str = resp.get("error").and_then(|e| e.as_str());
+    if err_str == Some("success") {
+        Ok(resp.get("data").cloned().unwrap_or(serde_json::Value::Null))
+    } else {
+        Err(crate::error::MediaControlError::mpv_connection_failed(
+            format!("mpv error for {property:?}: {}", err_str.unwrap_or("unknown")),
+        ))
+    }
 }
 
 /// Send a payload to a specific mpv socket (fire-and-forget, no response read).
@@ -610,6 +679,7 @@ mod tests {
 
     #[test]
     fn suppress_file_path_uses_xdg_runtime_dir() {
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
         // Save original value
         let original = env::var("XDG_RUNTIME_DIR").ok();
 
@@ -631,6 +701,7 @@ mod tests {
 
     #[test]
     fn suppress_file_path_fallback() {
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
         // Save original value
         let original = env::var("XDG_RUNTIME_DIR").ok();
 
@@ -650,6 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn suppress_avoider_writes_file() {
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
         suppress_avoider().await;
         let path = get_suppress_file_path();
         assert!(path.exists(), "suppress file should exist at {path:?}");
@@ -657,6 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_suppression_writes_file() {
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
         clear_suppression().await;
         let path = get_suppress_file_path();
         assert!(path.exists(), "suppress file should exist at {path:?}");
@@ -856,5 +929,191 @@ mod tests {
             Some(config.positions.x_right)
         );
         assert_eq!(resolve_effective_position(&ctx, "unknown"), None);
+    }
+
+    /// Security: ensure `runtime_dir()` rejects relative XDG_RUNTIME_DIR
+    /// (would otherwise resolve to CWD-relative paths).
+    #[test]
+    fn runtime_dir_rejects_relative_path() {
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: single-threaded test
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", "tmp/runtime");
+            let dir = runtime_dir();
+            assert_eq!(dir, PathBuf::from("/tmp"), "relative path must be rejected");
+            if let Some(val) = original {
+                set_env("XDG_RUNTIME_DIR", &val);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+        }
+    }
+
+    /// Security: ensure `runtime_dir()` rejects paths containing `..`.
+    #[test]
+    fn runtime_dir_rejects_parent_dir_traversal() {
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: single-threaded
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", "/run/user/1000/../../etc");
+            let dir = runtime_dir();
+            assert_eq!(dir, PathBuf::from("/tmp"), "parent-dir traversal must be rejected");
+            if let Some(val) = original {
+                set_env("XDG_RUNTIME_DIR", &val);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+        }
+    }
+
+    /// Security: ensure `runtime_dir()` rejects nonexistent paths
+    /// (defends against typo'd or hostile values pointing to attacker-controlled
+    /// future locations).
+    #[test]
+    fn runtime_dir_rejects_nonexistent() {
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: single-threaded
+        unsafe {
+            set_env(
+                "XDG_RUNTIME_DIR",
+                "/definitely/does/not/exist/runtime-dir-12345",
+            );
+            let dir = runtime_dir();
+            assert_eq!(dir, PathBuf::from("/tmp"));
+            if let Some(val) = original {
+                set_env("XDG_RUNTIME_DIR", &val);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+        }
+    }
+
+    /// Security: socket validation must NOT follow symlinks. A symlink
+    /// pointing to a real socket should be rejected, since an attacker who
+    /// controls /tmp could plant a symlink targeting a socket they own.
+    #[test]
+    fn socket_validation_rejects_symlink_to_socket() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_sock = dir.path().join("real.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&real_sock).unwrap();
+
+        let symlink_path = dir.path().join("via-symlink.sock");
+        symlink(&real_sock, &symlink_path).unwrap();
+
+        // is_unix_socket uses lstat; a symlink (even pointing at a real
+        // socket) must NOT pass.
+        assert!(!is_unix_socket(&symlink_path),
+            "symlink to socket must be rejected by lstat-based check");
+        // The real socket (no symlink in the path) should pass.
+        assert!(is_unix_socket(&real_sock));
+    }
+
+    /// Helper duplicates clean up after themselves; verify symlink to a
+    /// regular file is also rejected (would otherwise be silently followed
+    /// by std::fs::metadata).
+    #[test]
+    fn socket_validation_rejects_symlink_to_regular_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular.txt");
+        std::fs::write(&regular, "data").unwrap();
+        let link = dir.path().join("link.sock");
+        symlink(&regular, &link).unwrap();
+
+        assert!(!is_unix_socket(&link));
+    }
+
+    /// `runtime_socket_path` (Hyprland helper) must reject env vars whose
+    /// instance signature contains separators or `..`.
+    #[test]
+    fn runtime_socket_path_rejects_traversal_in_signature() {
+        use crate::hyprland::runtime_socket_path;
+
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let orig_runtime = env::var("XDG_RUNTIME_DIR").ok();
+        let orig_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+
+        // SAFETY: single-threaded test, restored at end
+        unsafe {
+            // Use a real existing dir so runtime_dir part passes validation
+            set_env("XDG_RUNTIME_DIR", "/tmp");
+
+            for bad in &["../escape", "a/b", ".hidden", "..", ""] {
+                set_env("HYPRLAND_INSTANCE_SIGNATURE", bad);
+                assert!(
+                    runtime_socket_path(".socket.sock").is_err(),
+                    "signature {bad:?} must be rejected"
+                );
+            }
+
+            // Restore
+            if let Some(v) = orig_runtime {
+                set_env("XDG_RUNTIME_DIR", &v);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+            if let Some(v) = orig_sig {
+                set_env("HYPRLAND_INSTANCE_SIGNATURE", &v);
+            } else {
+                remove_env("HYPRLAND_INSTANCE_SIGNATURE");
+            }
+        }
+    }
+
+    /// `runtime_socket_path` must reject relative XDG_RUNTIME_DIR.
+    #[test]
+    fn runtime_socket_path_rejects_relative_runtime_dir() {
+        use crate::hyprland::runtime_socket_path;
+
+        let _g = super::suppress_file_test_mutex().lock().unwrap();
+        let orig_runtime = env::var("XDG_RUNTIME_DIR").ok();
+        let orig_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+
+        // SAFETY: single-threaded
+        unsafe {
+            set_env("XDG_RUNTIME_DIR", "relative/path");
+            set_env("HYPRLAND_INSTANCE_SIGNATURE", "valid_sig");
+            assert!(runtime_socket_path(".socket.sock").is_err());
+
+            // Restore
+            if let Some(v) = orig_runtime {
+                set_env("XDG_RUNTIME_DIR", &v);
+            } else {
+                remove_env("XDG_RUNTIME_DIR");
+            }
+            if let Some(v) = orig_sig {
+                set_env("HYPRLAND_INSTANCE_SIGNATURE", &v);
+            } else {
+                remove_env("HYPRLAND_INSTANCE_SIGNATURE");
+            }
+        }
+    }
+
+    /// Verify try_mpv_paths returns None when no socket responds — sanity
+    /// check on the shared retry helper.
+    #[tokio::test]
+    async fn try_mpv_paths_returns_none_when_no_socket_works() {
+        let original = env::var("MPV_IPC_SOCKET").ok();
+        // SAFETY: single-threaded test
+        unsafe {
+            set_env("MPV_IPC_SOCKET", "/tmp/definitely-nonexistent-mpv-socket-xyz");
+        }
+        let result: Option<()> = try_mpv_paths(0, |_path| async { None }).await;
+        assert!(result.is_none());
+
+        // SAFETY: restore
+        unsafe {
+            if let Some(v) = original {
+                set_env("MPV_IPC_SOCKET", &v);
+            } else {
+                remove_env("MPV_IPC_SOCKET");
+            }
+        }
     }
 }
