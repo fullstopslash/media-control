@@ -3,7 +3,7 @@
 //! Pins or unpins the media window and applies appropriate positioning
 //! based on the current state and configuration.
 
-use super::{CommandContext, focus_window_cmd, pin_cmd, suppress_avoider, toggle_floating_cmd};
+use super::{CommandContext, pin_cmd, suppress_avoider, toggle_floating_cmd};
 use crate::error::Result;
 
 /// Toggle pinned floating mode for the media window.
@@ -53,7 +53,7 @@ pub async fn pin_and_float(ctx: &CommandContext) -> Result<()> {
 
     // Enable pinned+floating mode
     // Focus the window first (dispatch prepends "dispatch", so pass bare command)
-    ctx.hyprland.dispatch(&focus_window_cmd(addr)).await?;
+    ctx.hyprland.dispatch(&format!("focuswindow address:{addr}")).await?;
 
     // Build batch commands for state changes
     let mut cmds: Vec<String> = Vec::with_capacity(2);

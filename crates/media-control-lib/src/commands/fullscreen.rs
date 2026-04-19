@@ -71,7 +71,7 @@ async fn auto_pin_window(ctx: &CommandContext, media: &MediaWindow) -> Result<()
     suppress_avoider().await;
 
     if media.floating {
-        ctx.hyprland.dispatch(&pin_cmd(addr)).await?;
+        ctx.hyprland.dispatch(&format!("pin address:{addr}")).await?;
     } else {
         let float = toggle_floating_cmd(addr);
         let pin = pin_cmd(addr);
@@ -180,7 +180,7 @@ async fn exit_fullscreen(
     let current_pinned = media_window.map(|c| c.pinned).unwrap_or(false);
 
     if should_restore_pin && !current_pinned {
-        ctx.hyprland.dispatch(&pin_cmd(addr)).await?;
+        ctx.hyprland.dispatch(&format!("pin address:{addr}")).await?;
     }
 
     // Position the media window to default position and resize
