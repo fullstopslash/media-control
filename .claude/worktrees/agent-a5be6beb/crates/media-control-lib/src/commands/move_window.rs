@@ -155,8 +155,17 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
 
     // Resolve only the position needed for this direction (avoids unnecessary stat calls)
     let resolve = |name: &str| {
-        super::resolve_effective_position(ctx, name)
-            .unwrap_or_else(|| ctx.config.resolve_position(name).unwrap_or(0))
+        if let Some(v) = super::resolve_effective_position(ctx, name) {
+            return v;
+        }
+        if let Some(v) = ctx.config.resolve_position(name) {
+            return v;
+        }
+        tracing::warn!(
+            "move_window: position '{}' not found in config, using 0 as fallback",
+            name
+        );
+        0
     };
     let (ew, eh) = super::effective_dimensions(ctx);
 

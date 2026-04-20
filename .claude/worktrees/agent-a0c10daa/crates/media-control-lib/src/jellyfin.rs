@@ -891,6 +891,42 @@ impl JellyfinClient {
         Ok(response.items)
     }
 
+    /// Validate a Jellyfin item or session ID.
+    ///
+    /// Jellyfin IDs are 32-character hexadecimal strings (UUIDs without
+    /// dashes). This validator accepts any string that:
+    /// - Contains at least 8 characters (rejects trivially short/stub values)
+    /// - Consists entirely of ASCII alphanumeric characters (rejects dots,
+    ///   dashes, whitespace, and anything that isn't `[A-Za-z0-9]`)
+    ///
+    /// The minimum length of 8 rejects placeholders like `"..."` or `"x"`
+    /// while still accepting short test IDs used in integration fixtures.
+    /// The alphanumeric-only rule rejects `"..."` (all dots) and similar
+    /// semantically-invalid strings that pass a naive length check.
+    ///
+    /// # Errors
+    ///
+    /// Returns `JellyfinError::InvalidCredentials` (reusing the most
+    /// appropriate existing variant) if the ID is empty, too short, or
+    /// contains non-alphanumeric characters.
+    pub fn validate_id(id: &str) -> Result<()> {
+        const MIN_LEN: usize = 8;
+
+        if id.len() < MIN_LEN {
+            return Err(JellyfinError::InvalidCredentials(
+                "item ID too short (minimum 8 alphanumeric characters)",
+            ));
+        }
+
+        if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(JellyfinError::InvalidCredentials(
+                "item ID contains non-alphanumeric characters",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Get the server URL.
     pub fn server_url(&self) -> &str {
         &self.server_url
@@ -1379,6 +1415,61 @@ mod tests {
         // can't tell *which* field was missing from `cred.json`.
         let err = JellyfinError::InvalidCredentials("no credentials in file");
         assert!(err.to_string().contains("no credentials in file"));
+    }
+
+    #[test]
+    fn validate_id_accepts_valid_hex_uuid() {
+        // Typical Jellyfin item ID: 32 hex chars, no dashes
+        assert!(JellyfinClient::validate_id("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4").is_ok());
+    }
+
+    #[test]
+    fn validate_id_accepts_minimum_length() {
+        // Exactly 8 alphanumeric chars — minimum accepted
+        assert!(JellyfinClient::validate_id("abcd1234").is_ok());
+    }
+
+    #[test]
+    fn validate_id_rejects_three_dots() {
+        // "..." is a placeholder/sentinel that was previously accepted by
+        // naive length checks; must now be rejected
+        let err = JellyfinClient::validate_id("...").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidCredentials(_)));
+    }
+
+    #[test]
+    fn validate_id_rejects_dots_at_min_length() {
+        // Eight dots passes the old length check but must be rejected because
+        // dots are not alphanumeric
+        let err = JellyfinClient::validate_id("........").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidCredentials(_)));
+    }
+
+    #[test]
+    fn validate_id_rejects_empty() {
+        let err = JellyfinClient::validate_id("").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidCredentials(_)));
+    }
+
+    #[test]
+    fn validate_id_rejects_too_short() {
+        let err = JellyfinClient::validate_id("abc123").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidCredentials(_)));
+    }
+
+    #[test]
+    fn validate_id_rejects_dashes() {
+        // UUID with dashes (e.g. "550e8400-e29b-41d4-a716-446655440000") must
+        // be rejected — Jellyfin IDs are dashless hex
+        let err =
+            JellyfinClient::validate_id("550e8400-e29b-41d4-a716-446655440000").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidCredentials(_)));
+    }
+
+    #[test]
+    fn validate_id_rejects_whitespace() {
+        let err = JellyfinClient::validate_id("abc123  x").unwrap_err();
+        assert!(matches!(err, JellyfinError::InvalidCredentials(_)));
     }
 }
 

@@ -284,29 +284,55 @@ pub(crate) fn toggle_floating_cmd(addr: &str) -> String {
 ///
 /// Tries modern `cursor:no_warps` syntax first, falls back to legacy
 /// `general:no_cursor_warps` for older Hyprland versions.
+///
+/// The no-warps keyword is always cleared — even when both IPC paths fail —
+/// to avoid leaving the cursor permanently stuck in no-warp mode.
 pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
     let focus = focus_window_cmd(addr);
 
-    let result = ctx
-        .hyprland
-        .batch(&[
-            "keyword cursor:no_warps true",
-            &focus,
-            "keyword cursor:no_warps false",
-        ])
-        .await;
+    // Inner async block holds the actual logic so the cleanup `false` keyword
+    // can be sent unconditionally after it, regardless of outcome.
+    let result = async {
+        // Try modern syntax first.
+        let modern = ctx
+            .hyprland
+            .batch(&[
+                "keyword cursor:no_warps true",
+                &focus,
+                "keyword cursor:no_warps false",
+            ])
+            .await;
 
-    if result.is_err() {
+        if modern.is_ok() {
+            return Ok(());
+        }
+
+        // Fall back to legacy syntax for older Hyprland versions.
         ctx.hyprland
             .batch(&[
                 "keyword general:no_cursor_warps true",
                 &focus,
                 "keyword general:no_cursor_warps false",
             ])
-            .await?;
+            .await
+    }
+    .await;
+
+    // Safety net: if both paths failed we may have sent a `true` keyword
+    // without a matching `false` (e.g. if Hyprland processed the first command
+    // in a batch before the socket error). Clear both variants unconditionally
+    // so the cursor is never permanently stuck in no-warp mode.
+    if result.is_err() {
+        let _ = ctx
+            .hyprland
+            .batch(&[
+                "keyword cursor:no_warps false",
+                "keyword general:no_cursor_warps false",
+            ])
+            .await;
     }
 
-    Ok(())
+    result
 }
 
 /// Get the path to the minified state file.

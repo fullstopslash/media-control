@@ -173,13 +173,30 @@ async fn exit_fullscreen(
     // Get fresh state after exiting fullscreen
     let fresh_clients = ctx.hyprland.get_clients().await?;
 
-    // Get the media window's current position for repositioning
-    let media_window = fresh_clients.iter().find(|c| c.address == *addr);
+    // Get the media window's current position for repositioning.
+    // Verify the window still exists AND belongs to the same class/title to
+    // guard against the address being recycled by a different window between
+    // the "exit fullscreen" dispatch and now.
+    let media_window = fresh_clients.iter().find(|c| {
+        c.address == *addr && c.class == media.class && c.title == media.title
+    });
 
-    // Restore pin if needed
+    if fresh_clients.iter().any(|c| c.address == *addr)
+        && media_window.is_none()
+    {
+        tracing::warn!(
+            "skipping re-pin: address {addr} is now occupied by a different window \
+             (original class={:?} title={:?})",
+            media.class,
+            media.title,
+        );
+    }
+
+    // Restore pin if needed — only when the window is confirmed to be the
+    // same window we exited fullscreen on.
     let current_pinned = media_window.map(|c| c.pinned).unwrap_or(false);
 
-    if should_restore_pin && !current_pinned {
+    if should_restore_pin && !current_pinned && media_window.is_some() {
         ctx.hyprland.dispatch(&format!("pin address:{addr}")).await?;
     }
 
