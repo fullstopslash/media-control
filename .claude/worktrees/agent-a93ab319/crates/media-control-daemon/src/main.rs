@@ -657,8 +657,10 @@ async fn cmd_status() -> ExitCode {
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
 
+    // Cover both the daemon binary crate and the shared lib crate so that
+    // tracing calls in `media_control_lib` are not silently dropped.
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("media_control_daemon=info"));
+        .unwrap_or_else(|_| EnvFilter::new("media_control_daemon=info,media_control_lib=info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

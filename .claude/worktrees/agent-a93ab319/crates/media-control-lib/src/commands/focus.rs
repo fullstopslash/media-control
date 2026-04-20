@@ -42,7 +42,8 @@ use crate::error::Result;
 ///
 /// * `ctx` - The command context
 /// * `launch_cmd` - Optional command to run if no media window is found.
-///   The command is executed via `sh -c` for shell expansion.
+///   The command is split using POSIX-shell quoting rules (`shlex`) and
+///   executed directly — **not** via `sh -c` — to avoid shell injection.
 ///
 /// # Returns
 ///
@@ -90,16 +91,25 @@ pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> 
     // the events we were guarding against.
     clear_suppression().await;
 
-    // Launch command if provided
+    // Launch command if provided.
+    //
+    // Split with `shlex` (POSIX-shell quoting rules) instead of passing the
+    // raw string to `sh -c`, which would allow shell metacharacters in the
+    // keybind config to execute arbitrary shell code. `shlex::split` handles
+    // quoted arguments and escaped characters but never invokes a shell.
     if let Some(cmd) = launch_cmd {
-        // Spawn in background (don't wait for it)
-        Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let parts = shlex::split(cmd).unwrap_or_else(|| {
+            // Fallback: treat as a single executable with no arguments.
+            vec![cmd.to_owned()]
+        });
+        if let Some((exe, args)) = parts.split_first() {
+            Command::new(exe)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
     }
 
     Ok(false)

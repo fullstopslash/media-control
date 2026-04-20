@@ -183,10 +183,13 @@ async fn main() {
         return;
     }
 
-    // Setup logging (off by default, enabled with -v)
+    // Setup logging (off by default, enabled with -v).
+    // The filter covers both the CLI binary crate (`media_control`) and the
+    // shared lib crate (`media_control_lib`) so debug/warn calls in lib code
+    // are not silently dropped when -v is passed.
     if cli.verbose {
         tracing_subscriber::fmt()
-            .with_env_filter("media_control=debug")
+            .with_env_filter("media_control=debug,media_control_lib=debug")
             .init();
     }
 

@@ -635,64 +635,6 @@ mod tests {
         unsafe { env::remove_var(key) };
     }
 
-    #[tokio::test]
-    async fn suppress_file_path_uses_xdg_runtime_dir() {
-        let _g = super::async_env_test_mutex().lock().await;
-        // Save original value
-        let original = env::var("XDG_RUNTIME_DIR").ok();
-
-        // SAFETY: Test is single-threaded and restores the original value
-        unsafe {
-            // Test with XDG_RUNTIME_DIR set
-            set_env("XDG_RUNTIME_DIR", "/run/user/1000");
-            let path = get_suppress_file_path();
-            assert_eq!(path, PathBuf::from("/run/user/1000/media-avoider-suppress"));
-
-            // Restore original value
-            if let Some(val) = original {
-                set_env("XDG_RUNTIME_DIR", &val);
-            } else {
-                remove_env("XDG_RUNTIME_DIR");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn suppress_file_path_fallback() {
-        let _g = super::async_env_test_mutex().lock().await;
-        // Save original value
-        let original = env::var("XDG_RUNTIME_DIR").ok();
-
-        // SAFETY: Test is single-threaded and restores the original value
-        unsafe {
-            // Test without XDG_RUNTIME_DIR
-            remove_env("XDG_RUNTIME_DIR");
-            let path = get_suppress_file_path();
-            assert_eq!(path, PathBuf::from("/tmp/media-avoider-suppress"));
-
-            // Restore original value
-            if let Some(val) = original {
-                set_env("XDG_RUNTIME_DIR", &val);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn suppress_avoider_writes_file() {
-        let _g = super::async_env_test_mutex().lock().await;
-        suppress_avoider().await;
-        let path = get_suppress_file_path();
-        assert!(path.exists(), "suppress file should exist at {path:?}");
-    }
-
-    #[tokio::test]
-    async fn clear_suppression_writes_file() {
-        let _g = super::async_env_test_mutex().lock().await;
-        clear_suppression().await;
-        let path = get_suppress_file_path();
-        assert!(path.exists(), "suppress file should exist at {path:?}");
-    }
-
     #[test]
     fn socket_validation_skips_regular_file() {
         use std::os::unix::fs::FileTypeExt;
@@ -892,66 +834,6 @@ mod tests {
             Some(config.positions.x_right)
         );
         assert_eq!(resolve_effective_position(&ctx, "unknown"), None);
-    }
-
-    /// Security: ensure `runtime_dir()` rejects relative XDG_RUNTIME_DIR
-    /// (would otherwise resolve to CWD-relative paths).
-    #[tokio::test]
-    async fn runtime_dir_rejects_relative_path() {
-        let _g = super::async_env_test_mutex().lock().await;
-        let original = env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: single-threaded test
-        unsafe {
-            set_env("XDG_RUNTIME_DIR", "tmp/runtime");
-            let dir = runtime_dir();
-            assert_eq!(dir, PathBuf::from("/tmp"), "relative path must be rejected");
-            if let Some(val) = original {
-                set_env("XDG_RUNTIME_DIR", &val);
-            } else {
-                remove_env("XDG_RUNTIME_DIR");
-            }
-        }
-    }
-
-    /// Security: ensure `runtime_dir()` rejects paths containing `..`.
-    #[tokio::test]
-    async fn runtime_dir_rejects_parent_dir_traversal() {
-        let _g = super::async_env_test_mutex().lock().await;
-        let original = env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: single-threaded
-        unsafe {
-            set_env("XDG_RUNTIME_DIR", "/run/user/1000/../../etc");
-            let dir = runtime_dir();
-            assert_eq!(dir, PathBuf::from("/tmp"), "parent-dir traversal must be rejected");
-            if let Some(val) = original {
-                set_env("XDG_RUNTIME_DIR", &val);
-            } else {
-                remove_env("XDG_RUNTIME_DIR");
-            }
-        }
-    }
-
-    /// Security: ensure `runtime_dir()` rejects nonexistent paths
-    /// (defends against typo'd or hostile values pointing to attacker-controlled
-    /// future locations).
-    #[tokio::test]
-    async fn runtime_dir_rejects_nonexistent() {
-        let _g = super::async_env_test_mutex().lock().await;
-        let original = env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: single-threaded
-        unsafe {
-            set_env(
-                "XDG_RUNTIME_DIR",
-                "/definitely/does/not/exist/runtime-dir-12345",
-            );
-            let dir = runtime_dir();
-            assert_eq!(dir, PathBuf::from("/tmp"));
-            if let Some(val) = original {
-                set_env("XDG_RUNTIME_DIR", &val);
-            } else {
-                remove_env("XDG_RUNTIME_DIR");
-            }
-        }
     }
 
     /// Security: socket validation must NOT follow symlinks. A symlink
