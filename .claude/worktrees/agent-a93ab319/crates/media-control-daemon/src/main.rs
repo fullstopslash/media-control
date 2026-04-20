@@ -401,14 +401,42 @@ async fn run_event_loop() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the daemon in foreground mode.
+///
+/// Acquires the same start lock that `cmd_start` uses so that running
+/// `foreground` while a background daemon is already live produces an error
+/// rather than silently spawning a second instance.
 async fn run_foreground() -> ExitCode {
     info!("Starting media-control-daemon in foreground mode");
+
+    // Acquire the start lock to prevent a concurrent `start` (or another
+    // `foreground`) from racing past the PID-file check and double-spawning.
+    let _start_lock = match acquire_or_recover_start_lock().await {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+
+    // Refuse to run if a daemon is already live.
+    if let Some(pid) = read_pid_file().await {
+        if is_process_running(pid) {
+            eprintln!("Daemon already running (PID {pid}); refusing to start a second instance");
+            release_start_lock();
+            return ExitCode::FAILURE;
+        }
+        // Stale PID file from a crashed previous run — remove it.
+        remove_pid_file().await;
+    }
 
     // Write PID file
     if let Err(e) = write_pid_file().await {
         error!("Failed to write PID file: {}", e);
+        release_start_lock();
         return ExitCode::FAILURE;
     }
+
+    // Release the start lock now that we have written our PID. Other `start`
+    // or `foreground` invocations racing from here will see our live PID and
+    // exit cleanly via the `is_process_running` check above.
+    release_start_lock();
 
     // Run event loop with graceful shutdown
     let mut sigterm = match tokio::signal::unix::signal(
@@ -564,7 +592,11 @@ async fn cmd_start() -> ExitCode {
     result
 }
 
-/// Stop the running daemon.
+/// Stop the running daemon and wait for it to exit (up to 2 s).
+///
+/// After sending SIGTERM we poll `is_process_running` in 50 ms increments.
+/// If the daemon has not exited within the deadline we log a warning and
+/// return success anyway (the signal was delivered; the caller can retry).
 async fn cmd_stop() -> ExitCode {
     let Some(pid) = read_pid_file().await else {
         eprintln!("Daemon not running (no PID file)");
@@ -584,7 +616,26 @@ async fn cmd_stop() -> ExitCode {
     }
 
     println!("Sent SIGTERM to daemon (PID {})", pid);
-    ExitCode::SUCCESS
+
+    // Poll until the process exits or we time out (2 s / 50 ms = 40 ticks).
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const MAX_WAIT: Duration = Duration::from_secs(2);
+    let deadline = Instant::now() + MAX_WAIT;
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        if !is_process_running(pid) {
+            println!("Daemon stopped (PID {})", pid);
+            return ExitCode::SUCCESS;
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                "Daemon (PID {}) did not exit within {:?}; it may still be shutting down",
+                pid, MAX_WAIT
+            );
+            return ExitCode::SUCCESS;
+        }
+    }
 }
 
 /// Check daemon status.

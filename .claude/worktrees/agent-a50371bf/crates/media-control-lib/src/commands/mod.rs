@@ -22,6 +22,7 @@
 pub mod avoid;
 pub mod chapter;
 pub mod close;
+pub mod context;
 pub mod focus;
 pub mod fullscreen;
 pub mod keep;
@@ -33,6 +34,11 @@ pub mod play;
 pub mod random;
 pub mod seek;
 pub mod status;
+
+pub use context::{
+    async_env_test_mutex, clear_suppression, get_suppress_file_path, runtime_dir,
+    suppress_avoider,
+};
 
 use std::env;
 use std::os::unix::fs::FileTypeExt;
@@ -167,99 +173,6 @@ pub fn get_media_window_with_clients(
 ) -> Option<MediaWindow> {
     let focus_addr = find_focused_address(clients);
     ctx.window_matcher.find_media_window(clients, focus_addr)
-}
-
-/// Get the runtime directory (`$XDG_RUNTIME_DIR` or `/tmp` fallback).
-///
-/// Sanitizes the env value to defend against path-traversal injection:
-/// the path must be absolute, contain no `..` components, and exist as a
-/// directory. On any failure, falls back to `/tmp` and emits a one-shot
-/// warning since `/tmp` is world-writable on most systems.
-pub fn runtime_dir() -> PathBuf {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
-
-    fn sanitize(raw: &str) -> Option<PathBuf> {
-        let p = PathBuf::from(raw);
-        if !p.is_absolute() {
-            return None;
-        }
-        if p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return None;
-        }
-        // Existence check defends against typo'd or hostile values.
-        if !p.is_dir() {
-            return None;
-        }
-        Some(p)
-    }
-
-    if let Some(dir) = env::var("XDG_RUNTIME_DIR").ok().and_then(|v| sanitize(&v)) {
-        return dir;
-    }
-    if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "XDG_RUNTIME_DIR unset or invalid; falling back to /tmp (world-writable, less secure)"
-        );
-    }
-    PathBuf::from("/tmp")
-}
-
-/// Get the path to the avoider suppress file.
-///
-/// The suppress file is located at `$XDG_RUNTIME_DIR/media-avoider-suppress`.
-/// When this file exists and contains a recent timestamp, the avoider daemon
-/// will skip repositioning to prevent feedback loops.
-pub fn get_suppress_file_path() -> PathBuf {
-    runtime_dir().join("media-avoider-suppress")
-}
-
-/// Write a value to the suppress file. Logs on failure.
-async fn write_suppress_file(content: &str) {
-    if let Err(e) = fs::write(get_suppress_file_path(), content).await {
-        tracing::debug!("failed to write suppress file: {e}");
-    }
-}
-
-/// Write a timestamp to the suppress file to prevent avoider repositioning.
-///
-/// The avoider daemon checks this file before repositioning. If the timestamp
-/// is recent (within the configured timeout), it skips the reposition operation.
-/// This prevents feedback loops when commands intentionally move windows.
-pub async fn suppress_avoider() {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    write_suppress_file(&timestamp.to_string()).await;
-}
-
-/// Clear the avoider suppression to allow the next avoid trigger to run.
-///
-/// This writes a timestamp of 0 (epoch) which will always appear as stale
-/// to the avoider daemon, allowing it to run on the next event.
-pub async fn clear_suppression() {
-    write_suppress_file("0").await;
-}
-
-/// Test-only mutex serializing access to process-wide state used by the
-/// suppress file and runtime-dir resolution: `$XDG_RUNTIME_DIR`,
-/// `$HYPRLAND_INSTANCE_SIGNATURE`, and the on-disk suppress file path.
-/// Single process-wide async mutex serialising ALL tests that touch shared
-/// global state: `XDG_RUNTIME_DIR`, `HYPRLAND_INSTANCE_SIGNATURE`,
-/// `MPV_IPC_SOCKET`, or the on-disk suppress file.
-///
-/// Using ONE lock domain eliminates the inter-domain race that previously
-/// existed between sync env-mutation tests and async suppress-file tests.
-/// All callers hold this with `let _g = async_env_test_mutex().lock().await`
-/// for the full test body.
-#[cfg(test)]
-pub(crate) fn async_env_test_mutex() -> &'static tokio::sync::Mutex<()> {
-    use std::sync::OnceLock;
-    static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    M.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Build a `dispatch focuswindow address:<addr>` command string.

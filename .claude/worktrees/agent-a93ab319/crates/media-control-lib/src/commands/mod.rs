@@ -171,13 +171,23 @@ pub fn get_media_window_with_clients(
 
 /// Get the runtime directory (`$XDG_RUNTIME_DIR` or `/tmp` fallback).
 ///
+/// Reads `$XDG_RUNTIME_DIR` **once** at first call and caches the result in a
+/// `OnceLock`. Subsequent calls return the cached value, making the result
+/// consistent across the process lifetime regardless of later env mutations.
+///
 /// Sanitizes the env value to defend against path-traversal injection:
 /// the path must be absolute, contain no `..` components, and exist as a
 /// directory. On any failure, falls back to `/tmp` and emits a one-shot
 /// warning since `/tmp` is world-writable on most systems.
+///
+/// # Note for tests
+///
+/// Because the value is cached after the first call, tests that mutate
+/// `XDG_RUNTIME_DIR` must ensure this function has not yet been called in
+/// their process, or use the `async_env_test_mutex` to serialize access.
 pub fn runtime_dir() -> PathBuf {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<PathBuf> = OnceLock::new();
 
     fn sanitize(raw: &str) -> Option<PathBuf> {
         let p = PathBuf::from(raw);
@@ -196,15 +206,17 @@ pub fn runtime_dir() -> PathBuf {
         Some(p)
     }
 
-    if let Some(dir) = env::var("XDG_RUNTIME_DIR").ok().and_then(|v| sanitize(&v)) {
-        return dir;
-    }
-    if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "XDG_RUNTIME_DIR unset or invalid; falling back to /tmp (world-writable, less secure)"
-        );
-    }
-    PathBuf::from("/tmp")
+    CACHED
+        .get_or_init(|| {
+            if let Some(dir) = env::var("XDG_RUNTIME_DIR").ok().and_then(|v| sanitize(&v)) {
+                return dir;
+            }
+            tracing::warn!(
+                "XDG_RUNTIME_DIR unset or invalid; falling back to /tmp (world-writable, less secure)"
+            );
+            PathBuf::from("/tmp")
+        })
+        .clone()
 }
 
 /// Get the path to the avoider suppress file.
