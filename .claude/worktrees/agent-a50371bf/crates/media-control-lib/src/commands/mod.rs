@@ -35,15 +35,13 @@ pub mod random;
 pub mod seek;
 pub mod status;
 
-pub use context::{
-    async_env_test_mutex, clear_suppression, get_suppress_file_path, runtime_dir,
-    suppress_avoider,
-};
+pub use context::{clear_suppression, get_suppress_file_path, runtime_dir, suppress_avoider};
+#[cfg(test)]
+pub(crate) use context::async_env_test_mutex;
 
 use std::env;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -245,7 +243,7 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
             .await;
     }
 
-    result
+    Ok(result?)
 }
 
 /// Get the path to the minified state file.
