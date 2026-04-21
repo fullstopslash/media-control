@@ -29,7 +29,7 @@
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
           pname = "media-control";
-          version = "0.1.1";
+          version = "0.1.3";
 
           buildInputs = with pkgs; [
             # Add any native dependencies here
