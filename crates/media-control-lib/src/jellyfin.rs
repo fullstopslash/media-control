@@ -31,6 +31,22 @@ pub enum JellyfinError {
     #[error("failed to parse credentials: {0}")]
     CredentialsParsing(#[from] serde_json::Error),
 
+    /// Like `CredentialsParsing` but carries the file path that failed to
+    /// parse. Produced by `load_credentials`; the bare `CredentialsParsing`
+    /// variant is reserved for the `#[from] serde_json::Error` bridge where
+    /// the path isn't known at the conversion site.
+    ///
+    /// Without this, a parse failure surfaces as a bare TOML/JSON error and
+    /// the user has to guess which credential file was offending — this
+    /// matters when `XDG_CONFIG_HOME` is set non-standard or the operator
+    /// has multiple jellyfin-mpv-shim profiles.
+    #[error("failed to parse credentials at {}: {source}", path.display())]
+    CredentialsParseAt {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("invalid credentials: missing {0}")]
     InvalidCredentials(&'static str),
 
@@ -373,6 +389,80 @@ struct ItemsResponse {
     items: Vec<ItemSummary>,
 }
 
+/// Sort field for Jellyfin item queries.
+///
+/// Mirrors the subset of Jellyfin's `SortBy` enum we actually use. Constraining
+/// the type at the function boundary (vs. `&str`) means a typo like
+/// `"datecreated"` (lowercase, server-rejected) can't compile — and any future
+/// caller is forced to confront the closed set rather than guessing a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortBy {
+    /// Server-side library add date (`DateCreated`).
+    DateCreated,
+    /// Alphabetical sort name (`SortName`).
+    SortName,
+    /// Original release/premiere date (`PremiereDate`).
+    PremiereDate,
+    /// Production year (`ProductionYear`).
+    ProductionYear,
+    /// Pseudo-random ordering (`Random`). Useful for shuffle-style picks.
+    Random,
+    /// Index number within a series/season (`IndexNumber`).
+    IndexNumber,
+}
+
+impl fmt::Display for SortBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::DateCreated => "DateCreated",
+            Self::SortName => "SortName",
+            Self::PremiereDate => "PremiereDate",
+            Self::ProductionYear => "ProductionYear",
+            Self::Random => "Random",
+            Self::IndexNumber => "IndexNumber",
+        })
+    }
+}
+
+impl SortBy {
+    /// Wire-format spelling expected by Jellyfin's `SortBy` query parameter.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DateCreated => "DateCreated",
+            Self::SortName => "SortName",
+            Self::PremiereDate => "PremiereDate",
+            Self::ProductionYear => "ProductionYear",
+            Self::Random => "Random",
+            Self::IndexNumber => "IndexNumber",
+        }
+    }
+}
+
+/// Sort direction for Jellyfin item queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    /// `Ascending` — A→Z, oldest→newest.
+    Ascending,
+    /// `Descending` — Z→A, newest→oldest.
+    Descending,
+}
+
+impl fmt::Display for SortOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl SortOrder {
+    /// Wire-format spelling expected by Jellyfin's `SortOrder` query parameter.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ascending => "Ascending",
+            Self::Descending => "Descending",
+        }
+    }
+}
+
 /// Summary of a Jellyfin item (used in filtered queries).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -508,7 +598,14 @@ impl JellyfinClient {
         }
 
         // The credential file is an array; we use the first entry.
-        let creds: Vec<Credentials> = serde_json::from_str(&content)?;
+        // Wrap the parse error with the path so the user sees *which* file
+        // was malformed (`XDG_CONFIG_HOME` may point somewhere unexpected).
+        let creds: Vec<Credentials> = serde_json::from_str(&content).map_err(|source| {
+            JellyfinError::CredentialsParseAt {
+                path: cred_path.clone(),
+                source,
+            }
+        })?;
 
         creds
             .into_iter()
@@ -736,6 +833,13 @@ impl JellyfinClient {
     ///
     /// We still call `.send().await?.error_for_status()?` so HTTP errors
     /// surface as `JellyfinError::Http` rather than silently succeeding.
+    ///
+    /// The response body is **drained to EOF** before being dropped. Without
+    /// this, the underlying TCP/TLS connection cannot be returned to
+    /// `reqwest`'s pool — every `request_empty` call would leak a connection
+    /// slot, starving subsequent requests under load. `bytes()` consumes the
+    /// body in a single contiguous read; the result is intentionally ignored
+    /// (we don't need the bytes, only the side effect of consuming them).
     async fn request_empty<B>(
         &self,
         method: reqwest::Method,
@@ -753,7 +857,12 @@ impl JellyfinClient {
         if let Some(b) = body {
             req = req.json(b);
         }
-        req.send().await?.error_for_status()?;
+        let response = req.send().await?.error_for_status()?;
+        // Drain the body so the connection returns to the pool. Errors here
+        // (truncated body, etc.) are non-fatal: the request already succeeded
+        // semantically per `error_for_status`, and surfacing a body-drain
+        // failure would be more confusing than helpful for an "empty" call.
+        let _ = response.bytes().await;
         Ok(())
     }
 
@@ -1191,15 +1300,19 @@ impl JellyfinClient {
     /// # Arguments
     ///
     /// * `library_id` - Parent library ID to search within
-    /// * `sort_by` - Sort field (e.g., "DateCreated", "Random", "SortName")
-    /// * `sort_order` - Sort direction ("Descending" or "Ascending")
+    /// * `sort_by` - Sort field — see [`SortBy`].
+    /// * `sort_order` - Sort direction — see [`SortOrder`].
     /// * `exclude_id` - Optional item ID to exclude from results
     /// * `limit` - Maximum number of items to return
+    ///
+    /// `sort_by`/`sort_order` are typed enums (not strings) so a typo can't
+    /// reach the wire and produce a mysterious server-side rejection — the
+    /// type system enforces the closed set Jellyfin actually accepts.
     pub async fn get_unwatched_items(
         &self,
         library_id: &str,
-        sort_by: &str,
-        sort_order: &str,
+        sort_by: SortBy,
+        sort_order: SortOrder,
         exclude_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<ItemSummary>> {
@@ -1213,8 +1326,8 @@ impl JellyfinClient {
             ("ParentId", library_id),
             ("IsPlayed", "false"),
             ("Recursive", "true"),
-            ("SortBy", sort_by),
-            ("SortOrder", sort_order),
+            ("SortBy", sort_by.as_str()),
+            ("SortOrder", sort_order.as_str()),
             ("Limit", &limit_str),
             ("Fields", "DateCreated,ProductionYear"),
             ("IncludeItemTypes", "Episode,Movie,MusicVideo,Video"),
@@ -2086,5 +2199,77 @@ mod tests {
         let item: QueueItem = serde_json::from_str(json).unwrap();
         assert_eq!(item.id, "abc");
         assert_eq!(item.playlist_item_id.as_deref(), Some("qi-1"));
+    }
+
+    #[test]
+    fn sort_by_display_matches_wire_format() {
+        // The Display output is what flows into the URL query string —
+        // mismatched casing or hyphenation would silently break server-side
+        // sorting. Pin every variant to the exact spelling Jellyfin expects.
+        assert_eq!(SortBy::DateCreated.to_string(), "DateCreated");
+        assert_eq!(SortBy::SortName.to_string(), "SortName");
+        assert_eq!(SortBy::PremiereDate.to_string(), "PremiereDate");
+        assert_eq!(SortBy::ProductionYear.to_string(), "ProductionYear");
+        assert_eq!(SortBy::Random.to_string(), "Random");
+        assert_eq!(SortBy::IndexNumber.to_string(), "IndexNumber");
+    }
+
+    #[test]
+    fn sort_by_as_str_matches_display() {
+        // Display and as_str must agree — the query-builder uses as_str() but
+        // user-facing logs use Display, and a divergence would be a debugging
+        // nightmare ("the log says X but the server got Y").
+        for sb in [
+            SortBy::DateCreated,
+            SortBy::SortName,
+            SortBy::PremiereDate,
+            SortBy::ProductionYear,
+            SortBy::Random,
+            SortBy::IndexNumber,
+        ] {
+            assert_eq!(sb.as_str(), sb.to_string());
+        }
+    }
+
+    #[test]
+    fn sort_order_display_matches_wire_format() {
+        assert_eq!(SortOrder::Ascending.to_string(), "Ascending");
+        assert_eq!(SortOrder::Descending.to_string(), "Descending");
+    }
+
+    #[test]
+    fn sort_order_as_str_matches_display() {
+        for so in [SortOrder::Ascending, SortOrder::Descending] {
+            assert_eq!(so.as_str(), so.to_string());
+        }
+    }
+
+    #[test]
+    fn credentials_parse_at_displays_path_and_source() {
+        // The whole point of the variant: the offending file path must
+        // appear in the Display output so the user doesn't have to guess
+        // which credential file is malformed.
+        let source = serde_json::from_str::<Vec<Credentials>>("{not json}").unwrap_err();
+        let err = JellyfinError::CredentialsParseAt {
+            path: PathBuf::from("/etc/jellyfin/cred.json"),
+            source,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/etc/jellyfin/cred.json"), "path missing: {msg}");
+        assert!(msg.contains("failed to parse credentials"), "lead-in missing: {msg}");
+    }
+
+    #[test]
+    fn credentials_parse_at_preserves_source_chain() {
+        // `#[source]` on `source` means the Error trait's `source()` chain
+        // walks back to the underlying serde_json::Error — required so
+        // callers can still introspect the parse-position info.
+        use std::error::Error;
+        let source = serde_json::from_str::<Vec<Credentials>>("{").unwrap_err();
+        let err = JellyfinError::CredentialsParseAt {
+            path: PathBuf::from("/x.json"),
+            source,
+        };
+        assert!(err.source().is_some(), "source chain broken");
     }
 }
