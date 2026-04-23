@@ -313,7 +313,12 @@ async fn restore_after_fullscreen_exit(
     // Restore pin if needed. Non-fatal: if Hyprland can't pin right now (e.g.
     // the window is still mid-transition), the user can re-pin manually and
     // the window is at least un-fullscreened.
-    if should_restore_pin
+    //
+    // Gate on `fresh_window.is_some()` — when the window died mid-exit the
+    // address is dead and `pin_action(addr)` would dispatch against a stale
+    // pointer. Mirrors the reposition guard below.
+    if fresh_window.is_some()
+        && should_restore_pin
         && !current_pinned
         && let Err(e) = ctx.hyprland.dispatch(&pin_action(addr)).await
     {
@@ -1189,6 +1194,66 @@ mod tests {
         assert!(
             has_pin_restore,
             "regular pinned mpv must be re-pinned after fs exit: {cmds:?}"
+        );
+    }
+
+    /// Regression (bolt 023): when the media window dies mid-exit, the
+    /// post-exit fresh-clients snapshot won't contain `addr`. The pin restore
+    /// must NOT fire against the dead address — `pin_action(addr)` would
+    /// silently target stale heap. The reposition guard already covers this
+    /// shape; the pin guard now mirrors it.
+    #[tokio::test]
+    async fn fullscreen_exit_dead_window_skips_pin_dispatch() {
+        let mock = MockHyprland::start().await;
+
+        // Pre-exit: mpv pinned + fullscreen.
+        let clients_fs = vec![make_test_client_full(
+            "0xd1",
+            "mpv",
+            "video.mp4",
+            true, // pinned
+            true,
+            2, // fullscreen
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
+        )];
+        // Post-exit: window is GONE (closed mid-exit). Address 0xd1 absent.
+        let clients_after = vec![make_test_client_full(
+            "0xb1",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
+        )];
+        mock.set_response_sequence(
+            "j/clients",
+            vec![
+                make_clients_json(&clients_fs),
+                make_clients_json(&clients_after),
+            ],
+        )
+        .await;
+
+        let ctx = mock.context(test_config());
+        fullscreen(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        // No standalone `dispatch pin` against the dead address.
+        let pin_dispatched = cmds
+            .iter()
+            .any(|c| c.contains("dispatch pin address:0xd1") && !c.contains("fullscreen"));
+        assert!(
+            !pin_dispatched,
+            "pin must not dispatch when fresh_window is None: {cmds:?}"
         );
     }
 

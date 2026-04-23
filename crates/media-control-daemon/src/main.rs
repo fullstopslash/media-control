@@ -16,6 +16,7 @@ use media_control_lib::commands::{self, CommandContext, runtime_dir};
 use media_control_lib::config::Config;
 use media_control_lib::error::MediaControlError;
 use media_control_lib::hyprland::{HyprlandError, runtime_socket_path};
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::fs;
@@ -589,73 +590,73 @@ async fn run_foreground() -> ExitCode {
 }
 
 /// Path of the start-lock file (single source of truth).
+///
+/// The file persists on disk; serialization comes from `flock(LOCK_EX)` on
+/// the open FD, not from the file's existence. We never unlink it, so there
+/// is no "stale lock" state to recover from.
 fn start_lock_path() -> Result<PathBuf, MediaControlError> {
     Ok(runtime_dir()?.join("media-control-daemon.start.lock"))
 }
 
-/// Acquire an exclusive start-lock to prevent concurrent `cmd_start` invocations
-/// from racing past the PID-file check and double-spawning the daemon.
+/// Acquire an exclusive `flock(LOCK_EX | LOCK_NB)` on the start-lock file.
 ///
-/// Returns the lock file (must be held until spawn completes) or an error if
-/// another start is in progress. Uses `O_CREAT|O_EXCL` so creation is atomic
-/// with respect to other processes.
-fn acquire_start_lock() -> std::io::Result<std::fs::File> {
+/// # Invariant (TOCTOU-free)
+///
+/// The lock is the kernel-side `flock`, NOT the existence of the on-disk
+/// sentinel. The file is created (O_CREAT, mode 0o600) and the lock is
+/// taken in a single function with no intervening release. While the
+/// returned `Flock` is held:
+///
+/// - any other process calling `acquire_start_lock` returns `EWOULDBLOCK`
+///   (translated by `Flock::lock` into `Err`), and
+/// - dropping the `Flock` (or process exit, including SIGKILL or panic)
+///   atomically releases the lock — the kernel handles this on FD close,
+///   so a crashed `cmd_start` can never leave behind a stuck lock.
+///
+/// This replaces an earlier `O_EXCL`-on-sentinel scheme that had a TOCTOU
+/// window in `acquire_or_recover_start_lock`: between the staleness check
+/// and the recovery-`unlink`, another `cmd_start` could swoop in and
+/// release a healthy daemon's lock. With `flock`, no such recovery dance
+/// is needed — the kernel never lets two processes hold LOCK_EX at once,
+/// and there's no on-disk state for a crashed process to "leak".
+fn acquire_start_lock() -> std::io::Result<Flock<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = start_lock_path().map_err(std::io::Error::other)?;
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_f, errno)| {
+        // EWOULDBLOCK is the "another start in progress" case; surface it
+        // explicitly so the caller can distinguish it from genuine I/O
+        // errors.
+        std::io::Error::from_raw_os_error(errno as i32)
+    })
 }
 
-/// Release the start lock by removing the lock file.
-fn release_start_lock() {
-    if let Ok(path) = start_lock_path() {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// RAII guard that removes the on-disk start-lock sentinel on drop.
+/// Acquire the start lock. Returns the live lock handle on success or an
+/// `ExitCode::FAILURE` after logging if the lock is held by a concurrent
+/// start.
 ///
-/// `cmd_start` calls into `spawn_foreground_worker`, which can panic. Without
-/// this guard the lock file would survive and block all future starts until
-/// removed manually. Drop-on-panic ensures the next `cmd_start` recovers
-/// cleanly via `acquire_or_recover_start_lock`.
-struct StartLockGuard;
-
-impl Drop for StartLockGuard {
-    fn drop(&mut self) {
-        release_start_lock();
-    }
-}
-
-/// Acquire the start lock, recovering from a stale lock left behind by a
-/// crashed previous start. Returns the live lock handle on success.
-async fn acquire_or_recover_start_lock() -> Result<std::fs::File, ExitCode> {
-    match acquire_start_lock() {
-        Ok(f) => Ok(f),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Stale lock or genuine concurrent start? Check liveness.
-            let pid_alive = read_pid_file()
-                .await
-                .map(is_process_running)
-                .unwrap_or(false);
-            if pid_alive {
-                error!("Daemon start already in progress");
-                return Err(ExitCode::FAILURE);
-            }
-            release_start_lock();
-            acquire_start_lock().map_err(|e| {
-                error!("Failed to acquire start lock: {e}");
-                ExitCode::FAILURE
-            })
-        }
-        Err(e) => {
+/// No recovery branch is needed: `flock` is released by the kernel on FD
+/// close (including process death), so a crashed previous start cannot leave
+/// the lock stuck. A held lock therefore unambiguously means another
+/// `cmd_start` is currently running.
+async fn acquire_or_recover_start_lock() -> Result<Flock<std::fs::File>, ExitCode> {
+    acquire_start_lock().map_err(|e| {
+        // EWOULDBLOCK == LOCK_EX held by another process. We can't easily
+        // distinguish from other errors here without raw_os_error matching,
+        // but the message covers the common case.
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            error!("Daemon start already in progress (start-lock held)");
+        } else {
             error!("Failed to acquire start lock: {e}");
-            Err(ExitCode::FAILURE)
         }
-    }
+        ExitCode::FAILURE
+    })
 }
 
 /// Spawn the daemon's foreground worker as a detached background process.
@@ -751,7 +752,41 @@ async fn cmd_start() -> ExitCode {
     spawn_foreground_worker()
 }
 
+/// Poll-interval and total timeouts for the SIGTERM/SIGKILL wait loops in
+/// [`cmd_stop`]. Tuned together: a 50 ms poll keeps shell latency low, the
+/// 2 s SIGTERM window covers the daemon's clean-shutdown path (FIFO drain +
+/// PID-file unlink + Hyprland socket close, all sub-second on a healthy
+/// system), and the 1 s SIGKILL window leaves room for the kernel to reap
+/// after KILL — which can't be ignored, so anything longer indicates the
+/// process is stuck in uninterruptible sleep (D state), at which point an
+/// error return is the correct answer.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STOP_TERM_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_KILL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Wait up to `total` for `pid` to stop being a live process.
+///
+/// Returns `true` once the PID is gone, `false` if the deadline passes and
+/// the process is still alive. Polls every [`STOP_POLL_INTERVAL`] so a
+/// fast-exiting daemon is detected within ~50 ms.
+async fn wait_for_exit(pid: Pid, total: Duration) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if !is_process_running(pid) {
+            return true;
+        }
+        tokio::time::sleep(STOP_POLL_INTERVAL).await;
+    }
+    !is_process_running(pid)
+}
+
 /// Stop the running daemon.
+///
+/// Sends SIGTERM, waits up to [`STOP_TERM_TIMEOUT`] for clean shutdown, then
+/// escalates to SIGKILL if the daemon hasn't exited. Returns success only
+/// once the PID is verifiably gone — earlier behaviour returned immediately
+/// after sending SIGTERM, which let a subsequent `cmd_start` race against a
+/// daemon still holding the PID file (and lose, double-spawning).
 async fn cmd_stop() -> ExitCode {
     let Some(pid) = read_pid_file().await else {
         error!("Daemon not running (no PID file)");
@@ -764,14 +799,42 @@ async fn cmd_stop() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Send SIGTERM
+    // Send SIGTERM and wait for the daemon's signal handler to drive a
+    // clean shutdown.
     if let Err(e) = signal::kill(pid, Signal::SIGTERM) {
         error!("Failed to send SIGTERM to PID {pid}: {e}");
         return ExitCode::FAILURE;
     }
-
     info!("Sent SIGTERM to daemon (PID {pid})");
-    ExitCode::SUCCESS
+
+    if wait_for_exit(pid, STOP_TERM_TIMEOUT).await {
+        // Best-effort PID-file cleanup: the daemon's own shutdown removes
+        // it, but we re-check in case it crashed between SIGTERM receipt
+        // and `remove_pid_file`. `remove_pid_file` is idempotent.
+        remove_pid_file().await;
+        info!("Daemon stopped (PID {pid})");
+        return ExitCode::SUCCESS;
+    }
+
+    // Escalate. SIGKILL is uncatchable, so failure to exit after this
+    // window means the kernel hasn't reaped — D-state or similar.
+    warn!("Daemon (PID {pid}) did not exit after SIGTERM; escalating to SIGKILL");
+    if let Err(e) = signal::kill(pid, Signal::SIGKILL) {
+        error!("Failed to send SIGKILL to PID {pid}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if wait_for_exit(pid, STOP_KILL_TIMEOUT).await {
+        remove_pid_file().await;
+        info!("Daemon killed (PID {pid})");
+        ExitCode::SUCCESS
+    } else {
+        error!(
+            "Daemon (PID {pid}) still running after SIGKILL + {:?} — kernel has not reaped",
+            STOP_KILL_TIMEOUT
+        );
+        ExitCode::FAILURE
+    }
 }
 
 /// Check daemon status.

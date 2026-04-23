@@ -145,44 +145,6 @@ pub async fn get_media_window(ctx: &CommandContext) -> Result<Option<MediaWindow
     Ok(ctx.window_matcher.find_media_window(&clients, focus_addr))
 }
 
-/// Run `op` against the current media window, doing nothing when no media
-/// window is found.
-///
-/// Captures the recurring command shape:
-///
-/// ```text
-///     get_media_window(ctx).await? -> Some(w) or return Ok(()) -> dispatch
-/// ```
-///
-/// Most dispatch commands (focus, pin, fullscreen, close, ...) follow this
-/// exact pattern. Routing through this helper keeps the "no media window
-/// is a silent success" decision in one place — callers that want a hard
-/// error on missing media should call [`get_media_window`] directly.
-///
-/// # Example
-///
-/// ```ignore
-/// with_media_window(ctx, |w| async move {
-///     ctx.hyprland.dispatch(&pin_action(&w.address)).await
-/// }).await
-/// ```
-// Allow until existing callers are migrated in a follow-up pass — the
-// helper is documented and ready for adoption but not yet wired in here.
-#[allow(dead_code)]
-pub(crate) async fn with_media_window<F, Fut>(
-    ctx: &CommandContext,
-    op: F,
-) -> crate::error::Result<()>
-where
-    F: FnOnce(crate::window::MediaWindow) -> Fut,
-    Fut: std::future::Future<Output = crate::error::Result<()>>,
-{
-    let Some(window) = get_media_window(ctx).await? else {
-        return Ok(());
-    };
-    op(window).await
-}
-
 /// Find media window from pre-fetched clients.
 ///
 /// This variant avoids an extra Hyprland IPC call when clients have already
@@ -467,7 +429,10 @@ pub async fn restore_focus(ctx: &CommandContext, addr: &str) -> Result<()> {
         // action, so the `dispatch_batch` / `dispatch` helpers (which
         // auto-prefix `dispatch `) would mangle it.
         if let Err(e) = ctx.hyprland.batch(&["keyword cursor:no_warps false"]).await {
-            tracing::debug!("modern cursor:no_warps reset on fallback failed: {e}");
+            tracing::warn!(
+                "cursor:no_warps cleanup batch failed during restore_focus fallback: {e}; \
+                 cursor:no_warps may be stuck on `true` until another command resets it"
+            );
         }
 
         ctx.hyprland
@@ -518,13 +483,21 @@ pub async fn toggle_minified() -> Result<bool> {
 
 /// Compute scaled (width, height) for the minified branch.
 ///
-/// Defends against pathological config (NaN, negative, or huge `minified_scale`)
-/// by clamping the scaled value into a sane range before converting back to
-/// `i32`. Without this, an `f32 → i32` saturating-cast on `NaN` or out-of-range
-/// values would yield `0` / `i32::MAX` and propagate into geometry math.
+/// Defends against pathological config (NaN, negative, or out-of-range
+/// `minified_scale`) by clamping the scale factor to the same `(0.0, 1.0]`
+/// bound the config validator already enforces, then clamping the scaled
+/// pixel value before converting back to `i32`. Without the upper bound,
+/// an `f32 → i32` saturating-cast on `NaN` or out-of-range values would
+/// yield `0` / `i32::MAX` and propagate into geometry math; without
+/// matching the config bound, a config-validator drift could let the
+/// minified branch silently *upscale* the window.
 fn scaled_dims(w: i32, h: i32, raw_scale: f32) -> (i32, i32) {
+    debug_assert!(
+        raw_scale > 0.0 && raw_scale <= 1.0,
+        "minified_scale must be in (0.0, 1.0]; got {raw_scale}"
+    );
     let scale = if raw_scale.is_finite() {
-        raw_scale.clamp(0.0, 10.0)
+        raw_scale.clamp(0.0, 1.0)
     } else {
         1.0
     };

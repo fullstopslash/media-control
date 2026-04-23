@@ -8,7 +8,7 @@ use tokio::process::Command;
 use super::fullscreen::is_pip_title;
 use super::{
     CommandContext, MPV_IPC_SOCKET_DEFAULT as SHIM_SOCKET, close_window_action, get_media_window,
-    get_minify_state_path, send_to_mpv_socket,
+    get_minify_state_path, send_to_mpv_socket, suppress_avoider,
 };
 use crate::error::Result;
 
@@ -121,6 +121,10 @@ async fn close_window_gracefully(
     }
 
     // All other windows (standalone mpv, Jellyfin, default): closewindow.
+    // Suppress BEFORE the dispatch — Hyprland fires `closewindow` immediately,
+    // and the avoider daemon would otherwise race in to reposition any
+    // remaining media siblings on the workspace before the close has settled.
+    suppress_avoider().await;
     ctx.hyprland.dispatch(&close_window_action(addr)).await?;
     Ok(())
 }
@@ -135,6 +139,9 @@ async fn close_window_gracefully(
 /// owns the PiP, and Firefox's internal tab activation after PiP close
 /// is not deterministic enough to target with Ctrl+W.
 async fn close_firefox_pip(ctx: &CommandContext, pip_addr: &str) -> Result<()> {
+    // Suppress BEFORE the dispatch — `closewindow` emits an event the avoider
+    // would otherwise pick up and use to reposition siblings during teardown.
+    suppress_avoider().await;
     ctx.hyprland
         .dispatch(&close_window_action(pip_addr))
         .await?;

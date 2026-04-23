@@ -1,0 +1,45 @@
+[tools]
+rust = "stable"
+
+[env]
+RUST_LOG = "media_control=info"
+
+[tasks.build]
+description = "Build the workspace in release mode"
+run = "cargo build --workspace --release"
+
+[tasks.install]
+description = "Install binaries to ~/.local/bin"
+depends = ["build"]
+run = """
+mkdir -p ~/.local/bin
+install -m755 target/release/media-control ~/.local/bin/media-control
+install -m755 target/release/media-control-daemon ~/.local/bin/media-control-daemon
+"""
+
+[tasks.lint]
+description = "Run rustfmt + clippy"
+run = """
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+"""
+
+[tasks.fmt]
+description = "Auto-format the workspace"
+run = "cargo fmt --all"
+
+[tasks.test]
+description = "Run the full test suite"
+run = "cargo test --workspace"
+
+[tasks.check]
+description = "Lint + test (quality gate)"
+depends = ["lint", "test"]
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = "cargo clean"
+
+[tasks.dev]
+description = "Watch + rebuild on change"
+run = "cargo watch -x 'check --workspace'"

@@ -440,6 +440,19 @@ pub async fn avoid(ctx: &CommandContext) -> Result<()> {
         return Ok(());
     };
 
+    // Scratchpad windows report `monitor == -1` (special workspace, not bound
+    // to any output). The non-media-count + is_single_workspace heuristics
+    // assume a real monitor id and would mis-classify the scratchpad as a
+    // crowded/empty workspace, triggering spurious repositioning. Bail
+    // entirely — the user explicitly hid these windows.
+    if focused.monitor < 0 {
+        tracing::debug!(
+            "avoid: focused window on scratchpad (monitor={}); skipping",
+            focused.monitor
+        );
+        return Ok(());
+    }
+
     let non_media_count =
         count_non_media_windows(&clients, focused.workspace_id, focused.monitor, ctx);
     // "Single-workspace" here means at most one non-media peer alongside
@@ -1341,6 +1354,59 @@ mod tests {
         let cmds = mock.captured_commands().await;
         let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
         assert!(!has_move, "should return early with no focused window");
+    }
+
+    /// Regression (bolt 023): scratchpad windows report `monitor == -1`. The
+    /// avoid loop uses monitor as a filter for `count_non_media_windows` and
+    /// for `find_media_windows`; with `-1` it would mis-classify the
+    /// workspace and trigger spurious moves on real-monitor media windows.
+    /// Bail early.
+    #[tokio::test]
+    async fn avoid_scratchpad_focused_returns_early() {
+        let mock = MockHyprland::start().await;
+
+        // Focused window on the scratchpad: monitor=-1, focus_history_id=0.
+        // A media window on a real monitor is also present; it must not move.
+        let clients = vec![
+            make_test_client_full(
+                "0xs1",
+                "scratch",
+                "Scratchpad",
+                false,
+                true,
+                0,
+                42, // special workspace id
+                -1, // scratchpad monitor
+                0,  // focused
+                [0, 0],
+                [800, 600],
+            ),
+            make_test_client_full(
+                "0xd1",
+                "mpv",
+                "video.mp4",
+                true,
+                true,
+                0,
+                1,
+                0,
+                1,
+                [100, 100],
+                [640, 360],
+            ),
+        ];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+
+        let ctx = mock.context(test_config());
+        avoid(&ctx).await.unwrap();
+
+        let cmds = mock.captured_commands().await;
+        let has_move = cmds.iter().any(|c| c.contains("movewindowpixel"));
+        assert!(
+            !has_move,
+            "scratchpad focus must not trigger media moves: {cmds:?}"
+        );
     }
 
     #[tokio::test]

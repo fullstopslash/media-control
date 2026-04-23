@@ -4,11 +4,55 @@ Rust applet for managing floating media windows on Hyprland. Handles mpv, PiP, a
 
 ## Install
 
-```sh
-cargo build --release
+### Nix flake (flake-parts host)
+
+Add to your flake's inputs:
+
+```nix
+inputs.media-control.url = "github:rain/media-control";
 ```
 
-Add `target/release/media-control` and `target/release/media-control-daemon` to your PATH.
+Then in your flake-parts host:
+
+```nix
+imports = [ inputs.media-control.flakeModules.default ];
+```
+
+This wires the overlay (so `pkgs.media-control` is available) and exposes `nixosModules.media-control` / `homeManagerModules.media-control`. Enable with:
+
+```nix
+services.media-control.enable = true;
+```
+
+### Nix flake (plain)
+
+```nix
+inputs.media-control.url = "github:rain/media-control";
+
+# NixOS module:
+imports = [ inputs.media-control.nixosModules.default ];
+
+# or home-manager module:
+imports = [ inputs.media-control.homeManagerModules.default ];
+
+services.media-control.enable = true;
+```
+
+### mise
+
+```sh
+mise install
+mise run install
+```
+
+Installs to `~/.local/bin`. Other tasks: `mise run build`, `lint`, `test`, `check`, `fmt`, `clean`, `dev`.
+
+### Cargo (manual)
+
+```sh
+cargo build --release
+install -m755 target/release/media-control{,-daemon} ~/.local/bin/
+```
 
 ## Usage
 

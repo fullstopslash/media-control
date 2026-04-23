@@ -24,12 +24,12 @@ impl ChapterDirection {
         }
     }
 
-    /// Parse a chapter direction from a string.
+    /// Parse a chapter direction from a string (ASCII case-insensitive).
     ///
-    /// Accepts `next`/`Next` for [`Self::Next`] and
-    /// `prev`/`Prev`/`previous`/`Previous` for [`Self::Prev`].
-    /// Mirrors [`super::move_window::Direction::parse`] so CLI dispatch in
-    /// both subcommands stays consistent.
+    /// Accepts any case variant of `next` for [`Self::Next`] and any case
+    /// variant of `prev`/`previous` for [`Self::Prev`] (e.g. `NEXT`, `Prev`,
+    /// `PREVIOUS`). Mirrors [`super::move_window::Direction::parse`] so CLI
+    /// dispatch in both subcommands stays consistent.
     ///
     /// # Returns
     ///
@@ -37,10 +37,12 @@ impl ChapterDirection {
     /// - `None` otherwise
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "next" | "Next" => Some(Self::Next),
-            "prev" | "Prev" | "previous" | "Previous" => Some(Self::Prev),
-            _ => None,
+        if s.eq_ignore_ascii_case("next") {
+            Some(Self::Next)
+        } else if s.eq_ignore_ascii_case("prev") || s.eq_ignore_ascii_case("previous") {
+            Some(Self::Prev)
+        } else {
+            None
         }
     }
 }
@@ -118,9 +120,36 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_inputs() {
         assert_eq!(ChapterDirection::parse(""), None);
-        assert_eq!(ChapterDirection::parse("NEXT"), None);
         assert_eq!(ChapterDirection::parse("forward"), None);
         assert_eq!(ChapterDirection::parse("n"), None);
+    }
+
+    /// Bolt 023: parse is now ASCII case-insensitive — uppercase / mixed-case
+    /// variants must round-trip to the same direction. Mirrors the behaviour
+    /// of `move_window::Direction::parse` so CLI input parsing stays
+    /// consistent across subcommands.
+    #[test]
+    fn parse_is_case_insensitive() {
+        assert_eq!(
+            ChapterDirection::parse("NEXT"),
+            Some(ChapterDirection::Next)
+        );
+        assert_eq!(
+            ChapterDirection::parse("nExT"),
+            Some(ChapterDirection::Next)
+        );
+        assert_eq!(
+            ChapterDirection::parse("PREV"),
+            Some(ChapterDirection::Prev)
+        );
+        assert_eq!(
+            ChapterDirection::parse("PREVIOUS"),
+            Some(ChapterDirection::Prev)
+        );
+        assert_eq!(
+            ChapterDirection::parse("Previous"),
+            Some(ChapterDirection::Prev)
+        );
     }
 
     #[test]

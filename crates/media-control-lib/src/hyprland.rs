@@ -203,6 +203,25 @@ pub struct HyprlandClient {
     socket_path: PathBuf,
 }
 
+/// Reject empty / multi-component / traversal-laden path components.
+/// NUL bytes are rejected because most filesystems treat them as a
+/// terminator, which would silently truncate the resulting path.
+///
+/// The traversal guard is an exact-match check on `..` rather than a
+/// substring scan. The separator checks above already prevent
+/// multi-component injection (a value like `foo/../bar` is rejected by
+/// the `/` test), so the only remaining traversal vector for a single
+/// component is the bare parent-dir token. A substring scan would also
+/// reject benign names that merely embed `..` (e.g. `abc..def`).
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && s != ".."
+        && s != "."
+}
+
 /// Build the absolute path to one of Hyprland's per-instance Unix sockets
 /// (e.g. `.socket.sock` for commands, `.socket2.sock` for events).
 ///
@@ -217,18 +236,6 @@ pub struct HyprlandClient {
 /// `HYPRLAND_INSTANCE_SIGNATURE` are unset or contain unsafe components,
 /// or if `name` is empty / contains separators / contains `..`.
 pub fn runtime_socket_path(name: &str) -> Result<PathBuf> {
-    /// Reject empty / multi-component / traversal-laden path components.
-    /// NUL bytes are rejected because most filesystems treat them as a
-    /// terminator, which would silently truncate the resulting path.
-    fn is_safe_component(s: &str) -> bool {
-        !s.is_empty()
-            && !s.contains('/')
-            && !s.contains('\\')
-            && !s.contains('\0')
-            && !s.contains("..")
-            && s != "."
-    }
-
     // The `name` argument is supplied by the caller, not the environment.
     // Treat a bad value as a validation failure on the env var that would
     // otherwise hold this kind of component (the instance signature).
@@ -973,5 +980,43 @@ mod tests {
         // Even if the first command succeeded, a later `error: ...` line in
         // the batch response must surface as a failure.
         assert!(!HyprlandClient::is_success("ok\nerror: bad\nok\n"));
+    }
+
+    // --- is_safe_component tests ---
+
+    #[test]
+    fn is_safe_component_accepts_normal_names() {
+        assert!(is_safe_component("hyprland"));
+        assert!(is_safe_component(".socket.sock"));
+        assert!(is_safe_component("v0.41.2_1234567890"));
+    }
+
+    #[test]
+    fn is_safe_component_allows_embedded_double_dot() {
+        // `abc..def` is a single component with no separators — it's not the
+        // bare parent-dir token, so the exact-match guard must allow it.
+        // (Pre-fix behaviour rejected this via a `.contains("..")` substring
+        // scan, which over-rejected benign names.)
+        assert!(is_safe_component("abc..def"));
+        assert!(is_safe_component("a..b"));
+        assert!(is_safe_component("..foo"));
+        assert!(is_safe_component("foo.."));
+    }
+
+    #[test]
+    fn is_safe_component_rejects_bare_traversal_tokens() {
+        assert!(!is_safe_component(".."));
+        assert!(!is_safe_component("."));
+    }
+
+    #[test]
+    fn is_safe_component_rejects_separators_and_nul_and_empty() {
+        assert!(!is_safe_component(""));
+        assert!(!is_safe_component("foo/bar"));
+        assert!(!is_safe_component("foo\\bar"));
+        assert!(!is_safe_component("foo\0bar"));
+        // Even with `..` adjacent to a separator, the separator check fires
+        // first — so multi-component traversal is still blocked.
+        assert!(!is_safe_component("foo/../bar"));
     }
 }

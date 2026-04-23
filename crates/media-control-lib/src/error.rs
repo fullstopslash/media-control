@@ -16,6 +16,7 @@ pub type Result<T> = std::result::Result<T, MediaControlError>;
 /// previous `Timeout`/`ResponseError` variants were never produced and were
 /// removed to keep the surface honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MpvIpcErrorKind {
     /// No valid mpv IPC socket found.
     NoSocket,
@@ -34,9 +35,14 @@ impl std::fmt::Display for MpvIpcErrorKind {
 
 /// Specific kinds of Hyprland IPC errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HyprlandIpcErrorKind {
     /// Failed to connect to Hyprland socket.
     ConnectionFailed,
+    /// I/O failure on an already-established Hyprland socket
+    /// (write or read after a successful connect). Distinct from
+    /// `ConnectionFailed`, which is reserved for connect-time failures.
+    IoFailed,
     /// Failed to parse response from Hyprland.
     ParseError,
     /// Socket path not found (HYPRLAND_INSTANCE_SIGNATURE not set).
@@ -50,6 +56,7 @@ impl std::fmt::Display for HyprlandIpcErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ConnectionFailed => write!(f, "failed to connect to Hyprland socket"),
+            Self::IoFailed => write!(f, "Hyprland socket I/O failed"),
             Self::ParseError => write!(f, "failed to parse Hyprland response"),
             Self::SocketNotFound => write!(f, "Hyprland socket not found"),
             Self::Rejected => write!(f, "Hyprland rejected command"),
@@ -59,6 +66,7 @@ impl std::fmt::Display for HyprlandIpcErrorKind {
 
 /// Errors that can occur during media control operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MediaControlError {
     /// Hyprland IPC communication error.
     #[error("hyprland IPC error: {kind}")]
@@ -145,10 +153,15 @@ impl From<crate::hyprland::HyprlandError> for MediaControlError {
                     "invalid environment variable: {name}"
                 ))),
             },
-            HyprlandError::ConnectionFailed(e)
-            | HyprlandError::WriteFailed(e)
-            | HyprlandError::ReadFailed(e) => Self::HyprlandIpc {
+            HyprlandError::ConnectionFailed(e) => Self::HyprlandIpc {
                 kind: HyprlandIpcErrorKind::ConnectionFailed,
+                source: Some(e),
+            },
+            // Write/Read failures occur on an already-established stream;
+            // keeping them distinct from `ConnectionFailed` lets callers and
+            // logs tell "could not connect" apart from "lost the line mid-IO".
+            HyprlandError::WriteFailed(e) | HyprlandError::ReadFailed(e) => Self::HyprlandIpc {
+                kind: HyprlandIpcErrorKind::IoFailed,
                 source: Some(e),
             },
             // Route JSON parse failures into the typed `Json` variant so the
@@ -294,6 +307,10 @@ mod tests {
             "failed to connect to Hyprland socket"
         );
         assert_eq!(
+            HyprlandIpcErrorKind::IoFailed.to_string(),
+            "Hyprland socket I/O failed"
+        );
+        assert_eq!(
             HyprlandIpcErrorKind::ParseError.to_string(),
             "failed to parse Hyprland response"
         );
@@ -305,6 +322,59 @@ mod tests {
             HyprlandIpcErrorKind::Rejected.to_string(),
             "Hyprland rejected command"
         );
+    }
+
+    #[test]
+    fn hyprland_write_failed_bridges_to_io_failed_kind() {
+        // `WriteFailed` must surface as `IoFailed`, not `ConnectionFailed`:
+        // by the time write fails, the connect has already succeeded.
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "write boom");
+        let hypr_err = crate::hyprland::HyprlandError::WriteFailed(io_err);
+        let err: MediaControlError = hypr_err.into();
+        match err {
+            MediaControlError::HyprlandIpc { kind, source } => {
+                assert_eq!(kind, HyprlandIpcErrorKind::IoFailed);
+                let src = source.expect("io::Error source must be preserved");
+                assert_eq!(src.kind(), std::io::ErrorKind::BrokenPipe);
+                assert!(src.to_string().contains("write boom"));
+            }
+            other => panic!("expected HyprlandIpc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hyprland_read_failed_bridges_to_io_failed_kind() {
+        // Same bridge symmetry for `ReadFailed`: the source io::Error must
+        // pass through with its kind and message intact.
+        let io_err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "read boom");
+        let hypr_err = crate::hyprland::HyprlandError::ReadFailed(io_err);
+        let err: MediaControlError = hypr_err.into();
+        match err {
+            MediaControlError::HyprlandIpc { kind, source } => {
+                assert_eq!(kind, HyprlandIpcErrorKind::IoFailed);
+                let src = source.expect("io::Error source must be preserved");
+                assert_eq!(src.kind(), std::io::ErrorKind::UnexpectedEof);
+                assert!(src.to_string().contains("read boom"));
+            }
+            other => panic!("expected HyprlandIpc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hyprland_connection_failed_still_bridges_to_connection_failed_kind() {
+        // Regression guard: the `ConnectionFailed` arm must NOT be folded
+        // into `IoFailed` after the split.
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no connect");
+        let hypr_err = crate::hyprland::HyprlandError::ConnectionFailed(io_err);
+        let err: MediaControlError = hypr_err.into();
+        match err {
+            MediaControlError::HyprlandIpc { kind, source } => {
+                assert_eq!(kind, HyprlandIpcErrorKind::ConnectionFailed);
+                let src = source.expect("io::Error source must be preserved");
+                assert_eq!(src.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            other => panic!("expected HyprlandIpc, got {other:?}"),
+        }
     }
 
     #[test]

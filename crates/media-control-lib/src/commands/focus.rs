@@ -26,7 +26,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use super::{CommandContext, focus_window_action, get_media_window, suppress_avoider};
-use crate::error::Result;
+use crate::error::{MediaControlError, Result};
 
 /// Focus the media window, or launch a command if no media window exists.
 ///
