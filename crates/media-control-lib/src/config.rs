@@ -1111,26 +1111,17 @@ pref_x = "x_left"
     /// A pathological pattern that compiles to an NFA exceeding the size
     /// cap must be rejected at validation time, not silently dropped at
     /// runtime. This exercises the `RegexBuilder::size_limit(...)` cap on
-    /// `validate_pattern_regexes` (matching the runtime matcher's cap).
+    /// `validate_pattern_regexes` (matching the runtime matcher's cap in
+    /// `window.rs`'s `compile_pattern_regex`).
     ///
-    /// The pattern below is a long alternation of unique literal strings;
-    /// each literal expands the NFA's compiled state set, blowing past
-    /// `TITLE_REGEX_SIZE_LIMIT` (64 KiB). Catastrophic-backtracking patterns
-    /// like `(a+)+` are runtime-time blowups, not compile-time blowups, so
-    /// they wouldn't trip the size cap — we need NFA-state pressure instead.
+    /// `a{50000}` produces a compiled-NFA blowup well over the 64 KiB cap —
+    /// same construction used by `window::tests::pattern_regex_size_cap_*`.
     #[test]
     fn validate_rejects_oversized_pattern_regex() {
-        // 4000 unique 16-char tokens alternated. Compiled NFA blows the
-        // 64 KiB cap by a wide margin (each branch contributes states).
-        let big = (0..4000)
-            .map(|i| format!("token_{i:010}"))
-            .collect::<Vec<_>>()
-            .join("|");
-
         let mut config = Config::default();
         config.patterns.push(Pattern {
-            key: "title".into(),
-            value: big,
+            key: "class".into(),
+            value: "a{50000}".into(),
             pinned_only: false,
             always_pin: false,
         });
