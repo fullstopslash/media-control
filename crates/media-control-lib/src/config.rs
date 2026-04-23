@@ -276,14 +276,24 @@ impl Config {
         Ok(())
     }
 
-    /// Validate that every `patterns[].value` regex compiles.
+    /// Validate that every `patterns[].value` regex compiles within the
+    /// same NFA size cap that the runtime matcher enforces.
+    ///
+    /// Mirrors `validate_override_regexes` — using bare `Regex::new` here
+    /// would let an over-large pattern pass validation but be silently
+    /// dropped at runtime (the daemon's `RegexBuilder::size_limit(...)`
+    /// would refuse to build it). Single source of truth via
+    /// [`TITLE_REGEX_SIZE_LIMIT`] (re-exported from `window.rs`).
     fn validate_pattern_regexes(patterns: &[Pattern]) -> Result<()> {
         for p in patterns {
-            Regex::new(&p.value).map_err(|source| ConfigError::InvalidRegex {
-                field: "patterns[].value",
-                pattern: p.value.clone(),
-                source,
-            })?;
+            RegexBuilder::new(&p.value)
+                .size_limit(TITLE_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|source| ConfigError::InvalidRegex {
+                    field: "patterns[].value",
+                    pattern: p.value.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -1096,6 +1106,45 @@ pref_x = "x_left"
                 ..
             }
         ));
+    }
+
+    /// A pathological pattern that compiles to an NFA exceeding the size
+    /// cap must be rejected at validation time, not silently dropped at
+    /// runtime. This exercises the `RegexBuilder::size_limit(...)` cap on
+    /// `validate_pattern_regexes` (matching the runtime matcher's cap).
+    ///
+    /// The pattern below is a long alternation of unique literal strings;
+    /// each literal expands the NFA's compiled state set, blowing past
+    /// `TITLE_REGEX_SIZE_LIMIT` (64 KiB). Catastrophic-backtracking patterns
+    /// like `(a+)+` are runtime-time blowups, not compile-time blowups, so
+    /// they wouldn't trip the size cap — we need NFA-state pressure instead.
+    #[test]
+    fn validate_rejects_oversized_pattern_regex() {
+        // 4000 unique 16-char tokens alternated. Compiled NFA blows the
+        // 64 KiB cap by a wide margin (each branch contributes states).
+        let big = (0..4000)
+            .map(|i| format!("token_{i:010}"))
+            .collect::<Vec<_>>()
+            .join("|");
+
+        let mut config = Config::default();
+        config.patterns.push(Pattern {
+            key: "title".into(),
+            value: big,
+            pinned_only: false,
+            always_pin: false,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidRegex {
+                    field: "patterns[].value",
+                    ..
+                }
+            ),
+            "expected oversized pattern to be rejected by NFA cap, got: {err:?}"
+        );
     }
 
     #[test]

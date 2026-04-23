@@ -637,6 +637,15 @@ fn acquire_start_lock() -> std::io::Result<Flock<std::fs::File>> {
     })
 }
 
+/// Returns true if `e` originated from a non-blocking `flock` losing the
+/// race for the lock (i.e. another process holds it). On Linux
+/// `EWOULDBLOCK` is the same value as `EAGAIN`, which is the errno
+/// `flock(LOCK_EX | LOCK_NB)` returns when another holder exists.
+fn is_lock_held_elsewhere(e: &std::io::Error) -> bool {
+    let Some(n) = e.raw_os_error() else { return false };
+    nix::errno::Errno::from_raw(n) == nix::errno::Errno::EAGAIN
+}
+
 /// Acquire the start lock. Returns the live lock handle on success or an
 /// `ExitCode::FAILURE` after logging if the lock is held by a concurrent
 /// start.
@@ -647,10 +656,7 @@ fn acquire_start_lock() -> std::io::Result<Flock<std::fs::File>> {
 /// `cmd_start` is currently running.
 async fn acquire_or_recover_start_lock() -> Result<Flock<std::fs::File>, ExitCode> {
     acquire_start_lock().map_err(|e| {
-        // EWOULDBLOCK == LOCK_EX held by another process. We can't easily
-        // distinguish from other errors here without raw_os_error matching,
-        // but the message covers the common case.
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if is_lock_held_elsewhere(&e) {
             error!("Daemon start already in progress (start-lock held)");
         } else {
             error!("Failed to acquire start lock: {e}");
@@ -728,16 +734,15 @@ async fn cmd_start() -> ExitCode {
     // below and both spawn a daemon; the second's PID file would clobber
     // the first, leaking a daemon process.
     //
-    // The held `File` handle is the kernel-side mutex; closing it (by
-    // dropping `_start_lock`) only releases our open FD. The on-disk
-    // sentinel that other processes see is removed by `StartLockGuard`'s
-    // `Drop`, which fires on every exit path including panics in
-    // `spawn_foreground_worker`.
+    // The lock is a kernel `flock(LOCK_EX)` on a persistent sentinel file
+    // — released automatically when `_start_lock` is dropped (or when the
+    // process exits, including SIGKILL or panic). No on-disk cleanup is
+    // required, so the previous TOCTOU between "release stale" and
+    // "re-acquire" is gone: there is no "stale" state to recover from.
     let _start_lock = match acquire_or_recover_start_lock().await {
         Ok(f) => f,
         Err(code) => return code,
     };
-    let _lock_guard = StartLockGuard;
 
     // Check if already running (now serialized by the lock above).
     if let Some(pid) = read_pid_file().await {

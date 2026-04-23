@@ -41,24 +41,26 @@ use crate::error::{MediaControlError, Result};
 ///
 /// * `ctx` - The command context
 /// * `launch_cmd` - Optional command to run if no media window is found.
-///   The command is executed via `sh -c` for shell expansion.
+///   The command is tokenized with [`shlex::split`] (POSIX-style word
+///   splitting and quoting only — **no shell**). The first token is the
+///   program; remaining tokens are passed as argv. An empty or unparseable
+///   string returns [`MediaControlError::InvalidArgument`].
 ///
 /// # Safety
 ///
-/// `launch_cmd` is executed via `/bin/sh -c` with full shell expansion.
-/// Never pass untrusted input — this is only safe with hardcoded config values.
-/// Any unescaped metacharacters in `launch_cmd` (`;`, `|`, `$(...)`, backticks,
-/// redirections) will be interpreted by the shell.
+/// `launch_cmd` is **not** executed by a shell. shlex performs only argv
+/// tokenization (handles quoting and escapes); it does NOT expand `$VAR`,
+/// command substitution `$(...)`, globs `*`, redirections `> >>`, pipes `|`,
+/// or sequencers `;` `&&` `||`. The previous `/bin/sh -c` form interpreted
+/// all of those — a title like `Picture-in-Picture; rm -rf ~` would have
+/// executed the trailing command. With shlex, that string becomes literal
+/// argv tokens passed to the program named `Picture-in-Picture;` (which
+/// almost certainly fails to spawn — far better than running `rm`).
 ///
-/// **Concrete failure mode**: callers wrapping `media-control` (Hyprland
-/// keybinds, helper scripts, IPC daemons, GUI launchers) MUST NOT thread
-/// user-controlled data into this argument. Examples of unsafe sources include
-/// browser/window titles (an attacker-controlled page title becomes shell
-/// input), clipboard contents, filenames from the filesystem, environment
-/// variables sourced from untrusted contexts, and anything read from a
-/// socket. A title like `Picture-in-Picture; rm -rf ~` would execute the
-/// trailing command. Build the launch string from a fixed allowlist of
-/// commands defined in your own config, never from runtime data.
+/// Callers who genuinely need shell features can pass them explicitly as
+/// `sh -c "<command-string>"` — that puts the shell invocation in the launch
+/// string itself, where it is visible at the call site rather than implicit
+/// in this function.
 ///
 /// # Returns
 ///
@@ -107,19 +109,30 @@ pub async fn focus_or_launch(ctx: &CommandContext, launch_cmd: Option<&str>) -> 
         return Ok(true);
     }
 
-    // Launch command if provided. No suppression needed — `sh -c <cmd>`
+    // Launch command if provided. No suppression needed — spawning a process
     // doesn't itself generate Hyprland events; the launched app's `openwindow`
     // is precisely the event we want the avoider to react to.
     if let Some(cmd) = launch_cmd {
+        // Tokenize argv-style (no shell). `shlex::split` returns `None` when
+        // the string is malformed (e.g. unclosed quotes); empty input parses
+        // to `Some(vec![])` — both are user errors we surface cleanly.
+        let argv = shlex::split(cmd).ok_or_else(|| {
+            MediaControlError::InvalidArgument(format!(
+                "--launch: failed to tokenize {cmd:?} (unclosed quotes?)"
+            ))
+        })?;
+        let (program, args) = argv.split_first().ok_or_else(|| {
+            MediaControlError::InvalidArgument("--launch: empty after tokenize".into())
+        })?;
+
         // Spawn in background (don't wait for it). `process_group(0)` puts the
         // child in its own process group so it survives if `media-control`
         // exits — without it, a SIGHUP/SIGINT delivered to our process group
         // (e.g. when launched from a terminal that closes) would kill the
         // newly-launched media app too.
-        let mut command = Command::new("sh");
+        let mut command = Command::new(program);
         command
-            .arg("-c")
-            .arg(cmd)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -203,5 +216,68 @@ mod tests {
 
         let result = focus_or_launch(&ctx, None).await.unwrap();
         assert!(!result, "should return false when no media window");
+    }
+
+    /// Bolt 023: an empty `--launch` string (or a string that tokenizes to an
+    /// empty argv) must surface as `InvalidArgument` rather than silently
+    /// spawning nothing or panicking on `split_first`. No media window is
+    /// present so the launch path is exercised.
+    #[tokio::test]
+    async fn focus_launch_empty_string_returns_invalid_argument() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xb1",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+        let ctx = mock.default_context();
+
+        let err = focus_or_launch(&ctx, Some("")).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::MediaControlError::InvalidArgument(_)),
+            "expected InvalidArgument, got: {err:?}"
+        );
+    }
+
+    /// Bolt 023: a launch string with an unclosed quote is unparseable —
+    /// `shlex::split` returns `None`; we must surface `InvalidArgument`.
+    #[tokio::test]
+    async fn focus_launch_unparseable_returns_invalid_argument() {
+        let mock = MockHyprland::start().await;
+
+        let clients = vec![make_test_client_full(
+            "0xb1",
+            "firefox",
+            "Browser",
+            false,
+            false,
+            0,
+            1,
+            0,
+            0,
+            [0, 0],
+            [1920, 1080],
+        )];
+        mock.set_response("j/clients", &make_clients_json(&clients))
+            .await;
+        let ctx = mock.default_context();
+
+        // Unclosed single-quote — shlex returns None.
+        let err = focus_or_launch(&ctx, Some("foo 'bar")).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::MediaControlError::InvalidArgument(_)),
+            "expected InvalidArgument, got: {err:?}"
+        );
     }
 }
