@@ -9,13 +9,15 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use media_control_lib::commands::{self, CommandContext, runtime_dir};
 use media_control_lib::config::Config;
 use media_control_lib::error::MediaControlError;
-use media_control_lib::hyprland::{HyprlandError, runtime_socket_path};
+use media_control_lib::hyprland::{Client, HyprlandError, runtime_socket_path};
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -24,6 +26,166 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Per-tick snapshot of `get_clients()` plus the wall-clock time it was
+/// captured. The avoid hot path is event-driven and bursts of related
+/// events fire within a single debounce window, so reusing the same
+/// snapshot for the whole burst saves an IPC round-trip per event without
+/// changing avoidance semantics (the snapshot would be stale by the next
+/// `Instant::now() - captured_at >= TTL` check anyway).
+struct ClientCache {
+    inner: Mutex<Option<(Instant, Vec<Client>)>>,
+    /// Time-to-live for a cached snapshot. Pinned to the daemon's debounce
+    /// window so the cache horizon never extends past the boundary between
+    /// "this burst" and "next burst".
+    ttl: Duration,
+}
+
+impl ClientCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            inner: Mutex::new(None),
+            ttl,
+        }
+    }
+
+    /// Return a fresh client list, fetching from Hyprland only when the
+    /// cache is missing or older than `ttl`. The returned `Vec` is a clone
+    /// so callers can pass it as `&[Client]` without holding the lock.
+    async fn get_or_refresh(&self, ctx: &CommandContext) -> Result<Vec<Client>, MediaControlError> {
+        if let Some(cached) = self.try_hit() {
+            return Ok(cached);
+        }
+        // Cache cold or stale. Drop the lock across the IPC call so
+        // concurrent callers don't serialize on the round-trip.
+        debug!("client cache: refetching from Hyprland");
+        let fresh = ctx.hyprland.get_clients().await?;
+        self.install(fresh.clone());
+        Ok(fresh)
+    }
+
+    /// Cache-hit test, factored out for testability: returns the cached
+    /// clone iff a snapshot exists and is younger than `ttl`. The brief
+    /// std-mutex critical section does no IO; the hold-time is negligible
+    /// against the full IPC round-trip we avoid by serving from cache.
+    fn try_hit(&self) -> Option<Vec<Client>> {
+        let guard = self.inner.lock().expect("ClientCache poisoned");
+        guard.as_ref().and_then(|(captured_at, cached)| {
+            let age = captured_at.elapsed();
+            if age < self.ttl {
+                debug!("client cache: hit (age={:?})", age);
+                Some(cached.clone())
+            } else {
+                debug!("client cache: miss (stale, age={:?})", age);
+                None
+            }
+        })
+    }
+
+    /// Install a snapshot at the current `Instant`. If a parallel caller
+    /// also fetched and won the race, the later write replaces it — both
+    /// are equally fresh so the order does not matter.
+    fn install(&self, clients: Vec<Client>) {
+        let mut guard = self.inner.lock().expect("ClientCache poisoned");
+        *guard = Some((Instant::now(), clients));
+    }
+}
+
+/// In-memory mirror of the avoider's suppress timestamp (millis since
+/// UNIX epoch). The daemon updates this directly after each successful
+/// `trigger_avoid`, so subsequent ticks within the suppress window can
+/// short-circuit on a single atomic load instead of a per-event filesystem
+/// stat + read.
+///
+/// The on-disk suppress file remains the cross-process IPC path: CLI
+/// commands that warm the file (via `commands::suppress_avoider`) are
+/// observed by the file-stat fallback in [`SuppressState::is_suppressed`].
+/// This mirror is purely additive — disabling it would just put us back
+/// on the file-only path, with no correctness change.
+///
+/// `0` is the sentinel "never warmed". Any positive value is a real
+/// timestamp the comparison treats as the most recent in-memory write.
+struct SuppressState {
+    last_ms: AtomicU64,
+}
+
+impl SuppressState {
+    fn new() -> Self {
+        Self {
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Stamp the in-memory mirror with `now_unix_millis()`. Called by the
+    /// daemon after a successful `avoid_with_clients` so future ticks in
+    /// the same suppress window observe the warm state without file IO.
+    fn warm(&self) {
+        // `Release` so the in-memory write happens-before any subsequent
+        // `Acquire` load in `is_suppressed`. In practice the loader runs
+        // on the same task, so program order alone would suffice; the
+        // ordering is conservative against future multi-task callers.
+        self.last_ms.store(now_unix_millis(), Ordering::Release);
+    }
+
+    /// True iff the avoider should currently skip running. Consults the
+    /// in-memory mirror first; falls through to the file-stat path only
+    /// when the in-memory value is stale (i.e. cross-process suppress
+    /// might be the only source of truth).
+    async fn is_suppressed(&self, suppress_timeout_ms: u64) -> bool {
+        // `Acquire` pairs with the `Release` in `warm()`.
+        let stamp = self.last_ms.load(Ordering::Acquire);
+        if stamp != 0 {
+            let now = now_unix_millis();
+            if now.saturating_sub(stamp) < suppress_timeout_ms {
+                debug!(
+                    "suppress: in-memory hit (age={}ms)",
+                    now.saturating_sub(stamp)
+                );
+                return true;
+            }
+        }
+        // In-memory cold or stale — defer to the on-disk file so
+        // cross-process callers (CLI commands warming the daemon) remain
+        // authoritative for *their* writes. Promote a hit back into the
+        // mirror so the next tick can short-circuit.
+        if let Some(file_stamp) = read_suppress_file_ms().await {
+            let now = now_unix_millis();
+            if now.saturating_sub(file_stamp) < suppress_timeout_ms {
+                debug!(
+                    "suppress: file-fallback hit (age={}ms); promoting to mirror",
+                    now.saturating_sub(file_stamp)
+                );
+                self.last_ms.store(file_stamp, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Wall-clock millis since UNIX epoch. Saturating so a clock skewed
+/// before the epoch (impossible on a healthy system) folds to `0`
+/// rather than panicking — matches the lib's `now_unix_millis`
+/// semantics.
+#[inline]
+fn now_unix_millis() -> u64 {
+    let raw = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(raw).unwrap_or(u64::MAX)
+}
+
+/// Read the suppress file's u64 millis content, returning `None` for
+/// missing / unreadable / unparseable files. Mirrors the lib's
+/// `should_suppress` failure-mode behaviour: every IO/parse failure is
+/// treated as "no suppression" so a stale-or-broken file cannot lock
+/// the avoider out indefinitely.
+async fn read_suppress_file_ms() -> Option<u64> {
+    let path = commands::get_suppress_file_path().ok()?;
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    content.trim().parse::<u64>().ok()
+}
 
 /// Event-driven daemon for media window avoidance.
 #[derive(Parser)]
@@ -180,11 +342,38 @@ fn is_process_running(pid: Pid) -> bool {
     }
 }
 
-/// Trigger the avoid command.
-async fn trigger_avoid(ctx: &CommandContext) {
-    if let Err(e) = commands::avoid::avoid(ctx).await {
-        debug!("Avoid error: {}", e);
+/// Trigger the avoid command using the daemon's per-tick client cache
+/// and in-memory suppress mirror.
+///
+/// Suppress short-circuit runs first (cheapest path: a single atomic load
+/// when the mirror is warm). Refetches `j/clients` only when the cache is
+/// cold or older than the debounce window. After a successful avoid pass,
+/// the suppress mirror is warmed so the next tick within the suppress
+/// window can short-circuit without touching the file system.
+async fn trigger_avoid(ctx: &CommandContext, cache: &ClientCache, suppress: &SuppressState) {
+    if suppress
+        .is_suppressed(u64::from(ctx.config.positioning.suppress_ms))
+        .await
+    {
+        debug!("avoid: suppressed (daemon mirror)");
+        return;
     }
+    let clients = match cache.get_or_refresh(ctx).await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("Avoid client-cache refresh failed: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = commands::avoid::avoid_with_clients(ctx, &clients).await {
+        debug!("Avoid error: {}", e);
+        return;
+    }
+    // Warm the in-memory mirror: the lib's avoid path may have called
+    // `suppress_avoider` (writing the file), but the next tick should
+    // short-circuit without re-reading it. Setting the mirror here
+    // means subsequent `is_suppressed` calls hit the atomic load path.
+    suppress.warm();
 }
 
 /// Create a trigger FIFO at `path`, hardened against pre-creation attacks.
@@ -390,6 +579,8 @@ fn is_avoid_trigger(line: &str) -> bool {
 /// remain inspectable end-to-end.
 async fn run_event_session(
     ctx: &CommandContext,
+    cache: &ClientCache,
+    suppress: &SuppressState,
     debounce_duration: Duration,
     fifo_rx: &mut mpsc::Receiver<()>,
 ) -> Result<bool, MediaControlError> {
@@ -398,9 +589,15 @@ async fn run_event_session(
     let mut last_avoid_time = Instant::now();
 
     // Helper closure: apply debounce-and-trigger logic uniformly.
-    async fn maybe_trigger(ctx: &CommandContext, last: &mut Instant, debounce: Duration) {
+    async fn maybe_trigger(
+        ctx: &CommandContext,
+        cache: &ClientCache,
+        suppress: &SuppressState,
+        last: &mut Instant,
+        debounce: Duration,
+    ) {
         if last.elapsed() >= debounce {
-            trigger_avoid(ctx).await;
+            trigger_avoid(ctx, cache, suppress).await;
             *last = Instant::now();
         }
     }
@@ -413,7 +610,7 @@ async fn run_event_session(
                 match line_result {
                     Ok(Some(line)) => {
                         if is_avoid_trigger(&line) {
-                            maybe_trigger(ctx, &mut last_avoid_time, debounce_duration).await;
+                            maybe_trigger(ctx, cache, suppress, &mut last_avoid_time, debounce_duration).await;
                         }
                     }
                     Ok(None) => {
@@ -429,7 +626,7 @@ async fn run_event_session(
 
             Some(()) = fifo_rx.recv() => {
                 debug!("Processing FIFO trigger");
-                maybe_trigger(ctx, &mut last_avoid_time, debounce_duration).await;
+                maybe_trigger(ctx, cache, suppress, &mut last_avoid_time, debounce_duration).await;
             }
         }
     }
@@ -471,6 +668,13 @@ async fn run_event_loop() -> Result<(), MediaControlError> {
     let debounce_ms = config.positioning.debounce_ms;
     let ctx = CommandContext::with_config(config)?;
     let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
+    // TTL = the debounce window. A burst of related events fires within
+    // this window and benefits from a shared snapshot; the very next
+    // burst (after debounce_duration elapses) refetches naturally.
+    let client_cache = ClientCache::new(debounce_duration);
+    // In-memory mirror of the suppress timestamp. Cold on startup
+    // (`0`), warmed by `trigger_avoid` after each successful pass.
+    let suppress_state = SuppressState::new();
 
     // Create FIFO for manual triggers
     create_fifo()?;
@@ -488,7 +692,15 @@ async fn run_event_loop() -> Result<(), MediaControlError> {
     info!("Event loop started");
 
     loop {
-        match run_event_session(&ctx, debounce_duration, &mut fifo_rx).await {
+        match run_event_session(
+            &ctx,
+            &client_cache,
+            &suppress_state,
+            debounce_duration,
+            &mut fifo_rx,
+        )
+        .await
+        {
             Ok(true) => {
                 // Reconnect after brief delay
                 info!("Reconnecting to Hyprland socket...");
@@ -642,7 +854,9 @@ fn acquire_start_lock() -> std::io::Result<Flock<std::fs::File>> {
 /// `EWOULDBLOCK` is the same value as `EAGAIN`, which is the errno
 /// `flock(LOCK_EX | LOCK_NB)` returns when another holder exists.
 fn is_lock_held_elsewhere(e: &std::io::Error) -> bool {
-    let Some(n) = e.raw_os_error() else { return false };
+    let Some(n) = e.raw_os_error() else {
+        return false;
+    };
     nix::errno::Errno::from_raw(n) == nix::errno::Errno::EAGAIN
 }
 
@@ -1018,6 +1232,203 @@ mod tests {
         // 2^22 - 1 — above default kernel.pid_max on most systems.
         let pid = Pid::from_raw(4_194_303);
         assert!(!is_process_running(pid));
+    }
+
+    /// Build a minimal `Vec<Client>` for cache tests. We only care about
+    /// identity here — geometry / focus state are irrelevant to the
+    /// cache's freshness invariants.
+    fn make_cache_clients(addr: &str) -> Vec<Client> {
+        use media_control_lib::hyprland::Workspace;
+        vec![Client {
+            address: addr.to_string(),
+            mapped: true,
+            hidden: false,
+            at: [0, 0],
+            size: [100, 100],
+            workspace: Workspace {
+                id: 1,
+                name: "1".to_string(),
+            },
+            floating: false,
+            pinned: false,
+            fullscreen: 0,
+            monitor: 0,
+            pid: 0,
+            class: "test".to_string(),
+            title: "test".to_string(),
+            focus_history_id: 0,
+        }]
+    }
+
+    /// A freshly-installed snapshot must be returned by `try_hit` while
+    /// it is still inside the TTL window.
+    #[test]
+    fn client_cache_hit_within_ttl() {
+        let cache = ClientCache::new(Duration::from_secs(60));
+        cache.install(make_cache_clients("0xa1"));
+        let hit = cache.try_hit().expect("snapshot should be fresh");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].address, "0xa1");
+    }
+
+    /// A snapshot older than the TTL must miss — the cache horizon never
+    /// extends past the boundary the daemon's debounce window pins it to.
+    #[test]
+    fn client_cache_miss_after_ttl_expiry() {
+        // Zero TTL means every snapshot is born stale.
+        let cache = ClientCache::new(Duration::from_millis(0));
+        cache.install(make_cache_clients("0xa1"));
+        assert!(cache.try_hit().is_none(), "0-TTL snapshot must miss");
+    }
+
+    /// A cache that has never been installed must miss. The fast-path
+    /// branch in `get_or_refresh` falls through to the IPC fetch in this
+    /// state.
+    #[test]
+    fn client_cache_cold_misses() {
+        let cache = ClientCache::new(Duration::from_secs(60));
+        assert!(cache.try_hit().is_none(), "cold cache must miss");
+    }
+
+    /// Re-installing a snapshot replaces the prior one and resets the
+    /// captured-at timestamp. Verified by installing a stale snapshot in
+    /// a zero-TTL cache (which would always miss), then re-installing
+    /// with a generous TTL and asserting the hit returns the latest data.
+    #[test]
+    fn client_cache_install_replaces_snapshot() {
+        let cache = ClientCache::new(Duration::from_secs(60));
+        cache.install(make_cache_clients("0xa1"));
+        cache.install(make_cache_clients("0xb2"));
+        let hit = cache.try_hit().expect("re-installed snapshot should hit");
+        assert_eq!(hit[0].address, "0xb2", "must return the latest install");
+    }
+
+    /// A cold suppress mirror (never warmed) plus an unset runtime dir
+    /// (so file-fallback also misses) must report not-suppressed. This
+    /// is the default state on daemon startup.
+    #[tokio::test]
+    async fn suppress_state_cold_returns_not_suppressed() {
+        // Hold the env-mutex so we can clear XDG_RUNTIME_DIR safely.
+        let _g = env_test_lock().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: single-threaded test under the env-mutex
+        unsafe {
+            env::remove_var("XDG_RUNTIME_DIR");
+        }
+
+        let state = SuppressState::new();
+        let suppressed = state.is_suppressed(60_000).await;
+
+        // SAFETY: restore env before the assert (which can panic).
+        unsafe {
+            if let Some(v) = original {
+                env::set_var("XDG_RUNTIME_DIR", v);
+            }
+        }
+        assert!(
+            !suppressed,
+            "cold mirror + missing XDG_RUNTIME_DIR must not suppress"
+        );
+    }
+
+    /// `warm()` flips the in-memory mirror so the next `is_suppressed`
+    /// short-circuits on the atomic load — no file IO needed. This is
+    /// the syscall-elimination path Story 006 was designed for.
+    #[tokio::test]
+    async fn suppress_state_warm_skips_file_io() {
+        // Hold the env-mutex to block parallel file-touching tests.
+        let _g = env_test_lock().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        // Point at a directory that *does not contain* a suppress file.
+        // If `warm()` worked, `is_suppressed` returns true without ever
+        // reading the (nonexistent) file. If it ignored the warm signal,
+        // the file lookup would miss and we'd see false.
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test under the env-mutex
+        unsafe {
+            env::set_var("XDG_RUNTIME_DIR", dir.path());
+        }
+
+        let state = SuppressState::new();
+        state.warm();
+        let suppressed = state.is_suppressed(60_000).await;
+
+        // SAFETY: restore env before the assert.
+        unsafe {
+            if let Some(v) = original {
+                env::set_var("XDG_RUNTIME_DIR", v);
+            } else {
+                env::remove_var("XDG_RUNTIME_DIR");
+            }
+        }
+        assert!(suppressed, "warm mirror must short-circuit on atomic load");
+    }
+
+    /// An external write to the suppress file (cross-process: CLI command
+    /// warming the daemon) must be observed via the file-fallback path
+    /// even when the in-memory mirror is cold. Story 006 explicitly
+    /// preserves this IPC channel.
+    #[tokio::test]
+    async fn suppress_state_observes_external_file_write() {
+        let _g = env_test_lock().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test
+        unsafe {
+            env::set_var("XDG_RUNTIME_DIR", dir.path());
+        }
+
+        // Write a recent timestamp into the suppress file path the lib uses.
+        let path = commands::get_suppress_file_path().expect("path resolves with XDG set");
+        let now_ms = now_unix_millis();
+        tokio::fs::write(&path, now_ms.to_string()).await.unwrap();
+
+        let state = SuppressState::new(); // mirror is cold
+        let suppressed = state.is_suppressed(60_000).await;
+
+        // SAFETY: restore env before assert
+        unsafe {
+            if let Some(v) = original {
+                env::set_var("XDG_RUNTIME_DIR", v);
+            } else {
+                env::remove_var("XDG_RUNTIME_DIR");
+            }
+        }
+        assert!(
+            suppressed,
+            "cold mirror must fall through to fresh file stamp"
+        );
+    }
+
+    /// Stale file timestamps (older than the suppress window) must not
+    /// suppress. Boundary check that the file-fallback path applies the
+    /// same `now - stamp < timeout_ms` logic as the in-memory check.
+    #[tokio::test]
+    async fn suppress_state_rejects_stale_file_timestamp() {
+        let _g = env_test_lock().lock().await;
+        let original = env::var("XDG_RUNTIME_DIR").ok();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test
+        unsafe {
+            env::set_var("XDG_RUNTIME_DIR", dir.path());
+        }
+
+        let path = commands::get_suppress_file_path().expect("path resolves");
+        // Timestamp from 1970 — definitely stale.
+        tokio::fs::write(&path, "1").await.unwrap();
+
+        let state = SuppressState::new();
+        let suppressed = state.is_suppressed(60_000).await;
+
+        // SAFETY: restore env
+        unsafe {
+            if let Some(v) = original {
+                env::set_var("XDG_RUNTIME_DIR", v);
+            } else {
+                env::remove_var("XDG_RUNTIME_DIR");
+            }
+        }
+        assert!(!suppressed, "stale file timestamp must not suppress");
     }
 
     /// `read_pid_file` must reject pid <= 1 to defend against accidentally

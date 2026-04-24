@@ -3,15 +3,30 @@ name = "media-control-lib"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Opt-in surface for the CLI binary. Gates `commands::workflow`, `jellyfin`,
+# the workflow-side `pub use` shims in `commands/mod.rs`, and the `reqwest`
+# HTTP client. The daemon does not enable this feature, so single-package
+# `cargo build -p media-control-daemon` strips workflow code from its lib
+# build and `reqwest` from its resolved dependency tree.
+#
+# See `memory-bank/bolts/026-daemon-substrate-tightening/adr-001-...md` for
+# why this is opt-in and why a `tests/boundary.rs` grep test in the daemon
+# crate complements it. Workspace-wide `cargo build --workspace` enables
+# `cli` via feature unification (the CLI's dep activates it); the grep test
+# is what catches forbidden imports in that path.
+default = []
+cli = ["dep:reqwest"]
+
 [dependencies]
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "process", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true, features = ["parse"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json"], optional = true }
 gethostname.workspace = true
 shlex.workspace = true
 url = "2"

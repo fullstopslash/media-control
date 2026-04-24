@@ -7,6 +7,7 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod hyprland;
+#[cfg(feature = "cli")]
 pub mod jellyfin;
 pub mod window;
 

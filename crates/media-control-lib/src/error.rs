@@ -81,6 +81,11 @@ pub enum MediaControlError {
     Config(#[from] crate::config::ConfigError),
 
     /// Jellyfin API error (typed source, no `Box<dyn Error>`).
+    ///
+    /// Gated behind the `cli` feature: the `jellyfin` module only exists when
+    /// the lib is built with `cli` enabled (i.e. by the CLI binary). The
+    /// daemon never produces or matches this variant.
+    #[cfg(feature = "cli")]
     #[error("jellyfin error: {0}")]
     Jellyfin(#[from] crate::jellyfin::JellyfinError),
 
@@ -116,6 +121,10 @@ pub enum MediaControlError {
     Toml(#[from] toml::de::Error),
 
     /// HTTP request error.
+    ///
+    /// Gated behind the `cli` feature: `reqwest` is an optional dep enabled
+    /// only by `cli`. The daemon never makes HTTP calls.
+    #[cfg(feature = "cli")]
     #[error("HTTP request error: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -249,6 +258,7 @@ mod tests {
         assert!(err.source().is_some(), "Config variant must expose source");
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn jellyfin_error_bridges_via_from_and_preserves_source() {
         let jf_err = crate::jellyfin::JellyfinError::NoMpvSession;
@@ -397,6 +407,7 @@ mod tests {
         assert!(msg.contains("perm boom"), "io message lost: {msg}");
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn jellyfin_credentials_too_large_displays_with_size() {
         // Size cap errors must show the offending size + cap so the user can

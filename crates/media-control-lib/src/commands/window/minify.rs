@@ -111,7 +111,11 @@ pub async fn minify(ctx: &CommandContext) -> Result<()> {
     if we_flipped {
         tracing::debug!(
             "minify: {}",
-            if target_minified { "minified" } else { "restored" },
+            if target_minified {
+                "minified"
+            } else {
+                "restored"
+            },
         );
     } else {
         // Another caller already brought the flag to the desired state
@@ -161,7 +165,7 @@ mod tests {
     }
 
     async fn isolated_runtime_dir() -> EnvGuard {
-        let g = super::super::async_env_test_mutex().lock().await;
+        let g = crate::commands::shared::async_env_test_mutex().lock().await;
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: env-mutex held by `g` for the lifetime of EnvGuard.

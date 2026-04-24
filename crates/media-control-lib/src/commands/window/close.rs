@@ -7,9 +7,14 @@ use tokio::process::Command;
 
 use super::fullscreen::is_pip_title;
 use super::{
-    CommandContext, MPV_IPC_SOCKET_DEFAULT as SHIM_SOCKET, close_window_action, get_media_window,
-    get_minify_state_path, send_to_mpv_socket, suppress_avoider,
+    CommandContext, close_window_action, get_media_window, get_minify_state_path, suppress_avoider,
 };
+// The shim-mpv graceful-stop path needs workflow's mpv-IPC plumbing. When
+// `cli` is off (daemon build), the shim path is compiled out and shim mpv
+// windows fall through to the regular Hyprland close. The daemon never calls
+// `close()`, so this degraded behavior is theoretical.
+#[cfg(feature = "cli")]
+use crate::commands::workflow::{MPV_IPC_SOCKET_DEFAULT as SHIM_SOCKET, send_to_mpv_socket};
 use crate::error::Result;
 
 /// Close the media window gracefully with app-specific handling.
@@ -82,6 +87,7 @@ pub async fn close(ctx: &CommandContext) -> Result<()> {
 /// The match is anchored to the **last path segment of argv[0]** — searching
 /// the whole cmdline would falsely match harmless paths like
 /// `/home/user/mpv-shim-tutorial.mkv` passed as a file argument.
+#[cfg(feature = "cli")]
 async fn is_shim_mpv(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -103,9 +109,11 @@ async fn close_window_gracefully(
     addr: &str,
     class: &str,
     title: &str,
-    pid: i32,
+    #[cfg_attr(not(feature = "cli"), allow(unused_variables))] pid: i32,
 ) -> Result<()> {
     // Shim mpv: send stop-and-clear, keep window alive for reuse.
+    // Gated on `cli` because it depends on workflow's mpv-IPC plumbing.
+    #[cfg(feature = "cli")]
     if class == "mpv" && is_shim_mpv(pid).await {
         let _ = send_to_mpv_socket(
             SHIM_SOCKET,
@@ -361,7 +369,7 @@ mod tests {
     /// duration to keep parallel tests from racing on the same global.
     #[tokio::test]
     async fn close_clears_minify_state_when_no_media_window() {
-        let _g = super::super::async_env_test_mutex().lock().await;
+        let _g = crate::commands::shared::async_env_test_mutex().lock().await;
         let original = std::env::var("XDG_RUNTIME_DIR").ok();
         let dir = tempfile::tempdir().unwrap();
 

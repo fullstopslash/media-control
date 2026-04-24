@@ -1,10 +1,11 @@
 # Global Story Index
 
 ## Overview
-- **Total stories**: 33
+- **Total stories**: 44
 - **Generated**: 30
 - **Completed**: 3
-- **Last updated**: 2026-03-19
+- **Planned**: 11
+- **Last updated**: 2026-04-26
 
 ---
 
@@ -79,11 +80,30 @@
 - [x] **Given** `send_mpv_script_message("stop-and-clear")` fails, **When** close is called for an mpv window, **Then** the error is propagated or logged as a warning <!-- tw:7049e5a1-6e2e-41c8-bd43-7513461c4cfd -->
 - [x] **Given** the batch call for repositioning after fullscreen exit, **When** it fails, **Then** the error propagates via `?` <!-- tw:4442c19b-a780-4b03-8521-507713f7fa17 -->
 
+### 015-avoider-carveout
+
+**Unit: 001-commands-regrouping** (3 stories)
+- [ ] **001-define-submodule-layout** (commands-regrouping): Decide submodule layout and write empty scaffolding - Must - PLANNED
+- [ ] **002-move-window-commands** (commands-regrouping): Relocate 8 window-mgmt command files into commands/window/ - Must - PLANNED
+- [ ] **003-move-workflow-commands** (commands-regrouping): Relocate 6 workflow command files + migrate shared helpers - Must - PLANNED
+
+**Unit: 002-daemon-substrate-tightening** (2 stories)
+- [ ] **001-pick-and-apply-enforcement** (daemon-substrate-tightening): Choose and apply enforcement (cargo feature / pub(crate) / compile_fail) - Must - PLANNED
+- [ ] **002-prove-isolation** (daemon-substrate-tightening): Add CI-runnable verification that workflow imports break the daemon build - Must - PLANNED
+
+**Unit: 003-avoider-cleanup** (6 stories)
+- [ ] **001-rect-newtype-and-overlap-helpers** (avoider-cleanup): Rect newtype + overlaps; collapse 8-arg helper and dup closures - Must - PLANNED
+- [ ] **002-plumb-minified-and-position-resolver** (avoider-cleanup): Compute is_minified once; PositionResolver - Must - PLANNED
+- [ ] **003-collapse-classify-dispatch-and-restore-focus-helper** (avoider-cleanup): Collapse double-dispatch; extract restore_focus_suppressed; named constants - Must - PLANNED
+- [ ] **004-migrate-scenario-builders** (avoider-cleanup): Move ClientBuilder + with_isolated_runtime_dir to test_helpers.rs - Must - PLANNED
+- [ ] **005-daemon-cached-clients** (avoider-cleanup): Cache get_clients() in daemon; event-driven invalidation - Should - PLANNED
+- [ ] **006-daemon-in-memory-suppress** (avoider-cleanup): Daemon holds suppress timestamp in Arc<AtomicU64> - Should - PLANNED
+
 ---
 
 ## Stories by Status
 
-- **Planned**: 0
+- **Planned**: 11
 - **Generated**: 30
 - **In Progress**: 0
 - **Completed**: 3

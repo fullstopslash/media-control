@@ -194,6 +194,7 @@ pub async fn move_window(ctx: &CommandContext, direction: Direction) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::with_isolated_runtime_dir;
 
     #[test]
     fn direction_from_char_valid() {
@@ -318,71 +319,83 @@ mod tests {
 
     #[tokio::test]
     async fn move_left_dispatches_correct_position() {
-        let mock = MockHyprland::start().await;
-        mock.set_response("j/clients", &mpv_at(1272, 712)).await;
-        let ctx = mock.default_context();
+        with_isolated_runtime_dir(|_| async {
+            let mock = MockHyprland::start().await;
+            mock.set_response("j/clients", &mpv_at(1272, 712)).await;
+            let ctx = mock.default_context();
 
-        move_window(&ctx, Direction::Left).await.unwrap();
+            move_window(&ctx, Direction::Left).await.unwrap();
 
-        let cmds = mock.captured_commands().await;
-        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
-        // x_left=48, keep current y=712
-        assert!(
-            batch.contains("exact 48 712"),
-            "expected x_left=48, y=712: {batch}"
-        );
-        assert!(batch.contains("resizewindowpixel"), "should also resize");
+            let cmds = mock.captured_commands().await;
+            let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+            // x_left=48, keep current y=712
+            assert!(
+                batch.contains("exact 48 712"),
+                "expected x_left=48, y=712: {batch}"
+            );
+            assert!(batch.contains("resizewindowpixel"), "should also resize");
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn move_right_dispatches_correct_position() {
-        let mock = MockHyprland::start().await;
-        mock.set_response("j/clients", &mpv_at(48, 712)).await;
-        let ctx = mock.default_context();
+        with_isolated_runtime_dir(|_| async {
+            let mock = MockHyprland::start().await;
+            mock.set_response("j/clients", &mpv_at(48, 712)).await;
+            let ctx = mock.default_context();
 
-        move_window(&ctx, Direction::Right).await.unwrap();
+            move_window(&ctx, Direction::Right).await.unwrap();
 
-        let cmds = mock.captured_commands().await;
-        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
-        // x_right=1272, keep current y=712
-        assert!(
-            batch.contains("exact 1272 712"),
-            "expected x_right=1272, y=712: {batch}"
-        );
+            let cmds = mock.captured_commands().await;
+            let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+            // x_right=1272, keep current y=712
+            assert!(
+                batch.contains("exact 1272 712"),
+                "expected x_right=1272, y=712: {batch}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn move_up_dispatches_correct_position() {
-        let mock = MockHyprland::start().await;
-        mock.set_response("j/clients", &mpv_at(1272, 712)).await;
-        let ctx = mock.default_context();
+        with_isolated_runtime_dir(|_| async {
+            let mock = MockHyprland::start().await;
+            mock.set_response("j/clients", &mpv_at(1272, 712)).await;
+            let ctx = mock.default_context();
 
-        move_window(&ctx, Direction::Up).await.unwrap();
+            move_window(&ctx, Direction::Up).await.unwrap();
 
-        let cmds = mock.captured_commands().await;
-        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
-        // keep current x=1272, y_top=48
-        assert!(
-            batch.contains("exact 1272 48"),
-            "expected x=1272, y_top=48: {batch}"
-        );
+            let cmds = mock.captured_commands().await;
+            let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+            // keep current x=1272, y_top=48
+            assert!(
+                batch.contains("exact 1272 48"),
+                "expected x=1272, y_top=48: {batch}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn move_down_dispatches_correct_position() {
-        let mock = MockHyprland::start().await;
-        mock.set_response("j/clients", &mpv_at(1272, 48)).await;
-        let ctx = mock.default_context();
+        with_isolated_runtime_dir(|_| async {
+            let mock = MockHyprland::start().await;
+            mock.set_response("j/clients", &mpv_at(1272, 48)).await;
+            let ctx = mock.default_context();
 
-        move_window(&ctx, Direction::Down).await.unwrap();
+            move_window(&ctx, Direction::Down).await.unwrap();
 
-        let cmds = mock.captured_commands().await;
-        let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
-        // keep current x=1272, y_bottom=712
-        assert!(
-            batch.contains("exact 1272 712"),
-            "expected x=1272, y_bottom=712: {batch}"
-        );
+            let cmds = mock.captured_commands().await;
+            let batch = cmds.iter().find(|c| c.contains("movewindowpixel")).unwrap();
+            // keep current x=1272, y_bottom=712
+            assert!(
+                batch.contains("exact 1272 712"),
+                "expected x=1272, y_bottom=712: {batch}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -392,51 +405,57 @@ mod tests {
         // bundled in the batch may still be needed (e.g. after minify toggle).
         // Lock that in so we don't silently regress to a "skip if at target"
         // optimisation that would leave geometry stale.
-        let mock = MockHyprland::start().await;
-        // mpv already at x_left=48 with current y=712
-        mock.set_response("j/clients", &mpv_at(48, 712)).await;
-        let ctx = mock.default_context();
+        with_isolated_runtime_dir(|_| async {
+            let mock = MockHyprland::start().await;
+            // mpv already at x_left=48 with current y=712
+            mock.set_response("j/clients", &mpv_at(48, 712)).await;
+            let ctx = mock.default_context();
 
-        move_window(&ctx, Direction::Left).await.unwrap();
+            move_window(&ctx, Direction::Left).await.unwrap();
 
-        let cmds = mock.captured_commands().await;
-        let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
-        assert!(
-            batch.is_some(),
-            "move should dispatch even at correct position: {cmds:?}"
-        );
-        assert!(
-            batch.unwrap().contains("exact 48 712"),
-            "still targets x_left=48, y=712"
-        );
+            let cmds = mock.captured_commands().await;
+            let batch = cmds.iter().find(|c| c.contains("movewindowpixel"));
+            assert!(
+                batch.is_some(),
+                "move should dispatch even at correct position: {cmds:?}"
+            );
+            assert!(
+                batch.unwrap().contains("exact 48 712"),
+                "still targets x_left=48, y=712"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn move_no_media_window_is_noop() {
-        let mock = MockHyprland::start().await;
-        let clients = vec![make_test_client_full(
-            "0xb1",
-            "firefox",
-            "Browser",
-            false,
-            false,
-            0,
-            1,
-            0,
-            0,
-            [0, 0],
-            [1920, 1080],
-        )];
-        mock.set_response("j/clients", &make_clients_json(&clients))
-            .await;
-        let ctx = mock.default_context();
+        with_isolated_runtime_dir(|_| async {
+            let mock = MockHyprland::start().await;
+            let clients = vec![make_test_client_full(
+                "0xb1",
+                "firefox",
+                "Browser",
+                false,
+                false,
+                0,
+                1,
+                0,
+                0,
+                [0, 0],
+                [1920, 1080],
+            )];
+            mock.set_response("j/clients", &make_clients_json(&clients))
+                .await;
+            let ctx = mock.default_context();
 
-        move_window(&ctx, Direction::Left).await.unwrap();
+            move_window(&ctx, Direction::Left).await.unwrap();
 
-        let cmds = mock.captured_commands().await;
-        assert!(
-            !cmds.iter().any(|c| c.contains("movewindowpixel")),
-            "should not move: {cmds:?}"
-        );
+            let cmds = mock.captured_commands().await;
+            assert!(
+                !cmds.iter().any(|c| c.contains("movewindowpixel")),
+                "should not move: {cmds:?}"
+            );
+        })
+        .await;
     }
 }

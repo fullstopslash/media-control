@@ -10,7 +10,7 @@ name = "media-control"
 path = "src/main.rs"
 
 [dependencies]
-media-control-lib.workspace = true
+media-control-lib = { workspace = true, features = ["cli"] }
 clap.workspace = true
 clap_complete.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }

@@ -4,6 +4,7 @@
 //! builders for end-to-end command testing without a running Hyprland instance.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -261,6 +262,173 @@ pub fn make_test_client_full(
         title: title.to_string(),
         focus_history_id,
     }
+}
+
+/// Chainable builder for synthetic [`Client`] values, replacing the
+/// 12-positional-argument [`make_test_client_full`] at most call sites.
+///
+/// Construct with [`ClientBuilder::new`] (address + class + title — the
+/// fields nearly every test actually cares about), then chain setters for
+/// the rest. Defaults match `make_test_client` (mapped, visible, workspace
+/// 1, monitor 0, focused, geometry `[100, 100, 640, 360]`).
+#[must_use]
+pub struct ClientBuilder {
+    inner: Client,
+}
+
+impl ClientBuilder {
+    /// Start a builder with the three identity fields.
+    pub fn new(address: &str, class: &str, title: &str) -> Self {
+        Self {
+            inner: make_test_client(address, class, title, false, false),
+        }
+    }
+
+    /// Mark this client as pinned.
+    pub fn pinned(mut self, pinned: bool) -> Self {
+        self.inner.pinned = pinned;
+        self
+    }
+
+    /// Mark this client as floating.
+    pub fn floating(mut self, floating: bool) -> Self {
+        self.inner.floating = floating;
+        self
+    }
+
+    /// Set the Hyprland fullscreen state (0/1/2/3).
+    pub fn fullscreen(mut self, state: u8) -> Self {
+        self.inner.fullscreen = state;
+        self
+    }
+
+    /// Set the workspace id (workspace name is derived as the same string).
+    pub fn workspace(mut self, id: i32) -> Self {
+        self.inner.workspace = Workspace {
+            id,
+            name: id.to_string(),
+        };
+        self
+    }
+
+    /// Set the monitor id. Use `-1` for scratchpad windows.
+    pub fn monitor(mut self, id: i32) -> Self {
+        self.inner.monitor = id;
+        self
+    }
+
+    /// Set the focus history id (0 = currently focused, 1 = previous, ...).
+    pub fn focus_history(mut self, id: i32) -> Self {
+        self.inner.focus_history_id = id;
+        self
+    }
+
+    /// Set position `[x, y]`.
+    pub fn at(mut self, at: [i32; 2]) -> Self {
+        self.inner.at = at;
+        self
+    }
+
+    /// Set size `[w, h]`.
+    pub fn size(mut self, size: [i32; 2]) -> Self {
+        self.inner.size = size;
+        self
+    }
+
+    /// Materialize the [`Client`].
+    #[must_use]
+    pub fn build(self) -> Client {
+        self.inner
+    }
+}
+
+/// Two-client scenario used by the avoider's single-workspace tests:
+/// a focused non-media window (firefox) plus a pinned/floating media
+/// window (mpv) at `mpv_at`. Returns the JSON the mock server expects.
+///
+/// Centralized here so adding a new single-workspace test doesn't grow
+/// another 30-line scaffolding block in the test module.
+pub fn scenario_single_workspace_json(mpv_at: [i32; 2]) -> String {
+    let clients = [
+        ClientBuilder::new("0xb1", "firefox", "Browser")
+            .focus_history(0)
+            .at([0, 0])
+            .size([1920, 1080])
+            .build(),
+        ClientBuilder::new("0xd1", "mpv", "video.mp4")
+            .pinned(true)
+            .floating(true)
+            .focus_history(1)
+            .at(mpv_at)
+            .size([640, 360])
+            .build(),
+    ];
+    make_clients_json(&clients)
+}
+
+/// RAII guard that restores `XDG_RUNTIME_DIR` when dropped.
+///
+/// Held by [`with_isolated_runtime_dir`]. The drop runs on every exit path
+/// (panic, early return), so a failing assert can never leak our temp dir
+/// into a sibling test's environment.
+struct RuntimeDirGuard {
+    original: Option<String>,
+}
+
+impl Drop for RuntimeDirGuard {
+    fn drop(&mut self) {
+        // SAFETY: the outer `with_isolated_runtime_dir` holds the
+        // `async_env_test_mutex` for the entire scope this guard is
+        // alive in, so no other thread is racing us on env mutation.
+        unsafe {
+            match self.original.take() {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+    }
+}
+
+/// Run `f` with `XDG_RUNTIME_DIR` pointing at a fresh tempdir and the
+/// process-wide env mutex held for the entire body.
+///
+/// The returned future is polled to completion before the temp dir is
+/// dropped and the env var is restored. The env-mutex serializes against
+/// every other test that mutates `XDG_RUNTIME_DIR` (or the on-disk suppress
+/// file), eliminating the cross-test races that previously made this dance
+/// flake.
+///
+/// The mutex acquire must happen before `set_var` and the restore happens
+/// in `RuntimeDirGuard::drop`, so a panic inside `f` is panic-safe — the
+/// guard runs on unwind, restores the env, and the mutex releases naturally.
+///
+/// # Panics
+///
+/// Panics if creating the tempdir fails, which only happens if the OS is
+/// out of file descriptors / disk space — not a test invariant.
+pub async fn with_isolated_runtime_dir<F, Fut, R>(f: F) -> R
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = R>,
+{
+    // Hold the same async mutex `commands::shared::async_env_test_mutex`
+    // exposes — the lib's other suppress / runtime-dir tests serialize
+    // through that, and this helper joins the same lock domain.
+    let _g = crate::commands::shared::async_env_test_mutex().lock().await;
+
+    let original = std::env::var("XDG_RUNTIME_DIR").ok();
+    let runtime = tempfile::tempdir().expect("create temp runtime dir");
+    let path = runtime.path().to_path_buf();
+
+    // SAFETY: single-threaded test under the async env mutex held above.
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &path);
+    }
+
+    // RAII restore: runs on every exit path including panic in `f`.
+    let _restore = RuntimeDirGuard { original };
+
+    f(path).await
 }
 
 /// Build a `Config` with `suppress_ms = 0` so suppression never blocks tests.

@@ -139,8 +139,9 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
 
+    use super::super::MPV_IPC_SOCKET_DEFAULT;
     use super::{mark_watched, mark_watched_and_next, mark_watched_and_stop};
-    use crate::commands::{MPV_IPC_SOCKET_DEFAULT, async_env_test_mutex};
+    use crate::commands::shared::async_env_test_mutex;
     use crate::error::{MediaControlError, MpvIpcErrorKind};
 
     /// Legacy fallback socket path mirrored from [`crate::commands`]
@@ -205,10 +206,7 @@ mod tests {
         let (stream, _) = listener.accept().await.expect("accept failed");
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .expect("read_line failed");
+        reader.read_line(&mut line).await.expect("read_line failed");
         // Payload shape:
         //   {"command":["script-message","<verb>", ...]}
         // The verb is at command[1]; command[0] is the literal
@@ -280,6 +278,23 @@ mod tests {
     #[tokio::test]
     async fn mark_watched_and_stop_happy_path_sends_both_messages() {
         let _g = async_env_test_mutex().lock().await;
+        if fallback_sockets_present() {
+            // The two send_mpv_script_message calls each open a fresh
+            // connection. Under parallel-test load, the second connect can
+            // hit transient EAGAIN/ECONNREFUSED on the test's listener
+            // backlog; try_mpv_paths' retry loop then falls through to a
+            // live fallback ({MPV_IPC_SOCKET_DEFAULT} or
+            // {MPV_IPC_SOCKET_FALLBACK}) and the test's server never sees
+            // the second verb. Skip when fallbacks are live to keep the
+            // assertion honest; the partial-failure test below uses the
+            // same gate for the same reason.
+            eprintln!(
+                "skipping mark_watched_and_stop_happy_path_sends_both_messages: \
+                 {MPV_IPC_SOCKET_DEFAULT} or {MPV_IPC_SOCKET_FALLBACK} is a live \
+                 socket on this host; the second send could fall through to it."
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("mpv-mark-stop-ok");
         let listener = UnixListener::bind(&socket_path).unwrap();

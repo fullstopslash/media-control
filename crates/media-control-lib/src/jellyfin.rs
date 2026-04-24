@@ -600,12 +600,11 @@ impl JellyfinClient {
         // The credential file is an array; we use the first entry.
         // Wrap the parse error with the path so the user sees *which* file
         // was malformed (`XDG_CONFIG_HOME` may point somewhere unexpected).
-        let creds: Vec<Credentials> = serde_json::from_str(&content).map_err(|source| {
-            JellyfinError::CredentialsParseAt {
+        let creds: Vec<Credentials> =
+            serde_json::from_str(&content).map_err(|source| JellyfinError::CredentialsParseAt {
                 path: cred_path.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         creds
             .into_iter()
@@ -2255,8 +2254,14 @@ mod tests {
             source,
         };
         let msg = err.to_string();
-        assert!(msg.contains("/etc/jellyfin/cred.json"), "path missing: {msg}");
-        assert!(msg.contains("failed to parse credentials"), "lead-in missing: {msg}");
+        assert!(
+            msg.contains("/etc/jellyfin/cred.json"),
+            "path missing: {msg}"
+        );
+        assert!(
+            msg.contains("failed to parse credentials"),
+            "lead-in missing: {msg}"
+        );
     }
 
     #[test]

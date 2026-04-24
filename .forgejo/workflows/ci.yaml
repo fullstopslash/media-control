@@ -1,0 +1,69 @@
+name: CI
+
+# Two-stage pipeline:
+#   build  — lint / test / build (every push + PR).
+#   cache  — push `nix build` outputs to the skitterstack attic (main only).
+#
+# Reference pattern: ~/.claude/memory/reference_attic_ci_pattern.md.
+# Canonical shape mirrors timecop / flashburn / the-desk CI.
+#
+# Manual post-merge step: add `SOPS_AGE_KEY` Forgejo secret at
+# https://forgejo.chimera-micro.ts.net/rain/media-control/settings/actions/secrets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: nix
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Format check
+        run: nix develop -c cargo fmt --all -- --check
+
+      - name: Clippy (workspace, all targets, deny warnings)
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+
+      # Workspace test — single-threaded because some lib tests serialize
+      # via async_env_test_mutex on shared globals (XDG_RUNTIME_DIR,
+      # MPV_IPC_SOCKET). Parallel runs flake on this kind of env-var swap.
+      - name: Workspace tests
+        run: nix develop -c cargo test --workspace -- --test-threads=1
+
+      # Single-package daemon build — exercises the boundary contract
+      # established in ADR-001 (memory-bank/standards/decision-index.md).
+      # Without workspace feature unification, the daemon's lib build
+      # excludes the `cli` feature, so any forbidden import from
+      # commands::workflow / jellyfin would fail to compile here.
+      # Pairs with the tests/boundary.rs grep test that runs in the
+      # workspace test step above (which catches workspace-build escapes).
+      - name: Daemon-only build (boundary structural enforcement)
+        run: nix develop -c cargo build -p media-control-daemon
+
+      - name: Nix build (default package)
+        run: nix build .#default
+
+  cache:
+    runs-on: nix
+    timeout-minutes: 20
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decrypt secrets and push to Attic
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+        run: |
+          ATTIC_SERVER=$(sops -d --extract '["attic"]["server"]' secrets.yaml)
+          ATTIC_CACHE=$(sops -d --extract '["attic"]["cache"]' secrets.yaml)
+          ATTIC_TOKEN=$(sops -d --extract '["attic"]["token"]' secrets.yaml)
+
+          attic login chimera "$ATTIC_SERVER" "$ATTIC_TOKEN"
+          nix build .#default
+          attic push "$ATTIC_CACHE" result
