@@ -43,31 +43,37 @@ impl CommandContext {
 
     /// Create a new command context with configuration loaded from default path.
     ///
+    /// `async` because [`HyprlandClient::new`] now probes for a live
+    /// Hyprland instance (intent 017).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The configuration file cannot be read or parsed
-    /// - The Hyprland socket is not available
+    /// - No reachable Hyprland instance is found
     /// - Any pattern regex fails to compile
-    pub fn new() -> Result<Self> {
+    pub async fn new() -> Result<Self> {
         // `ConfigError` bridges via `#[from]` — preserves the typed source
         // chain (path, regex, range failures) instead of `Box<dyn Error>`.
         let config = Config::load()?;
-        Self::with_config(config)
+        Self::with_config(config).await
     }
 
     /// Create a new command context with the provided configuration.
     ///
+    /// `async` because [`HyprlandClient::new`] now probes for a live
+    /// Hyprland instance (intent 017).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The Hyprland socket is not available
+    /// - No reachable Hyprland instance is found
     /// - Any pattern regex fails to compile
-    pub fn with_config(config: Config) -> Result<Self> {
+    pub async fn with_config(config: Config) -> Result<Self> {
         // Use the existing `From<HyprlandError>` bridge so the typed source
         // chain (env-var name, IO error, etc.) is preserved end-to-end
         // instead of being flattened into a stringified `NotFound`.
-        let hyprland = HyprlandClient::new()?;
+        let hyprland = HyprlandClient::new().await?;
         let window_matcher = WindowMatcher::new(&config.patterns);
 
         Ok(Self {

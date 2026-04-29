@@ -35,7 +35,7 @@ use crate::error::Result;
 /// use media_control_lib::commands::{CommandContext, close::close};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let ctx = CommandContext::new()?;
+/// let ctx = CommandContext::new().await?;
 /// close(&ctx).await?;
 /// # Ok(())
 /// # }

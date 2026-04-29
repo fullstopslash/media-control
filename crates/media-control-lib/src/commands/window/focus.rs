@@ -10,7 +10,7 @@
 //! use media_control_lib::commands::{CommandContext, focus::focus_or_launch};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let ctx = CommandContext::new()?;
+//! let ctx = CommandContext::new().await?;
 //!
 //! // Focus media window or launch Jellyfin
 //! focus_or_launch(&ctx, Some("flatpak run com.github.iwalton3.jellyfin-media-player")).await?;
@@ -74,7 +74,7 @@ use crate::error::{MediaControlError, Result};
 /// use media_control_lib::commands::{CommandContext, focus::focus_or_launch};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let ctx = CommandContext::new()?;
+/// let ctx = CommandContext::new().await?;
 ///
 /// // Focus or launch Jellyfin Media Player
 /// let focused = focus_or_launch(

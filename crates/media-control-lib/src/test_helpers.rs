@@ -445,6 +445,116 @@ pub fn test_config_no_suppress() -> Config {
     c
 }
 
+/// Response policy for [`MockHyprlandInstance`] — controls what the mock
+/// `.socket.sock` does when probed by [`crate::hyprland::probe_instance`].
+#[derive(Debug, Clone, Copy)]
+pub enum InstancePolicy {
+    /// Replies with a synthetic `activewindow` window block.
+    /// Probe should classify as `LiveWithClients`.
+    LiveWithClients,
+    /// Replies with the literal `Invalid`. Probe should classify as
+    /// `LiveEmpty`.
+    LiveEmpty,
+    /// Accepts the connection but never reads or replies. Probe should
+    /// hit the per-probe deadline and classify as `Dead`.
+    Hang,
+    /// Creates the HIS directory but no socket file. Probe should fail
+    /// to connect and classify as `Dead`.
+    Refuse,
+}
+
+/// A mock Hyprland instance for [`crate::hyprland::probe_instance`] /
+/// [`crate::hyprland::resolve_live_his`] tests.
+///
+/// Creates `$runtime_dir/hypr/{his}/` with a `.socket.sock` Unix socket
+/// served by a tokio task whose response is governed by [`InstancePolicy`].
+/// Drop aborts the server task and the listener is closed; the temp
+/// directory cleanup is the caller's responsibility (typically via
+/// [`with_isolated_runtime_dir`]).
+///
+/// Multiple instances can coexist under the same `runtime_dir` with
+/// different HIS strings, modeling the multi-instance host the resolver
+/// is designed for.
+pub struct MockHyprlandInstance {
+    his: String,
+    _server: Option<MockServerHandle>,
+}
+
+/// Server task wrapper that aborts on drop, so test cleanup never leaks
+/// listener tasks even when a panicked assertion bypasses normal teardown.
+struct MockServerHandle(tokio::task::JoinHandle<()>);
+
+impl Drop for MockServerHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl MockHyprlandInstance {
+    /// Create a mock instance under `runtime_dir` (typically the path
+    /// from [`with_isolated_runtime_dir`]) with the given HIS string and
+    /// response policy. The HIS dir is created at
+    /// `runtime_dir/hypr/{his}/`; for [`InstancePolicy::Refuse`] no
+    /// socket file is created. Returns once the listener is bound and
+    /// ready to accept (so a probe issued immediately after construction
+    /// will not race the bind).
+    pub async fn new(runtime_dir: &std::path::Path, his: &str, policy: InstancePolicy) -> Self {
+        let dir = runtime_dir.join("hypr").join(his);
+        std::fs::create_dir_all(&dir).expect("create mock HIS dir");
+
+        if matches!(policy, InstancePolicy::Refuse) {
+            return Self {
+                his: his.to_string(),
+                _server: None,
+            };
+        }
+
+        let socket_path = dir.join(".socket.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind mock .socket.sock");
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    if matches!(policy, InstancePolicy::Hang) {
+                        // Accept then never reply, never close. Probe must
+                        // hit its own timeout to classify Dead. Pending
+                        // forever is correct: the test's drop will abort
+                        // the parent task, which cancels children.
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    let mut buf = Vec::new();
+                    if stream.read_to_end(&mut buf).await.is_err() {
+                        return;
+                    }
+                    let response: &[u8] = match policy {
+                        InstancePolicy::LiveWithClients => {
+                            b"Window 0xdeadbeef -> mpv:\n\tmapped: 1\n\thidden: 0\n"
+                        }
+                        InstancePolicy::LiveEmpty => b"Invalid",
+                        InstancePolicy::Hang | InstancePolicy::Refuse => unreachable!(),
+                    };
+                    let _ = stream.write_all(response).await;
+                });
+            }
+        });
+
+        Self {
+            his: his.to_string(),
+            _server: Some(MockServerHandle(handle)),
+        }
+    }
+
+    /// HIS string this mock answers as.
+    #[must_use]
+    pub fn his(&self) -> &str {
+        &self.his
+    }
+}
+
 /// Create a test `Monitor` with common defaults.
 pub fn make_test_monitor(id: i32, focused: bool) -> Monitor {
     Monitor {

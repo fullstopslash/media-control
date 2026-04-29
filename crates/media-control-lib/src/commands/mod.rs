@@ -16,7 +16,7 @@
 //! use media_control_lib::commands::CommandContext;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let ctx = CommandContext::new()?;
+//! let ctx = CommandContext::new().await?;
 //!
 //! // Find the current media window
 //! if let Some(window) = media_control_lib::commands::get_media_window(&ctx).await? {

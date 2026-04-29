@@ -183,6 +183,17 @@ impl From<crate::hyprland::HyprlandError> for MediaControlError {
                 kind: HyprlandIpcErrorKind::Rejected,
                 source: Some(std::io::Error::other(msg)),
             },
+            // No reachable Hyprland during HIS resolution: env hint dead (or
+            // absent) and scan turned up nothing. Maps to SocketNotFound
+            // because from the caller's perspective the symptom is identical
+            // to "no Hyprland socket exists at the resolved path."
+            HyprlandError::NoLiveInstance => Self::HyprlandIpc {
+                kind: HyprlandIpcErrorKind::SocketNotFound,
+                source: Some(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no reachable Hyprland instance",
+                )),
+            },
         }
     }
 }

@@ -9,7 +9,7 @@
 //! use media_control_lib::hyprland::HyprlandClient;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = HyprlandClient::new()?;
+//! let client = HyprlandClient::new().await?;
 //!
 //! // Get all windows
 //! let clients = client.get_clients().await?;
@@ -25,7 +25,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
@@ -61,6 +61,17 @@ pub enum HyprlandError {
 
     #[error("command failed: {0}")]
     CommandFailed(String),
+
+    /// No reachable Hyprland instance was found during HIS resolution: the
+    /// `HYPRLAND_INSTANCE_SIGNATURE` env hint (if any) probed dead, scanning
+    /// `$XDG_RUNTIME_DIR/hypr/` found no responsive sockets, and there were
+    /// no candidate dirs at all to fall back on. Distinct from
+    /// `MissingEnvVar` (env unset, dirs unscanned) and `ConnectionFailed`
+    /// (a specific connect attempt failed) so `connect_hyprland_socket`'s
+    /// retry loop can log it as "no Hyprland up yet" rather than a transient
+    /// IO error.
+    #[error("no reachable Hyprland instance found in $XDG_RUNTIME_DIR/hypr/")]
+    NoLiveInstance,
 }
 
 /// Result type for Hyprland operations.
@@ -222,61 +233,272 @@ fn is_safe_component(s: &str) -> bool {
         && s != "."
 }
 
+/// Validate `XDG_RUNTIME_DIR`: must be set, absolute, and free of `..`.
+/// Returns the validated `PathBuf` or a typed error matching the original
+/// `runtime_socket_path` failure modes.
+fn validated_runtime_dir() -> Result<PathBuf> {
+    let raw =
+        env::var("XDG_RUNTIME_DIR").map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
+    let p = PathBuf::from(&raw);
+    if !p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(HyprlandError::InvalidEnvVar("XDG_RUNTIME_DIR"));
+    }
+    Ok(p)
+}
+
+/// Validate an HIS string against the same threat model as
+/// `runtime_socket_path` originally enforced inline: single non-empty
+/// component free of separators / NUL / `..` / leading `.`.
+fn is_safe_his(his: &str) -> bool {
+    is_safe_component(his) && !his.starts_with('.')
+}
+
+/// Probe outcome for a single Hyprland instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// `.socket.sock` accepted the connection AND `activewindow` returned
+    /// a non-empty, non-`Invalid` reply — Hyprland has at least one mapped
+    /// window to report.
+    LiveWithClients,
+    /// `.socket.sock` accepted the connection but `activewindow` returned
+    /// `Invalid` (or zero bytes) — Hyprland is up but has no clients yet.
+    /// Acceptable as a fallback when no `LiveWithClients` instance exists.
+    LiveEmpty,
+    /// Connect refused, file missing, not a socket, or read deadline
+    /// exceeded. The instance is not usable.
+    Dead,
+}
+
+/// Per-probe deadline. Hyprland's `activewindow` is a fast IPC; 1s is
+/// generous and bounds the worst case for a wedged Hyprland.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Probe a single Hyprland instance's `.socket.sock` and classify it.
+///
+/// Connect → write `activewindow\n` → shutdown write half → read reply.
+/// Mirrors [`HyprlandClient::command_inner`]'s protocol so the probe and
+/// the real client see the same socket the same way.
+///
+/// All IO failures map to [`Liveness::Dead`] (connect refused, missing
+/// file, not-a-socket, permission denied, timeout). The function never
+/// returns an error — an unprobeable instance is the same as a dead one
+/// for the purpose of [`resolve_live_his`].
+pub(crate) async fn probe_instance(runtime_dir: &Path, his: &str) -> Liveness {
+    let socket_path = runtime_dir.join("hypr").join(his).join(".socket.sock");
+    match tokio::time::timeout(PROBE_TIMEOUT, probe_inner(&socket_path)).await {
+        Ok(liveness) => liveness,
+        Err(_) => {
+            tracing::debug!("probe {his}: timeout after {:?}", PROBE_TIMEOUT);
+            Liveness::Dead
+        }
+    }
+}
+
+async fn probe_inner(socket_path: &Path) -> Liveness {
+    let mut stream = match UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("probe {socket_path:?}: connect failed: {e}");
+            return Liveness::Dead;
+        }
+    };
+    if stream.write_all(b"activewindow").await.is_err() {
+        return Liveness::Dead;
+    }
+    if stream.shutdown().await.is_err() {
+        return Liveness::Dead;
+    }
+    let mut buf = String::new();
+    if (&mut stream).take(8192).read_to_string(&mut buf).await.is_err() {
+        return Liveness::Dead;
+    }
+    let trimmed = buf.trim();
+    if trimmed.is_empty() || trimmed == "Invalid" {
+        Liveness::LiveEmpty
+    } else {
+        Liveness::LiveWithClients
+    }
+}
+
+/// Resolve to a live Hyprland instance signature.
+///
+/// Precedence (first match wins):
+///
+/// 1. `env_hint` set AND its instance probes alive (`LiveWithClients` or
+///    `LiveEmpty`) → return it. Honors explicit user / multi-seat pinning.
+/// 2. `env_hint` set AND probes `Dead` → `warn!` naming the stale HIS,
+///    fall through to scan.
+/// 3. Scan `$XDG_RUNTIME_DIR/hypr/*/` concurrently. Pick newest
+///    `LiveWithClients` by directory mtime; else newest `LiveEmpty`.
+/// 4. No live instance found → return `env_hint` if Some (so the caller's
+///    existing retry loop has a target to keep trying), else the newest
+///    scanned dir, else `Err(NoLiveInstance)`.
+///
+/// The candidate set is filtered through [`is_safe_his`] before probing,
+/// so any directory whose name fails validation (separators, NUL, leading
+/// `.`, `..`) is silently skipped. This matches the security posture the
+/// original `runtime_socket_path` enforced.
+pub(crate) async fn resolve_live_his(env_hint: Option<&str>) -> Result<String> {
+    let runtime_dir = validated_runtime_dir()?;
+
+    // FR-2 fast path: env hint set and live → return without scanning.
+    let env_hint = env_hint.filter(|s| !s.is_empty() && is_safe_his(s));
+    if let Some(h) = env_hint {
+        match probe_instance(&runtime_dir, h).await {
+            Liveness::LiveWithClients | Liveness::LiveEmpty => {
+                tracing::debug!("resolve: env hint {h} is live, using it");
+                return Ok(h.to_string());
+            }
+            Liveness::Dead => {
+                tracing::warn!(
+                    "resolve: HYPRLAND_INSTANCE_SIGNATURE={h} is stale (socket dead); scanning for live instance"
+                );
+            }
+        }
+    }
+
+    // FR-1: enumerate $XDG_RUNTIME_DIR/hypr/*/, probe concurrently.
+    let hypr_dir = runtime_dir.join("hypr");
+    let mut entries = match tokio::fs::read_dir(&hypr_dir).await {
+        Ok(e) => e,
+        Err(_) => {
+            // No hypr/ at all. Hand back the env hint for the retry loop,
+            // else fail.
+            return env_hint
+                .map(String::from)
+                .ok_or(HyprlandError::NoLiveInstance);
+        }
+    };
+
+    let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        // Reject symlinks: same posture as create_fifo_at in the daemon.
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        if !is_safe_his(&name) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .await
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((name, mtime));
+    }
+
+    if candidates.is_empty() {
+        return env_hint
+            .map(String::from)
+            .ok_or(HyprlandError::NoLiveInstance);
+    }
+
+    // Sort newest-first so the mtime tiebreaker happens naturally when
+    // multiple instances share a Liveness.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Concurrent probes: total wall time bounds at slowest single probe.
+    let mut set: tokio::task::JoinSet<(String, Liveness)> = tokio::task::JoinSet::new();
+    for (his, _) in &candidates {
+        let his_owned = his.clone();
+        let dir_owned = runtime_dir.clone();
+        set.spawn(async move {
+            let liveness = probe_instance(&dir_owned, &his_owned).await;
+            (his_owned, liveness)
+        });
+    }
+
+    let mut probed: Vec<(String, Liveness)> = Vec::with_capacity(candidates.len());
+    while let Some(joined) = set.join_next().await {
+        if let Ok(pair) = joined {
+            probed.push(pair);
+        }
+    }
+
+    // Re-order by candidate order (newest-mtime-first) so picks honor mtime.
+    probed.sort_by_key(|(his, _)| candidates.iter().position(|(c, _)| c == his).unwrap_or(usize::MAX));
+
+    if let Some((his, _)) = probed
+        .iter()
+        .find(|(_, l)| *l == Liveness::LiveWithClients)
+    {
+        return Ok(his.clone());
+    }
+    if let Some((his, _)) = probed.iter().find(|(_, l)| *l == Liveness::LiveEmpty) {
+        return Ok(his.clone());
+    }
+
+    // FR-5: nothing alive. Hand back the env hint (or newest dir) so the
+    // caller's existing retry loop has something to retry against.
+    if let Some(h) = env_hint {
+        return Ok(h.to_string());
+    }
+    if let Some((newest, _)) = candidates.into_iter().next() {
+        return Ok(newest);
+    }
+    Err(HyprlandError::NoLiveInstance)
+}
+
 /// Build the absolute path to one of Hyprland's per-instance Unix sockets
 /// (e.g. `.socket.sock` for commands, `.socket2.sock` for events).
 ///
-/// Sanitizes both env vars *and* the `name` argument to defend against
-/// path-traversal injection: the runtime dir must be absolute and free of
-/// `..`; the instance signature and `name` must each be a single non-empty
-/// component free of separators and `..`.
+/// Resolves the live Hyprland instance via [`resolve_live_his`]:
+/// - Honors `HYPRLAND_INSTANCE_SIGNATURE` when its target probes alive
+/// - Falls through to a probe-based scan when the env points at a stale
+///   instance (logs `warn!` naming the stale HIS)
+/// - Falls back to the env hint (or a candidate dir) when nothing probes
+///   alive, so the caller's retry loop keeps a target
+///
+/// Sanitizes the `name` argument to defend against path-traversal
+/// injection: it must be a single non-empty component free of separators,
+/// NUL bytes, and `..`.
 ///
 /// # Errors
 ///
-/// Returns [`HyprlandError::MissingEnvVar`] if `XDG_RUNTIME_DIR` or
-/// `HYPRLAND_INSTANCE_SIGNATURE` are unset or contain unsafe components,
-/// or if `name` is empty / contains separators / contains `..`.
-pub fn runtime_socket_path(name: &str) -> Result<PathBuf> {
-    // The `name` argument is supplied by the caller, not the environment.
-    // Treat a bad value as a validation failure on the env var that would
-    // otherwise hold this kind of component (the instance signature).
+/// Returns [`HyprlandError::MissingEnvVar`] / [`HyprlandError::InvalidEnvVar`]
+/// for `XDG_RUNTIME_DIR` failures, or [`HyprlandError::NoLiveInstance`]
+/// when the env hint is unset and no candidate HIS dirs exist.
+pub async fn runtime_socket_path(name: &str) -> Result<PathBuf> {
     if !is_safe_component(name) {
         return Err(HyprlandError::InvalidEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
     }
-
-    let runtime_dir =
-        env::var("XDG_RUNTIME_DIR").map_err(|_| HyprlandError::MissingEnvVar("XDG_RUNTIME_DIR"))?;
-    let instance_sig = env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .map_err(|_| HyprlandError::MissingEnvVar("HYPRLAND_INSTANCE_SIGNATURE"))?;
-
-    let runtime = PathBuf::from(&runtime_dir);
-    if !runtime.is_absolute()
-        || runtime
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        // Var was set, but its content is unsafe — this is `Invalid`, not `Missing`.
-        return Err(HyprlandError::InvalidEnvVar("XDG_RUNTIME_DIR"));
-    }
-    // Reuse `is_safe_component` for instance_sig — same threat model
-    // (path-traversal, NUL-byte truncation, separator injection). Also
-    // reject signatures starting with `.` so an attacker can't squat on a
-    // hidden directory the user might not notice in `ls`.
-    if !is_safe_component(&instance_sig) || instance_sig.starts_with('.') {
+    let env_hint_owned = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    let env_hint = env_hint_owned.as_deref();
+    let his = resolve_live_his(env_hint).await?;
+    // Defense in depth: even if the resolver returned a non-validated HIS
+    // (it filters via is_safe_his, but a hostile probe path could in
+    // principle slip through a future refactor), validate again here.
+    if !is_safe_his(&his) {
         return Err(HyprlandError::InvalidEnvVar("HYPRLAND_INSTANCE_SIGNATURE"));
     }
-
-    Ok(runtime.join("hypr").join(instance_sig).join(name))
+    Ok(validated_runtime_dir()?.join("hypr").join(his).join(name))
 }
 
 impl HyprlandClient {
     /// Create a new client from environment variables.
     ///
+    /// Resolves the Hyprland instance via [`runtime_socket_path`], which
+    /// probes for a live instance (preferring the one named by
+    /// `HYPRLAND_INSTANCE_SIGNATURE` when alive). `async` because the
+    /// probe issues a real IPC round-trip.
+    ///
     /// # Errors
     ///
-    /// Returns an error if `XDG_RUNTIME_DIR` or `HYPRLAND_INSTANCE_SIGNATURE` are not set.
-    pub fn new() -> Result<Self> {
+    /// Returns an error if `XDG_RUNTIME_DIR` is missing/unsafe, or if no
+    /// reachable Hyprland instance is found and no env hint exists to fall
+    /// back on.
+    pub async fn new() -> Result<Self> {
         Ok(Self {
-            socket_path: runtime_socket_path(".socket.sock")?,
+            socket_path: runtime_socket_path(".socket.sock").await?,
         })
     }
 
@@ -426,7 +648,7 @@ impl HyprlandClient {
     /// ```no_run
     /// # use media_control_lib::hyprland::HyprlandClient;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = HyprlandClient::new()?;
+    /// let client = HyprlandClient::new().await?;
     /// client.dispatch("focuswindow address:0x12345678").await?;
     /// client.dispatch("movewindowpixel exact 100 200,address:0x12345678").await?;
     /// # Ok(())
@@ -449,7 +671,7 @@ impl HyprlandClient {
     /// ```no_run
     /// # use media_control_lib::hyprland::HyprlandClient;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = HyprlandClient::new()?;
+    /// let client = HyprlandClient::new().await?;
     /// client.batch(&[
     ///     "dispatch movewindowpixel exact 100 200,address:0x12345678",
     ///     "dispatch resizewindowpixel exact 640 360,address:0x12345678",
@@ -478,7 +700,7 @@ impl HyprlandClient {
     /// ```no_run
     /// # use media_control_lib::hyprland::HyprlandClient;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = HyprlandClient::new()?;
+    /// let client = HyprlandClient::new().await?;
     /// client.dispatch_batch(&[
     ///     "movewindowpixel exact 100 200,address:0x12345678",
     ///     "resizewindowpixel exact 640 360,address:0x12345678",
@@ -567,7 +789,7 @@ impl HyprlandClient {
     /// ```no_run
     /// # use media_control_lib::hyprland::HyprlandClient;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = HyprlandClient::new()?;
+    /// let client = HyprlandClient::new().await?;
     /// client.keyword("cursor:no_warps", "true").await?;
     /// # Ok(())
     /// # }
@@ -1018,5 +1240,286 @@ mod tests {
         // Even with `..` adjacent to a separator, the separator check fires
         // first — so multi-component traversal is still blocked.
         assert!(!is_safe_component("foo/../bar"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Story 001-probe-instance: probe_instance + Liveness + mock-socket cases
+    // ---------------------------------------------------------------------
+
+    use crate::test_helpers::{InstancePolicy, MockHyprlandInstance, with_isolated_runtime_dir};
+
+    #[tokio::test]
+    async fn probe_classifies_live_with_clients() {
+        with_isolated_runtime_dir(|runtime| async move {
+            let _mock = MockHyprlandInstance::new(&runtime, "alpha", InstancePolicy::LiveWithClients).await;
+            let liveness = probe_instance(&runtime, "alpha").await;
+            assert_eq!(liveness, Liveness::LiveWithClients);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_live_empty() {
+        with_isolated_runtime_dir(|runtime| async move {
+            let _mock = MockHyprlandInstance::new(&runtime, "beta", InstancePolicy::LiveEmpty).await;
+            let liveness = probe_instance(&runtime, "beta").await;
+            assert_eq!(liveness, Liveness::LiveEmpty);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_dead_when_socket_missing() {
+        with_isolated_runtime_dir(|runtime| async move {
+            let _mock = MockHyprlandInstance::new(&runtime, "gamma", InstancePolicy::Refuse).await;
+            let liveness = probe_instance(&runtime, "gamma").await;
+            assert_eq!(liveness, Liveness::Dead);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_dead_when_dir_missing_entirely() {
+        with_isolated_runtime_dir(|runtime| async move {
+            // No mock created — no `hypr/` subdir, no socket.
+            let liveness = probe_instance(&runtime, "ghost").await;
+            assert_eq!(liveness, Liveness::Dead);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_times_out_on_hanging_server() {
+        with_isolated_runtime_dir(|runtime| async move {
+            let _mock = MockHyprlandInstance::new(&runtime, "wedged", InstancePolicy::Hang).await;
+            let start = std::time::Instant::now();
+            let liveness = probe_instance(&runtime, "wedged").await;
+            let elapsed = start.elapsed();
+            assert_eq!(liveness, Liveness::Dead);
+            // Must respect the 1s deadline (PROBE_TIMEOUT). Allow 300ms slack
+            // for tokio scheduling jitter on a busy CI.
+            assert!(
+                elapsed < Duration::from_millis(1300),
+                "probe took {elapsed:?}, expected < 1.3s (PROBE_TIMEOUT + slack)"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_concurrent_runs_in_parallel_not_serial() {
+        with_isolated_runtime_dir(|runtime| async move {
+            // Two hanging mocks: serial probe = 2s, concurrent probe ≈ 1s.
+            let _m1 = MockHyprlandInstance::new(&runtime, "hang-a", InstancePolicy::Hang).await;
+            let _m2 = MockHyprlandInstance::new(&runtime, "hang-b", InstancePolicy::Hang).await;
+            let _m3 = MockHyprlandInstance::new(&runtime, "hang-c", InstancePolicy::Hang).await;
+            let _m4 = MockHyprlandInstance::new(&runtime, "hang-d", InstancePolicy::Hang).await;
+
+            let runtime_owned = runtime.clone();
+            let start = std::time::Instant::now();
+            let mut set: tokio::task::JoinSet<Liveness> = tokio::task::JoinSet::new();
+            for his in &["hang-a", "hang-b", "hang-c", "hang-d"] {
+                let r = runtime_owned.clone();
+                let h = his.to_string();
+                set.spawn(async move { probe_instance(&r, &h).await });
+            }
+            while set.join_next().await.is_some() {}
+            let elapsed = start.elapsed();
+            // All four 1s timeouts in parallel should finish in ~1s, not ~4s.
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "4 concurrent hang probes took {elapsed:?}; expected ~1s, got more — probes are serial"
+            );
+        })
+        .await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Story 002-resolve-live-instance: precedence rules + 7-case matrix
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_env_hint_live_returns_env_without_scan() {
+        with_isolated_runtime_dir(|runtime| async move {
+            let _live = MockHyprlandInstance::new(&runtime, "primary", InstancePolicy::LiveWithClients).await;
+            let _other = MockHyprlandInstance::new(&runtime, "secondary", InstancePolicy::LiveWithClients).await;
+            let chosen = resolve_live_his(Some("primary")).await.expect("resolve");
+            assert_eq!(chosen, "primary");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_env_hint_live_empty_wins_over_others_with_clients() {
+        // FR-2: explicit env pin wins even if "better" exists. User chose this
+        // instance; honor it.
+        with_isolated_runtime_dir(|runtime| async move {
+            let _empty = MockHyprlandInstance::new(&runtime, "pinned", InstancePolicy::LiveEmpty).await;
+            let _better = MockHyprlandInstance::new(&runtime, "elsewhere", InstancePolicy::LiveWithClients).await;
+            let chosen = resolve_live_his(Some("pinned")).await.expect("resolve");
+            assert_eq!(chosen, "pinned");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_env_hint_dead_falls_through_to_live_scan() {
+        // FR-3: the 2026-04-29 incident shape. Env points at a dead instance,
+        // a real one exists elsewhere. Resolver must find the real one.
+        with_isolated_runtime_dir(|runtime| async move {
+            let _dead = MockHyprlandInstance::new(&runtime, "stale", InstancePolicy::Refuse).await;
+            let _live = MockHyprlandInstance::new(&runtime, "actual", InstancePolicy::LiveWithClients).await;
+            let chosen = resolve_live_his(Some("stale")).await.expect("resolve");
+            assert_eq!(chosen, "actual");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_no_hint_prefers_live_with_clients_over_empty_over_dead() {
+        // FR-1 preference ladder.
+        with_isolated_runtime_dir(|runtime| async move {
+            let _dead = MockHyprlandInstance::new(&runtime, "d", InstancePolicy::Refuse).await;
+            let _empty = MockHyprlandInstance::new(&runtime, "e", InstancePolicy::LiveEmpty).await;
+            let _live = MockHyprlandInstance::new(&runtime, "l", InstancePolicy::LiveWithClients).await;
+            let chosen = resolve_live_his(None).await.expect("resolve");
+            assert_eq!(chosen, "l");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_no_hint_returns_live_empty_when_only_choice() {
+        with_isolated_runtime_dir(|runtime| async move {
+            let _empty = MockHyprlandInstance::new(&runtime, "only", InstancePolicy::LiveEmpty).await;
+            let chosen = resolve_live_his(None).await.expect("resolve");
+            assert_eq!(chosen, "only");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_env_hint_dead_no_live_falls_back_to_env_for_retry() {
+        // FR-5: env points dead, scan finds nothing alive; we still hand
+        // back the env hint so the caller's retry loop has a target.
+        with_isolated_runtime_dir(|runtime| async move {
+            let _dead = MockHyprlandInstance::new(&runtime, "stale", InstancePolicy::Refuse).await;
+            let chosen = resolve_live_his(Some("stale")).await.expect("resolve");
+            assert_eq!(chosen, "stale");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_no_hint_no_dirs_returns_no_live_instance_error() {
+        // FR-5 boundary: zero env hint AND zero dirs → typed error, not
+        // a fabricated path.
+        with_isolated_runtime_dir(|_runtime| async move {
+            let err = resolve_live_his(None).await.expect_err("must error");
+            assert!(
+                matches!(err, HyprlandError::NoLiveInstance),
+                "expected NoLiveInstance, got {err:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_invalid_env_hint_falls_through_to_scan() {
+        // Defense-in-depth: even if a malformed env value sneaks past the
+        // caller, is_safe_his filters it out before probing. The behavior
+        // should be identical to env_hint = None.
+        with_isolated_runtime_dir(|runtime| async move {
+            let _live = MockHyprlandInstance::new(&runtime, "real", InstancePolicy::LiveWithClients).await;
+            // "../escape" is not a safe HIS — should be ignored.
+            let chosen = resolve_live_his(Some("../escape")).await.expect("resolve");
+            assert_eq!(chosen, "real");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_skips_symlink_his_dirs() {
+        // Hyprland never creates symlinks under hypr/; if one appears it's
+        // suspicious — skip it entirely.
+        with_isolated_runtime_dir(|runtime| async move {
+            // Plant a real instance under "good", then symlink "evil" -> "good".
+            let _live = MockHyprlandInstance::new(&runtime, "good", InstancePolicy::LiveWithClients).await;
+            let hypr_dir = runtime.join("hypr");
+            std::os::unix::fs::symlink(hypr_dir.join("good"), hypr_dir.join("evil"))
+                .expect("create symlink");
+
+            // The symlink dir is skipped by the scan; only "good" is a real
+            // candidate, so it's chosen.
+            let chosen = resolve_live_his(None).await.expect("resolve");
+            assert_eq!(chosen, "good");
+        })
+        .await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Story 003-runtime-socket-path-uses-resolver: integration through the
+    // public seam. Confirms CLI / daemon get the fix without code changes.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn runtime_socket_path_returns_live_instance_socket() {
+        // `with_isolated_runtime_dir` already holds `async_env_test_mutex` for
+        // the duration of the closure, so we mutate HYPRLAND_INSTANCE_SIGNATURE
+        // directly (re-acquiring the mutex would deadlock — tokio::sync::Mutex
+        // is not reentrant).
+        with_isolated_runtime_dir(|runtime| async move {
+            let _live = MockHyprlandInstance::new(&runtime, "real", InstancePolicy::LiveWithClients).await;
+
+            let orig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+            // SAFETY: env mutex held by with_isolated_runtime_dir.
+            unsafe {
+                env::set_var("HYPRLAND_INSTANCE_SIGNATURE", "nonexistent");
+            }
+
+            let path = runtime_socket_path(".socket2.sock").await.expect("resolve");
+            assert!(
+                path.to_string_lossy().contains("/hypr/real/"),
+                "expected live instance in path, got {path:?}"
+            );
+
+            // SAFETY: env mutex still held.
+            unsafe {
+                match orig {
+                    Some(v) => env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+                    None => env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn runtime_socket_path_honors_live_env_pinning() {
+        with_isolated_runtime_dir(|runtime| async move {
+            let _pinned = MockHyprlandInstance::new(&runtime, "pinned", InstancePolicy::LiveWithClients).await;
+            let _other = MockHyprlandInstance::new(&runtime, "other", InstancePolicy::LiveWithClients).await;
+
+            let orig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+            // SAFETY: env mutex held by with_isolated_runtime_dir.
+            unsafe {
+                env::set_var("HYPRLAND_INSTANCE_SIGNATURE", "pinned");
+            }
+
+            let path = runtime_socket_path(".socket2.sock").await.expect("resolve");
+            assert!(
+                path.to_string_lossy().contains("/hypr/pinned/"),
+                "expected pinned instance, got {path:?}"
+            );
+
+            // SAFETY: env mutex still held.
+            unsafe {
+                match orig {
+                    Some(v) => env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+                    None => env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+                }
+            }
+        })
+        .await;
     }
 }

@@ -1,11 +1,11 @@
 # Global Story Index
 
 ## Overview
-- **Total stories**: 44
+- **Total stories**: 48
 - **Generated**: 30
 - **Completed**: 3
-- **Planned**: 11
-- **Last updated**: 2026-04-26
+- **Planned**: 15
+- **Last updated**: 2026-04-29
 
 ---
 
@@ -99,11 +99,21 @@
 - [ ] **005-daemon-cached-clients** (avoider-cleanup): Cache get_clients() in daemon; event-driven invalidation - Should - PLANNED
 - [ ] **006-daemon-in-memory-suppress** (avoider-cleanup): Daemon holds suppress timestamp in Arc<AtomicU64> - Should - PLANNED
 
+### 017-daemon-his-autodetect
+
+**Unit: 001-his-resolve-with-probe** (3 stories)
+- [ ] **001-probe-instance** (his-resolve-with-probe): probe_instance() + Liveness enum + mock-socket tests (LiveWithClients/LiveEmpty/Refused/Timeout) - Must - PLANNED
+- [ ] **002-resolve-live-instance** (his-resolve-with-probe): resolve_live_his() precedence rules (env-fast-path, stale-warn, scan-and-pick, no-live fallback) - Must - PLANNED
+- [ ] **003-runtime-socket-path-uses-resolver** (his-resolve-with-probe): Replace runtime_socket_path() body to call resolver; CLI + daemon get fix automatically - Must - PLANNED
+
+**Unit: 002-daemon-reconnect-re-resolution** (1 story)
+- [ ] **001-connect-loop-re-resolves** (daemon-reconnect-re-resolution): Move resolve call inside connect_hyprland_socket() loop body; swap-mid-retry test - Should - PLANNED
+
 ---
 
 ## Stories by Status
 
-- **Planned**: 11
+- **Planned**: 15
 - **Generated**: 30
 - **In Progress**: 0
 - **Completed**: 3

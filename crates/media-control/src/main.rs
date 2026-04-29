@@ -269,7 +269,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // `warn!` and falls back to defaults instead of refusing to start.
     let config = Config::load_or_warn(cli.config.as_deref());
 
-    let ctx = CommandContext::with_config(config)?;
+    let ctx = CommandContext::with_config(config).await?;
 
     // Route to command
     match cli.command {

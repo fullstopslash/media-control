@@ -9,7 +9,7 @@
 //! use media_control_lib::commands::{CommandContext, move_window::{Direction, move_window}};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let ctx = CommandContext::new()?;
+//! let ctx = CommandContext::new().await?;
 //! move_window(&ctx, Direction::Left).await?;  // Move to left edge
 //! move_window(&ctx, Direction::Down).await?;  // Move to bottom edge
 //! # Ok(())
@@ -141,7 +141,7 @@ impl std::fmt::Display for Direction {
 /// use media_control_lib::commands::{CommandContext, move_window::{Direction, move_window}};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let ctx = CommandContext::new()?;
+/// let ctx = CommandContext::new().await?;
 ///
 /// // Move window to each corner
 /// move_window(&ctx, Direction::Up).await?;    // Top edge

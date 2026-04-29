@@ -231,11 +231,13 @@ fn get_fifo_path() -> Result<PathBuf, MediaControlError> {
 
 /// Get the path to Hyprland's socket2 (event stream).
 ///
-/// Propagates the typed `HyprlandError` rather than collapsing it to a
-/// `String` — preserves the error variant so callers can distinguish
-/// missing-env from malformed-env, and lets `?` carry source chains.
-fn get_socket2_path() -> Result<PathBuf, HyprlandError> {
-    runtime_socket_path(".socket2.sock")
+/// `async` because `runtime_socket_path` now probes for a live Hyprland
+/// instance (intent 017). Propagates the typed `HyprlandError` rather
+/// than collapsing it to a `String` — preserves the error variant so
+/// callers can distinguish missing-env from malformed-env from
+/// no-live-instance, and lets `?` carry source chains.
+async fn get_socket2_path() -> Result<PathBuf, HyprlandError> {
+    runtime_socket_path(".socket2.sock").await
 }
 
 /// Read PID from the PID file.
@@ -523,29 +525,42 @@ async fn fifo_listener(tx: mpsc::Sender<()>) {
 }
 
 /// Connect to Hyprland socket2 with retries and backoff.
+///
+/// Path resolution happens **inside** the loop so a Hyprland restart
+/// (which produces a new HIS) is recovered within one retry tick instead
+/// of hammering a dead path forever (intent 017 / FR-4 — outer-loop
+/// case; the inner-loop tighter coverage lands in unit 002 / bolt 029).
 async fn connect_hyprland_socket() -> Result<UnixStream, HyprlandError> {
-    let socket_path = get_socket2_path()?;
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(10);
 
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path)).await
-        {
-            Ok(Ok(stream)) => {
-                info!("Connected to Hyprland socket at {:?}", socket_path);
-                return Ok(stream);
+        match get_socket2_path().await {
+            Ok(socket_path) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    UnixStream::connect(&socket_path),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        info!("Connected to Hyprland socket at {:?}", socket_path);
+                        return Ok(stream);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "Failed to connect to Hyprland socket {socket_path:?}: {e} (retry in {backoff:?})"
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Timed out connecting to Hyprland socket {socket_path:?} (retry in {backoff:?})"
+                        );
+                    }
+                }
             }
-            Ok(Err(e)) => {
-                warn!(
-                    "Failed to connect to Hyprland socket: {} (retry in {:?})",
-                    e, backoff
-                );
-            }
-            Err(_) => {
-                warn!(
-                    "Timed out connecting to Hyprland socket (retry in {:?})",
-                    backoff
-                );
+            Err(e) => {
+                warn!("Failed to resolve Hyprland socket path: {e} (retry in {backoff:?})");
             }
         }
         tokio::time::sleep(backoff).await;
@@ -666,7 +681,7 @@ impl Drop for AbortOnDrop {
 async fn run_event_loop() -> Result<(), MediaControlError> {
     let config = Config::load_or_warn(None);
     let debounce_ms = config.positioning.debounce_ms;
-    let ctx = CommandContext::with_config(config)?;
+    let ctx = CommandContext::with_config(config).await?;
     let debounce_duration = Duration::from_millis(u64::from(debounce_ms));
     // TTL = the debounce window. A burst of related events fires within
     // this window and benefits from a shared snapshot; the very next
