@@ -92,16 +92,21 @@ impl ClientCache {
 }
 
 /// In-memory mirror of the avoider's suppress timestamp (millis since
-/// UNIX epoch). The daemon updates this directly after each successful
-/// `trigger_avoid`, so subsequent ticks within the suppress window can
-/// short-circuit on a single atomic load instead of a per-event filesystem
-/// stat + read.
+/// UNIX epoch). The on-disk suppress file is the source of truth: the
+/// lib writes it via `commands::suppress_avoider` only when an actual
+/// move (or focus-restore) happens, and external CLI commands write it
+/// from outside the daemon process.
 ///
-/// The on-disk suppress file remains the cross-process IPC path: CLI
-/// commands that warm the file (via `commands::suppress_avoider`) are
-/// observed by the file-stat fallback in [`SuppressState::is_suppressed`].
-/// This mirror is purely additive — disabling it would just put us back
-/// on the file-only path, with no correctness change.
+/// `is_suppressed` consults this mirror first to avoid a per-event
+/// filesystem stat; on a miss it falls through to the file and promotes
+/// any fresh stamp it finds back into the mirror so subsequent ticks in
+/// the same suppress window hit the atomic load path.
+///
+/// Critically the daemon does NOT warm this mirror at the end of every
+/// `trigger_avoid`. A no-op avoid pass (no overlap, nothing moved) must
+/// not block the next 150ms of collision detection — pre-fix this is
+/// exactly how recent updates regressed near-perfect overlap detection
+/// into noticeable lag.
 ///
 /// `0` is the sentinel "never warmed". Any positive value is a real
 /// timestamp the comparison treats as the most recent in-memory write.
@@ -116,14 +121,16 @@ impl SuppressState {
         }
     }
 
-    /// Stamp the in-memory mirror with `now_unix_millis()`. Called by the
-    /// daemon after a successful `avoid_with_clients` so future ticks in
-    /// the same suppress window observe the warm state without file IO.
+    /// Stamp the in-memory mirror with `now_unix_millis()`.
+    ///
+    /// Production warming happens implicitly inside `is_suppressed` when
+    /// it promotes a fresh file stamp into the mirror, so this method is
+    /// reachable only from tests; gating with `cfg(test)` keeps the
+    /// production binary free of an obvious footgun (calling `warm()`
+    /// from the avoid hot path is exactly the regression that motivated
+    /// the carve-out doc comment above).
+    #[cfg(test)]
     fn warm(&self) {
-        // `Release` so the in-memory write happens-before any subsequent
-        // `Acquire` load in `is_suppressed`. In practice the loader runs
-        // on the same task, so program order alone would suffice; the
-        // ordering is conservative against future multi-task callers.
         self.last_ms.store(now_unix_millis(), Ordering::Release);
     }
 
@@ -349,9 +356,16 @@ fn is_process_running(pid: Pid) -> bool {
 ///
 /// Suppress short-circuit runs first (cheapest path: a single atomic load
 /// when the mirror is warm). Refetches `j/clients` only when the cache is
-/// cold or older than the debounce window. After a successful avoid pass,
-/// the suppress mirror is warmed so the next tick within the suppress
-/// window can short-circuit without touching the file system.
+/// cold or older than the debounce window.
+///
+/// Does NOT unconditionally warm the suppress mirror after the avoid
+/// pass. The lib's `move_media_window` / `restore_focus_suppressed`
+/// already write the suppress file when a real move happens; the
+/// file-fallback in `SuppressState::is_suppressed` promotes that stamp
+/// back into the mirror on the very next tick. Warming here for every
+/// avoid call — including no-op passes that found nothing to move —
+/// would silently block legitimate collision detection for the full
+/// `suppress_ms` window after every tick.
 async fn trigger_avoid(ctx: &CommandContext, cache: &ClientCache, suppress: &SuppressState) {
     if suppress
         .is_suppressed(u64::from(ctx.config.positioning.suppress_ms))
@@ -369,13 +383,7 @@ async fn trigger_avoid(ctx: &CommandContext, cache: &ClientCache, suppress: &Sup
     };
     if let Err(e) = commands::avoid::avoid_with_clients(ctx, &clients).await {
         debug!("Avoid error: {}", e);
-        return;
     }
-    // Warm the in-memory mirror: the lib's avoid path may have called
-    // `suppress_avoider` (writing the file), but the next tick should
-    // short-circuit without re-reading it. Setting the mirror here
-    // means subsequent `is_suppressed` calls hit the atomic load path.
-    suppress.warm();
 }
 
 /// Create a trigger FIFO at `path`, hardened against pre-creation attacks.
@@ -568,21 +576,54 @@ async fn connect_hyprland_socket() -> Result<UnixStream, HyprlandError> {
     }
 }
 
-/// Hyprland event names that warrant a re-evaluation of media window placement.
-const AVOID_EVENTS: &[&str] = &[
-    "workspace",
-    "activewindow",
-    "movewindow",
-    "openwindow",
-    "closewindow",
-    "swapwindow",
+/// Hyprland event names with NO layout impact. Anything not on this list
+/// triggers an avoid pass — mirroring the original bash daemon's catch-all
+/// semantics that the user described as "near perfect" collision detection.
+///
+/// The Rust port previously used an allow-list of just six events
+/// (`workspace`, `activewindow`, `movewindow`, `openwindow`, `closewindow`,
+/// `swapwindow`), silently dropping `resizewindow`, `changefloatingmode`,
+/// `fullscreen`, `pin`, monitor changes, and several other events that DO
+/// move or reshape windows. Switching back to a deny-list restores the
+/// original coverage while keeping the high-frequency noisemakers out.
+///
+/// `*v2` duplicates of triggering events are listed here because Hyprland
+/// emits both forms back-to-back; debounce would coalesce them, but
+/// dropping the v2 explicitly keeps the debug log readable.
+const IGNORE_EVENTS: &[&str] = &[
+    // Duplicates of events whose non-v2 form already triggers.
+    "activewindowv2",
+    "movewindowv2",
+    "workspacev2",
+    "windowtitlev2",
+    "createworkspacev2",
+    "destroyworkspacev2",
+    "moveworkspacev2",
+    "monitoraddedv2",
+    // Title changes are extremely high-frequency (mpv updates ~1Hz with
+    // playback position) and never move the window.
+    "windowtitle",
+    // Pure state notifications without geometry impact.
+    "urgent",
+    "minimize",
+    "screencast",
+    "submap",
+    "activelayout",
+    // Layer-shell surfaces (panels/bars) don't move regular windows.
+    "openlayer",
+    "closelayer",
 ];
 
 /// Returns true if a Hyprland event line should trigger an avoid pass.
+///
+/// Deny-list semantics: an empty / unparsed line is treated as "ignore"
+/// because we can't classify it. Everything else not in [`IGNORE_EVENTS`]
+/// triggers — debounce (15ms default) and `should_suppress` (150ms
+/// default after a real move) gate the cost of an over-trigger.
 #[inline]
 fn is_avoid_trigger(line: &str) -> bool {
     let (event, _) = line.split_once(">>").unwrap_or((line, ""));
-    AVOID_EVENTS.contains(&event)
+    !event.is_empty() && !IGNORE_EVENTS.contains(&event)
 }
 
 /// Run a single session of the event loop (until socket disconnect).
@@ -688,7 +729,9 @@ async fn run_event_loop() -> Result<(), MediaControlError> {
     // burst (after debounce_duration elapses) refetches naturally.
     let client_cache = ClientCache::new(debounce_duration);
     // In-memory mirror of the suppress timestamp. Cold on startup
-    // (`0`), warmed by `trigger_avoid` after each successful pass.
+    // (`0`); warmed lazily by the file-fallback path inside
+    // `is_suppressed` whenever the lib (or an external CLI command)
+    // has written the on-disk suppress file.
     let suppress_state = SuppressState::new();
 
     // Create FIFO for manual triggers
@@ -1134,19 +1177,49 @@ mod tests {
         media_control_lib::commands::shared::async_env_test_mutex()
     }
 
-    /// Avoid-trigger event matcher correctly identifies relevant events
-    /// and ignores everything else. This guards against silent regression
-    /// if the AVOID_EVENTS list is reordered or trimmed.
+    /// Avoid-trigger event matcher correctly identifies layout-affecting
+    /// events and ignores known no-op / duplicate events. Guards against a
+    /// future trim of `IGNORE_EVENTS` re-introducing the title-update spam
+    /// that originally motivated the deny-list, AND against shrinking the
+    /// trigger surface back down to the six-event allow-list that lost
+    /// `resizewindow`/`changefloatingmode`/`fullscreen`/`pin` coverage.
     #[test]
     fn is_avoid_trigger_matches_relevant_events() {
-        for ev in AVOID_EVENTS {
+        // Layout-affecting events MUST trigger.
+        for ev in &[
+            "workspace",
+            "activewindow",
+            "movewindow",
+            "openwindow",
+            "closewindow",
+            "swapwindow",
+            "resizewindow",
+            "changefloatingmode",
+            "fullscreen",
+            "pin",
+            "togglegroup",
+            "moveintogroup",
+            "moveoutofgroup",
+            "monitoradded",
+            "monitorremoved",
+            "focusedmon",
+            "moveworkspace",
+            "createworkspace",
+            "destroyworkspace",
+            "configreloaded",
+        ] {
             assert!(is_avoid_trigger(&format!("{ev}>>some,data")), "{ev}");
             // No payload is also valid (just the event token).
             assert!(is_avoid_trigger(ev), "{ev} (no payload)");
         }
-        for ev in &["createworkspace", "monitoradded", "submap", ""] {
+        // Known no-op / duplicate events MUST NOT trigger.
+        for ev in IGNORE_EVENTS {
             assert!(!is_avoid_trigger(&format!("{ev}>>x")), "{ev}");
+            assert!(!is_avoid_trigger(ev), "{ev} (no payload)");
         }
+        // Empty / unparseable lines MUST NOT trigger.
+        assert!(!is_avoid_trigger(""));
+        assert!(!is_avoid_trigger(">>x"));
     }
 
     /// FIFO creation must succeed at a fresh path and produce an actual FIFO
