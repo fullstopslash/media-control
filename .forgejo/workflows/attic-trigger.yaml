@@ -1,0 +1,21 @@
+name: Attic Trigger
+
+# Restart the nix-builder container on waterbug after every push to main,
+# so the ~/nix system flake's lock advances and the resulting closure
+# lands in the attic cache before the operator's next `nh os switch -u`.
+# The hourly TrueNAS cron (/mnt/apps/apps/attic/restart-builder.sh) remains
+# the safety net.
+#
+# Dedup: build.sh in nix-builder takes a flock on /builder/.build.lock,
+# so multiple triggers within a single build cycle collapse to one run.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  trigger-system-rebuild:
+    runs-on: docker
+    steps:
+      - name: Restart nix-builder
+        run: docker restart nix-builder
