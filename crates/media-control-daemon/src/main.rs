@@ -1270,26 +1270,38 @@ mod tests {
 
     /// FIFO creation must refuse a stale FIFO owned by a different uid.
     /// We can't easily create cross-uid files in tests without root, so we
-    /// assert via the code path: when an existing FIFO is ours, it is
-    /// removed and recreated cleanly (the inverse of the ownership check).
+    /// assert via the code path: when an existing FIFO is ours, the second
+    /// `create_fifo_at` call returns `Ok` and leaves a FIFO at the path.
+    ///
+    /// We do NOT compare inode numbers between the two calls. Inode-reuse is
+    /// allowed by POSIX and tmpfs (which the nix build sandbox uses) reuses
+    /// the inode of a just-unlinked file immediately, so an inode equality
+    /// flake is built into that storage layer. The actual contract being
+    /// tested — "calling against our own existing FIFO does not error" — is
+    /// load-bearing because `mkfifo(2)` returns `EEXIST` against any extant
+    /// path: if the implementation forgot to unlink first, the second call
+    /// here would have already panicked at `expect("recreate-our-own")`.
     #[test]
     fn create_fifo_at_replaces_our_own_existing_fifo() {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::FileTypeExt;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replace.fifo");
 
         // First creation
         create_fifo_at(&path).expect("first create");
-        let inode_before = std::fs::symlink_metadata(&path).unwrap().ino();
 
-        // Second creation should succeed (we own it) and replace inode.
+        // Second creation must succeed against the existing FIFO we own.
+        // If `create_fifo_at` had skipped the unlink step, `mkfifo` would
+        // surface EEXIST and this `expect` would have panicked.
         create_fifo_at(&path).expect("recreate-our-own");
-        let inode_after = std::fs::symlink_metadata(&path).unwrap().ino();
 
-        assert_ne!(
-            inode_before, inode_after,
-            "our own existing FIFO should be removed and recreated"
+        // And the path must still be a FIFO afterwards (not, e.g., silently
+        // turned into a regular file by a future implementation regression).
+        let meta = std::fs::symlink_metadata(&path).expect("stat after recreate");
+        assert!(
+            meta.file_type().is_fifo(),
+            "path must still be a FIFO after recreate"
         );
     }
 

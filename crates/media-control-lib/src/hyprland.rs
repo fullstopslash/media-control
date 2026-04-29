@@ -597,29 +597,35 @@ impl HyprlandClient {
 
     /// Check if a Hyprland IPC response indicates success.
     ///
-    /// Accepts an empty body or a body whose every line is exactly `"ok"`
-    /// (one line per command in a `[[BATCH]]` response). This is stricter
-    /// than the previous `starts_with("ok\n")` check, which would accept
-    /// partial-failure batches like `"ok\nerror: bad\nok\n"` because the
-    /// first command happened to succeed. It also rejects substring-style
-    /// false positives like `"oklahoma"` and `"okok"`.
+    /// Accepts an empty body, a single `"ok"`, or a multi-`"ok"` body
+    /// returned by a `[[BATCH]]` request. Hyprland 0.5x separates per-command
+    /// batch results with a blank line (e.g. `"ok\n\n\nok\n\n\nok"` for a
+    /// 3-command success and `"No such window found\n\n\nok"` when the first
+    /// command failed), so empty intermediate lines are treated as separators
+    /// and skipped. Any non-empty line that isn't exactly `"ok"` (a Hyprland
+    /// error string like `"error: ..."`, `"No such window found"`, etc.)
+    /// still surfaces as a failure, which preserves the partial-failure-in-
+    /// batch detection the previous strict check was added for.
+    /// Substring-style false positives like `"oklahoma"` and `"okok"` are
+    /// rejected.
     #[inline]
     fn is_success(response: &str) -> bool {
         if response.is_empty() {
             return true;
         }
-        // `lines()` strips the trailing `\n` and skips an empty trailing
-        // record, so `"ok\n"` and `"ok\nok\n"` both yield only `"ok"` lines.
-        // An empty intermediate line (e.g. `"ok\n\nok\n"`) is treated as
-        // failure — Hyprland never emits that shape for success.
-        let mut had_line = false;
+        let mut had_ok_line = false;
         for line in response.lines() {
+            // Hyprland's `[[BATCH]]` separator is a blank line between the
+            // `ok`s; skip it rather than rejecting on it.
+            if line.is_empty() {
+                continue;
+            }
             if line != "ok" {
                 return false;
             }
-            had_line = true;
+            had_ok_line = true;
         }
-        had_line
+        had_ok_line
     }
 
     /// Send a command and require a success response.
@@ -1184,6 +1190,24 @@ mod tests {
         assert!(HyprlandClient::is_success("ok\nok"));
     }
 
+    /// Regression: Hyprland 0.5x emits a blank line *between* per-command
+    /// `ok`s in a `[[BATCH]]` response. Captured wire formats from a live
+    /// 0.54.3 socket: `"ok\n\n\nok"` (2 cmds), `"ok\n\n\nok\n\n\nok"` (3
+    /// cmds). A strict `"only `ok` lines"` check rejected these as failures
+    /// and surfaced every successful batched dispatch (focuswindow + pin +
+    /// fullscreen, the fullscreen-toggle hot path) as a `Rejected` IPC error.
+    #[test]
+    fn is_success_accepts_batch_response_with_blank_separators() {
+        // 2-command batch: `ok\n\n\nok`.
+        assert!(HyprlandClient::is_success("ok\n\n\nok"));
+        // 3-command batch (the fullscreen-toggle batch shape).
+        assert!(HyprlandClient::is_success("ok\n\n\nok\n\n\nok"));
+        // Trailing newline after the last `ok` — `String::read_to_string`
+        // may or may not drop it depending on whether mpv-style EOF flushed
+        // the trailing byte.
+        assert!(HyprlandClient::is_success("ok\n\n\nok\n"));
+    }
+
     #[test]
     fn is_success_rejects_error_text() {
         assert!(!HyprlandClient::is_success("error: unknown command"));
@@ -1202,6 +1226,31 @@ mod tests {
         // Even if the first command succeeded, a later `error: ...` line in
         // the batch response must surface as a failure.
         assert!(!HyprlandClient::is_success("ok\nerror: bad\nok\n"));
+    }
+
+    /// Regression: a partial-failure batch in the 0.5x wire format
+    /// (`"<error>\n\n\nok"`) must still surface as failure, even though the
+    /// blank-line skip now treats the separator as a no-op. Captured shape:
+    /// `"No such window found\n\n\nok"` from a `focuswindow address:0xdead`
+    /// followed by a valid second command in the same batch.
+    #[test]
+    fn is_success_rejects_partial_failure_with_blank_separators() {
+        assert!(!HyprlandClient::is_success(
+            "No such window found\n\n\nok"
+        ));
+        // Symmetrically: failure in the trailing position.
+        assert!(!HyprlandClient::is_success(
+            "ok\n\n\nNo such window found"
+        ));
+    }
+
+    /// A response made entirely of blank lines is NOT success: there is no
+    /// `ok` evidence to treat as a positive ack. Conservative — we'd rather
+    /// surface an unexpected wire format as failure than silently approve.
+    #[test]
+    fn is_success_rejects_blank_only_response() {
+        assert!(!HyprlandClient::is_success("\n"));
+        assert!(!HyprlandClient::is_success("\n\n"));
     }
 
     // --- is_safe_component tests ---
