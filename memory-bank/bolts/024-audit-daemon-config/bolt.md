@@ -3,12 +3,15 @@ id: 024-audit-daemon-config
 unit: 001-audit-fixes
 intent: 014-audit-round4-fixes
 type: simple-construction-bolt
-status: planned
+status: complete
 stories:
   - daemon-cmd-stop-wait-for-exit
   - daemon-start-lock-toctou
   - config-validate-pattern-regex-nfa-cap
 created: 2026-04-23T00:00:00Z
+completed: 2026-04-23T22:30:56Z
+status_backfilled: 2026-04-29T12:00:00Z
+source_commit: 69ed0a98
 requires_bolts: []
 enables_bolts: []
 requires_units: []
@@ -62,3 +65,20 @@ Tighten daemon lifecycle and config validation. Two files:
 
 ### Dependencies
 None.
+
+### Completion (status backfilled 2026-04-29)
+
+Frontmatter sync — work shipped in commit `69ed0a98` (2026-04-23). Verified
+2026-04-29 against the live tree:
+
+- `daemon-cmd-stop-wait-for-exit` ✅ — `is_process_running` poll loop after
+  SIGTERM at `media-control-daemon/src/main.rs:978` with 2s budget
+  (`tokio::time::sleep(Duration::from_secs(2))` at line 753); SIGKILL escalation
+  path on timeout
+- `daemon-start-lock-toctou` ✅ — `flock(LOCK_EX | LOCK_NB)` at
+  `media-control-daemon/src/main.rs:828` (kernel-side lock; doc comment
+  cites the design choice — "the kernel never lets two processes hold
+  LOCK_EX at once")
+- `config-validate-pattern-regex-nfa-cap` ✅ — `RegexBuilder::new(...)
+  .size_limit(TITLE_REGEX_SIZE_LIMIT)` in `validate_pattern_regexes` at
+  `config.rs:289-290`

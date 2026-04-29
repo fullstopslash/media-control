@@ -3,7 +3,7 @@ id: 023-audit-handler-fixes
 unit: 001-audit-fixes
 intent: 014-audit-round4-fixes
 type: simple-construction-bolt
-status: planned
+status: complete
 stories:
   - fullscreen-pin-dead-address-guard
   - close-suppress-avoider-before-dispatch
@@ -11,6 +11,9 @@ stories:
   - chapter-direction-case-insensitive
   - focus-launch-shlex-no-shell
 created: 2026-04-23T00:00:00Z
+completed: 2026-04-23T22:33:51Z
+status_backfilled: 2026-04-29T12:00:00Z
+source_commit: 751a0edd
 requires_bolts: []
 enables_bolts: []
 requires_units: []
@@ -76,3 +79,22 @@ focus-launch story is a behavior change for users who relied on shell expansion
 in --launch. Document in the next changelog entry. shlex tokenization is the
 correct default; users wanting shell features can always invoke `sh -c "..."`
 themselves as the launch command.
+
+### Completion (status backfilled 2026-04-29)
+
+Frontmatter sync — work shipped in commit `751a0edd` (2026-04-23). Verified
+2026-04-29 against the live tree:
+
+- `fullscreen-pin-dead-address-guard` ✅ — `if fresh_window.is_some() ...`
+  guard at `commands/window/fullscreen.rs:320`
+- `close-suppress-avoider-before-dispatch` ✅ — `suppress_avoider().await`
+  calls at `commands/window/close.rs:135,152` before each dispatch
+- `avoid-scratchpad-monitor-guard` ✅ — `if focused.monitor() <=
+  SCRATCHPAD_MONITOR { return ... }` early-return at
+  `commands/window/avoid.rs:538`; regression test
+  `avoid_scratchpad_focused_returns_early` at `avoid.rs:1278` cites this bolt
+- `chapter-direction-case-insensitive` ✅ — `eq_ignore_ascii_case` at
+  `commands/workflow/chapter.rs:40,42`
+- `focus-launch-shlex-no-shell` ✅ — `shlex::split(cmd)` at
+  `commands/window/focus.rs:119`; `InvalidArgument` returned on `None` /
+  empty argv

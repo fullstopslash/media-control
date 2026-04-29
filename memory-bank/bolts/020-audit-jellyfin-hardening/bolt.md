@@ -3,12 +3,15 @@ id: 020-audit-jellyfin-hardening
 unit: 001-audit-fixes
 intent: 014-audit-round4-fixes
 type: simple-construction-bolt
-status: planned
+status: complete
 stories:
   - jellyfin-sort-params-validation
   - jellyfin-request-empty-body-drain
   - jellyfin-credential-error-context
 created: 2026-04-23T00:00:00Z
+completed: 2026-04-23T22:25:28Z
+status_backfilled: 2026-04-29T12:00:00Z
+source_commit: 3844dd08
 requires_bolts: []
 enables_bolts: []
 requires_units: []
@@ -56,3 +59,16 @@ edits in `crates/media-control-lib/src/jellyfin.rs`.
 
 ### Dependencies
 None.
+
+### Completion (status backfilled 2026-04-29)
+
+Frontmatter sync — work shipped in commit `3844dd08` (2026-04-23). Verified
+2026-04-29 against the live tree:
+
+- `jellyfin-sort-params-validation` ✅ — `pub enum SortBy` at
+  `jellyfin.rs:399`; `pub enum SortOrder` at `jellyfin.rs:443`
+- `jellyfin-request-empty-body-drain` ✅ — `let _ = response.bytes().await;`
+  at `jellyfin.rs:864`
+- `jellyfin-credential-error-context` ✅ — new `CredentialsParseAt {
+  path: PathBuf, source: serde_json::Error }` variant at `jellyfin.rs:43-50`
+  with formatter that displays the path

@@ -3,7 +3,7 @@ id: 008-strategy-implementations
 unit: 003-strategy-implementations
 intent: 002-smart-next-episode
 type: simple-construction-bolt
-status: in-progress
+status: superseded
 stories:
   - 001-next-up-and-random
   - 002-recent-unwatched
@@ -11,6 +11,8 @@ stories:
 created: 2026-03-18T20:00:00Z
 started: 2026-03-18T21:30:00Z
 completed: null
+status_backfilled: 2026-04-29T12:00:00Z
+superseded_by: jellyfin-mpv-shim-fork
 current_stage: implement
 stages_completed:
   - name: plan
@@ -58,3 +60,22 @@ Implement all 4 strategies: next-up, recent-unwatched, series-or-random, random-
 
 ### Enables
 - None (final bolt)
+
+## Status (backfilled 2026-04-29)
+
+**Superseded** — strategy implementations are being ported to a
+`jellyfin-mpv-shim` fork rather than implemented natively in
+`media-control`. Verified 2026-04-29 against the live tree:
+
+- Only `PlayTarget::NextUp` exists in `commands/workflow/play.rs:14`; the
+  other three planned strategies (`recent-unwatched`, `series-or-random`,
+  `random-unwatched`) are not present
+- The `NextUp` integration in `play.rs:96` delegates to mpv via
+  `send_mpv_script_message("play-next-up")`, consistent with the
+  shim-side execution model
+
+The unit's intent (intent 002 — smart-next-episode) lives on in the
+shim fork project; treat this bolt as cancelled-in-this-repo. Reopen
+only if the strategy logic moves back into `media-control` itself.
+
+(See user-memory entry `project_jellyfin_shim_fork.md`.)

@@ -3,11 +3,14 @@ id: 021-audit-minify-fix
 unit: 001-audit-fixes
 intent: 014-audit-round4-fixes
 type: simple-construction-bolt
-status: planned
+status: complete
 stories:
   - minify-toggle-toctou-fix
   - minify-test-coverage
 created: 2026-04-23T00:00:00Z
+completed: 2026-04-23T22:31:02Z
+status_backfilled: 2026-04-29T12:00:00Z
+source_commit: 457286e8
 requires_bolts: []
 enables_bolts: []
 requires_units: []
@@ -57,3 +60,15 @@ None. Disjoint from bolt 022 (mark_watched.rs).
 The audit Round 4 explicitly listed both the TOCTOU bug AND zero test coverage
 for this file. Both must land together so tests cover the new atomic-toggle
 behavior, not the old buggy behavior.
+
+### Completion (status backfilled 2026-04-29)
+
+Frontmatter sync — work shipped in commit `457286e8` (2026-04-23). Verified
+2026-04-29 against the live tree:
+
+- `minify-toggle-toctou-fix` ✅ — `try_set_minified(target: bool)` helper at
+  `commands/window/minify.rs:36` using `OpenOptions::create_new(true)`
+  (`O_CREAT | O_EXCL`); `we_flipped` pattern at `minify.rs:109` only toggles
+  the file after successful dispatch
+- `minify-test-coverage` ✅ — `mod tests` at `minify.rs:135` with 5+ tests
+  including `try_set_minified_true_is_atomic`, `try_set_minified_false_is_atomic`

@@ -3,10 +3,13 @@ id: 022-audit-mark-watched-tests
 unit: 001-audit-fixes
 intent: 014-audit-round4-fixes
 type: simple-construction-bolt
-status: planned
+status: complete
 stories:
   - mark-watched-test-coverage
 created: 2026-04-23T00:00:00Z
+completed: 2026-04-23T22:32:29Z
+status_backfilled: 2026-04-29T12:00:00Z
+source_commit: a9a0ce86
 requires_bolts: []
 enables_bolts: []
 requires_units: []
@@ -45,3 +48,10 @@ Single-file scope.
 
 ### Dependencies
 None. Pure test addition, no behavior changes.
+
+### Completion (status backfilled 2026-04-29)
+
+Frontmatter sync — work shipped in commit `a9a0ce86` (2026-04-23). Verified
+2026-04-29: `mod tests` at `commands/workflow/mark_watched.rs:111` with 4
+`#[tokio::test]` cases covering the no-socket, partial-failure, and happy
+paths.

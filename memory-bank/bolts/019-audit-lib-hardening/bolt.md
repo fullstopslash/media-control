@@ -3,7 +3,7 @@ id: 019-audit-lib-hardening
 unit: 001-audit-fixes
 intent: 014-audit-round4-fixes
 type: simple-construction-bolt
-status: planned
+status: complete
 stories:
   - error-write-read-iofailed-kind
   - error-non-exhaustive
@@ -12,6 +12,9 @@ stories:
   - mod-scaled-dims-clamp-to-config-bound
   - mod-with-media-window-resolve-dead-code
 created: 2026-04-23T00:00:00Z
+completed: 2026-04-23T22:25:28Z
+status_backfilled: 2026-04-29T12:00:00Z
+source_commit: 7828c17c
 requires_bolts: []
 enables_bolts: []
 requires_units: []
@@ -69,3 +72,23 @@ resolution. All edits live in error.rs, hyprland.rs, commands/mod.rs.
 ### Dependencies
 None. Touches disjoint sections from other bolts (other bolts edit specific
 function bodies, not the surrounding error/IPC plumbing).
+
+### Completion (status backfilled 2026-04-29)
+
+Frontmatter sync — work shipped in commit `7828c17c` (2026-04-23) but the
+bolt's `status` was never flipped from `planned` to `complete`. Verified
+2026-04-29 against the live tree:
+
+- `error-write-read-iofailed-kind` ✅ — `HyprlandIpcErrorKind::IoFailed` at
+  `error.rs:45`; bridge arm `error.rs:173`; tests at `error.rs:357,375`
+- `error-non-exhaustive` ✅ — `#[non_exhaustive]` on `MediaControlError`
+  (`error.rs:38`), `HyprlandIpcErrorKind` (`error.rs:19`), `MpvIpcErrorKind`
+  (`error.rs:69`)
+- `hyprland-safe-component-exact-match` ✅ — `s != ".."` at `hyprland.rs:232`
+- `mod-restore-focus-warn-on-cleanup-fail` ✅ — `tracing::warn!` upgrade at
+  `commands/window/mod.rs:308` (in `restore_focus_suppressed`)
+- `mod-scaled-dims-clamp-to-config-bound` ✅ — `debug_assert!(raw_scale > 0.0
+  && raw_scale <= 1.0, ...)` and `clamp(0.0, 1.0)` at
+  `commands/window/mod.rs:354-371`
+- `mod-with-media-window-resolve-dead-code` ✅ — `with_media_window` removed
+  (no hits in tree)
