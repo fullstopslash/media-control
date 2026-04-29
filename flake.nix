@@ -40,7 +40,7 @@
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
           pname = "media-control";
-          version = "0.1.4";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
           buildInputs = [];
           nativeBuildInputs = with pkgs; [pkg-config makeWrapper];
