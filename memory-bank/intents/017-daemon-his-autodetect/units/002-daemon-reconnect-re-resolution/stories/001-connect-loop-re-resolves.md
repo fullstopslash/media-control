@@ -19,10 +19,10 @@ implemented: false
 
 ## Acceptance Criteria
 
-- [ ] **Given** `connect_hyprland_socket()` in `crates/media-control-daemon/src/main.rs`, **When** the path-resolution call is moved from before the loop into the loop body (each iteration calls `get_socket2_path()` afresh), **Then** the function still has the same signature and exponential-backoff schedule (500ms → 10s)
+- [x] **Given** `connect_hyprland_socket()` in `crates/media-control-daemon/src/main.rs`, **When** the path-resolution call is moved from before the loop into the loop body (each iteration calls `get_socket2_path()` afresh), **Then** the function still has the same signature and exponential-backoff schedule (500ms → 10s) — _delivered by bolt 028 as a side effect of the `runtime_socket_path` async refactor_
 - [ ] **Given** a mock test setup with no live HIS dirs, **When** the daemon enters `connect_hyprland_socket()` and the loop has retried at least once, **And** I install a mock `LiveWithClients` HIS dir, **Then** the next loop iteration resolves to that new HIS and connects successfully
 - [ ] **Given** a real Hyprland session, **When** I `kill` the Hyprland process and `Hyprland` is restarted (new HIS), **Then** the daemon journal shows reconnection to the new HIS within ~1 retry-tick of the new instance being probe-alive — not a stuck retry against the dead path
-- [ ] **Given** existing daemon unit tests, **When** the change lands, **Then** they all pass (the per-iteration resolve does not change retry timing or error behavior)
+- [x] **Given** existing daemon unit tests, **When** the change lands, **Then** they all pass (the per-iteration resolve does not change retry timing or error behavior) — _verified during bolt 028: 402/402 workspace tests pass_
 
 ## Technical Notes
 

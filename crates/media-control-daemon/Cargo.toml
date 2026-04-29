@@ -21,3 +21,9 @@ nix = { version = "0.30", features = ["signal", "process", "fs", "user"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Activate the lib's `test-helpers` feature for tests in this crate so we
+# can reuse `MockHyprlandInstance` / `with_isolated_runtime_dir` instead
+# of duplicating the mock layer (intent 015 FR-5: single-source test
+# infrastructure). Release builds do not see this — dev-dep features are
+# only active for `cargo test`/`bench`/`example`.
+media-control-lib = { workspace = true, features = ["test-helpers"] }

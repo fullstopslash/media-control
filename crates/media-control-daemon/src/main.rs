@@ -1125,14 +1125,13 @@ mod tests {
     use std::os::unix::fs::FileTypeExt;
 
     /// Async serialization for tests in this binary that mutate
-    /// `XDG_RUNTIME_DIR` across `.await`. Backed by `tokio::sync::Mutex`
-    /// so its guard is `Send` and can safely outlive an await — the
-    /// std-mutex pattern would force a drop-before-await that fails to
-    /// actually serialize.
+    /// `XDG_RUNTIME_DIR` across `.await`. Forwards to the lib's
+    /// process-wide env mutex so daemon tests share the same lock
+    /// domain as the lib's `with_isolated_runtime_dir` (and any
+    /// future test-helpers in this crate that go through it).
+    /// Two domains would race on `XDG_RUNTIME_DIR` mutations.
     fn env_test_lock() -> &'static tokio::sync::Mutex<()> {
-        use std::sync::OnceLock;
-        static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| tokio::sync::Mutex::new(()))
+        media_control_lib::commands::shared::async_env_test_mutex()
     }
 
     /// Avoid-trigger event matcher correctly identifies relevant events
@@ -1482,5 +1481,171 @@ mod tests {
                 env::remove_var("XDG_RUNTIME_DIR");
             }
         }
+    }
+
+    /// Locks in FR-4 (intent 017 unit 002): when the daemon's connect-retry
+    /// loop starts with no live Hyprland and a fresh instance comes up
+    /// mid-retry, the next loop iteration must re-resolve and connect to it
+    /// — not stay stuck on the dead path.
+    ///
+    /// Production code already does this: `connect_hyprland_socket` calls
+    /// `get_socket2_path().await` inside the loop body (which delegates
+    /// through the resolver added in bolt 028). This test exists to keep
+    /// that property locked against a future refactor that hoists the
+    /// resolve back outside the loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_loop_picks_up_live_instance_mid_retry() {
+        use media_control_lib::test_helpers::{
+            InstancePolicy, MockHyprlandInstance, with_isolated_runtime_dir,
+        };
+        use std::time::Duration;
+
+        with_isolated_runtime_dir(|runtime_dir| async move {
+            // Clear HYPRLAND_INSTANCE_SIGNATURE so the resolver doesn't
+            // honor a stale env hint from the test runner. SAFETY:
+            // `with_isolated_runtime_dir` holds the env mutex for this
+            // closure body; no parallel test is mutating env right now.
+            let saved_his = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+            unsafe {
+                env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+            }
+            struct HisGuard(Option<String>);
+            impl Drop for HisGuard {
+                fn drop(&mut self) {
+                    unsafe {
+                        if let Some(v) = self.0.take() {
+                            env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v);
+                        }
+                    }
+                }
+            }
+            let _his_guard = HisGuard(saved_his);
+
+            // No HIS dirs under runtime_dir yet → resolver returns
+            // NoLiveInstance → connect_hyprland_socket warns and starts a
+            // 500ms backoff.
+            let connect_task =
+                tokio::spawn(async { connect_hyprland_socket().await });
+
+            // Sleep into the first backoff window. Anything in (0ms, 500ms)
+            // works; 200ms leaves clear room before the next iteration.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Install a live mock mid-backoff. The next iteration of
+            // connect_hyprland_socket will resolve to this instance and
+            // succeed on UnixStream::connect to .socket2.sock.
+            let mock = MockHyprlandInstance::new(
+                &runtime_dir,
+                "test-instance-1",
+                InstancePolicy::LiveWithClients,
+            )
+            .await;
+
+            // Expected wall time ≈ 500ms (rest of first backoff) plus
+            // one resolve+connect (sub-100ms). 5s timeout is generous.
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), connect_task)
+                    .await
+                    .expect("connect_hyprland_socket did not return within 5s")
+                    .expect("connect_hyprland_socket task panicked");
+
+            let stream = result.expect("connect_hyprland_socket returned Err");
+            // Connection established against the mid-loop-installed mock.
+            // The successful return type is the assertion; drop and clean up.
+            drop(stream);
+            drop(mock);
+        })
+        .await;
+    }
+
+    /// Locks in the FR-4 EOF-then-reconnect cycle: daemon connected to peer
+    /// A, peer A dies (socket close → EOF on the daemon's read side), daemon
+    /// reconnects, peer B is up at a new HIS, resolver picks B and connect
+    /// succeeds. This is the structural substitute for the real-Hyprland
+    /// `kill -9` test — it cannot run against a live Hyprland from inside a
+    /// session hosted by that Hyprland (the kill would also terminate the
+    /// test runner). Validates the EOF assumption against `tokio::net::
+    /// UnixStream` and the resolver's per-iteration re-scan against
+    /// `${runtime_dir}/hypr/`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_loop_recovers_after_peer_close() {
+        use media_control_lib::test_helpers::{
+            InstancePolicy, MockHyprlandInstance, with_isolated_runtime_dir,
+        };
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        with_isolated_runtime_dir(|runtime_dir| async move {
+            let saved_his = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+            unsafe {
+                env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+            }
+            struct HisGuard(Option<String>);
+            impl Drop for HisGuard {
+                fn drop(&mut self) {
+                    unsafe {
+                        if let Some(v) = self.0.take() {
+                            env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v);
+                        }
+                    }
+                }
+            }
+            let _his_guard = HisGuard(saved_his);
+
+            // Phase 1: peer A is up. Daemon connects.
+            let mock_a = MockHyprlandInstance::new(
+                &runtime_dir,
+                "instance-pre-kill",
+                InstancePolicy::LiveWithClients,
+            )
+            .await;
+            let stream_a =
+                connect_hyprland_socket().await.expect("connect to mock A");
+
+            // The mock's `.socket2.sock` server is accept-and-drop, so the
+            // daemon's read side should see EOF on first read. This is the
+            // protocol-level invariant that `run_event_session` relies on
+            // (Hyprland death closes the events socket → daemon reads
+            // `Ok(None)` and returns to reconnect).
+            let mut lines = BufReader::new(stream_a).lines();
+            let line = tokio::time::timeout(
+                Duration::from_secs(2),
+                lines.next_line(),
+            )
+            .await
+            .expect("EOF should arrive within 2s")
+            .expect("read errored before EOF");
+            assert!(
+                line.is_none(),
+                "expected EOF from peer A's socket close, got line: {line:?}"
+            );
+
+            // Phase 2: simulate Hyprland restart with NEW HIS. Drop peer A
+            // (listener tasks aborted; socket files linger, future connects
+            // refused), bring up peer B at a different HIS path.
+            drop(mock_a);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _mock_b = MockHyprlandInstance::new(
+                &runtime_dir,
+                "instance-post-kill",
+                InstancePolicy::LiveWithClients,
+            )
+            .await;
+
+            // Phase 3: daemon's reconnect path. Resolver scans the runtime
+            // dir, sees both `instance-pre-kill` (Dead — listener gone) and
+            // `instance-post-kill` (LiveWithClients), picks the latter,
+            // connect succeeds.
+            let stream_b = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_hyprland_socket(),
+            )
+            .await
+            .expect("reconnect-after-EOF did not return within 5s")
+            .expect("connect_hyprland_socket returned Err post-restart");
+
+            drop(stream_b);
+        })
+        .await;
     }
 }

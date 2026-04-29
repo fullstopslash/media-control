@@ -31,7 +31,7 @@ impl CommandContext {
     ///
     /// This bypasses environment variable lookups and config file reading,
     /// allowing tests to provide a mock Hyprland socket and custom configuration.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn for_test(hyprland: HyprlandClient, config: Config) -> Result<Self> {
         let window_matcher = WindowMatcher::new(&config.patterns);
         Ok(Self {
@@ -142,8 +142,8 @@ pub fn runtime_dir() -> Result<PathBuf> {
 /// existed between sync env-mutation tests and async suppress-file tests.
 /// All callers hold this with `let _g = async_env_test_mutex().lock().await`
 /// for the full test body.
-#[cfg(test)]
-pub(crate) fn async_env_test_mutex() -> &'static tokio::sync::Mutex<()> {
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn async_env_test_mutex() -> &'static tokio::sync::Mutex<()> {
     use std::sync::OnceLock;
     static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     M.get_or_init(|| tokio::sync::Mutex::new(()))

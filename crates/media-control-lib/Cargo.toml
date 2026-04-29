@@ -17,6 +17,12 @@ edition.workspace = true
 # is what catches forbidden imports in that path.
 default = []
 cli = ["dep:reqwest"]
+# Exposes `pub mod test_helpers` (mock infra: `MockHyprland`,
+# `MockHyprlandInstance`, `with_isolated_runtime_dir`, builders) so other
+# crates in the workspace can reuse it from their own tests without
+# duplicating the mock layer (intent 015 FR-5: single-source test
+# infrastructure). Activated only by dev-dependencies — never in release.
+test-helpers = ["dep:tempfile"]
 
 [dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "process", "fs"] }
@@ -27,6 +33,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["json"], optional = true }
+tempfile = { version = "3", optional = true }
 gethostname.workspace = true
 shlex.workspace = true
 url = "2"

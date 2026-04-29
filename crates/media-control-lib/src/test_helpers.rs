@@ -466,18 +466,28 @@ pub enum InstancePolicy {
 /// A mock Hyprland instance for [`crate::hyprland::probe_instance`] /
 /// [`crate::hyprland::resolve_live_his`] tests.
 ///
-/// Creates `$runtime_dir/hypr/{his}/` with a `.socket.sock` Unix socket
-/// served by a tokio task whose response is governed by [`InstancePolicy`].
-/// Drop aborts the server task and the listener is closed; the temp
-/// directory cleanup is the caller's responsibility (typically via
+/// Creates `$runtime_dir/hypr/{his}/` with both `.socket.sock` (for the
+/// resolver's `activewindow` probe) and `.socket2.sock` (the events socket
+/// the daemon's `connect_hyprland_socket` connects to). Both are served by
+/// tokio tasks whose behavior is governed by [`InstancePolicy`]. Drop
+/// aborts the server tasks and the listeners are closed; the temp directory
+/// cleanup is the caller's responsibility (typically via
 /// [`with_isolated_runtime_dir`]).
 ///
 /// Multiple instances can coexist under the same `runtime_dir` with
 /// different HIS strings, modeling the multi-instance host the resolver
 /// is designed for.
+///
+/// `.socket2.sock` is bound for every non-`Refuse` policy. The daemon's
+/// connect path returns as soon as `UnixStream::connect` succeeds, so the
+/// `.socket2.sock` task just accepts and immediately closes connections —
+/// no synthetic event stream is needed for the swap-mid-retry test, and a
+/// real event stream would invite scope creep into mocking Hyprland's
+/// event protocol.
 pub struct MockHyprlandInstance {
     his: String,
     _server: Option<MockServerHandle>,
+    _socket2_server: Option<MockServerHandle>,
 }
 
 /// Server task wrapper that aborts on drop, so test cleanup never leaks
@@ -506,6 +516,7 @@ impl MockHyprlandInstance {
             return Self {
                 his: his.to_string(),
                 _server: None,
+                _socket2_server: None,
             };
         }
 
@@ -542,9 +553,28 @@ impl MockHyprlandInstance {
             }
         });
 
+        // Also bind .socket2.sock so a daemon's `connect_hyprland_socket`
+        // can succeed against this mock. We accept-and-drop: the daemon's
+        // connect path returns as soon as the connection establishes, and
+        // mocking Hyprland's event stream is out of scope for this layer.
+        let socket2_path = dir.join(".socket2.sock");
+        let socket2_listener =
+            UnixListener::bind(&socket2_path).expect("bind mock .socket2.sock");
+        let socket2_handle = tokio::spawn(async move {
+            loop {
+                if socket2_listener.accept().await.is_err() {
+                    break;
+                }
+                // Stream dropped here — connect succeeds on the daemon side;
+                // any subsequent read sees EOF, which is fine because
+                // `connect_hyprland_socket` only awaits the connect.
+            }
+        });
+
         Self {
             his: his.to_string(),
             _server: Some(MockServerHandle(handle)),
+            _socket2_server: Some(MockServerHandle(socket2_handle)),
         }
     }
 

@@ -11,5 +11,5 @@ pub mod hyprland;
 pub mod jellyfin;
 pub mod window;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
