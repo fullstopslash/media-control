@@ -3,23 +3,27 @@ id: 031-rollout-migration
 unit: 002-rollout-migration
 intent: 018-sock-trigger-ipc
 type: simple-construction-bolt
-status: in-progress
+status: complete
 stories:
   - 001-hyprland-keybind-migration
   - 002-nixos-module-cleanup
   - 003-end-to-end-validation
-created: 2026-05-03T15:44:51Z
-started: 2026-05-03T16:45:54Z
-completed: null
-current_stage: plan
-stages_completed: []
-
+created: 2026-05-03T15:44:51.000Z
+started: 2026-05-03T16:45:54.000Z
+completed: "2026-05-03T17:00:53Z"
+current_stage: null
+stages_completed:
+  - name: plan
+    completed: 2026-05-03T16:50:00.000Z
+    artifact: implementation-plan.md
+  - name: implement
+    completed: 2026-05-03T16:55:00.000Z
+    artifact: implementation-walkthrough.md
 requires_bolts:
   - 030-socket-transport
 enables_bolts: []
 requires_units: []
 blocks: true
-
 complexity:
   avg_complexity: 1
   avg_uncertainty: 1

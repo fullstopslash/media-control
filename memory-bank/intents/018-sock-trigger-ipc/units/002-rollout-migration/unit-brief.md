@@ -2,9 +2,9 @@
 unit: 002-rollout-migration
 intent: 018-sock-trigger-ipc
 phase: inception
-status: ready
-created: 2026-05-03T15:44:51Z
-updated: 2026-05-03T15:44:51Z
+status: complete
+created: 2026-05-03T15:44:51.000Z
+updated: 2026-05-03T15:44:51.000Z
 ---
 
 # Unit Brief: rollout-migration

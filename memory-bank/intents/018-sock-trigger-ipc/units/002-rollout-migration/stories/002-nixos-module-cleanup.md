@@ -2,11 +2,11 @@
 id: 002-nixos-module-cleanup
 unit: 002-rollout-migration
 intent: 018-sock-trigger-ipc
-status: draft
+status: complete
 priority: must
-created: 2026-05-03T15:44:51Z
+created: 2026-05-03T15:44:51.000Z
 assigned_bolt: 031-rollout-migration
-implemented: false
+implemented: true
 ---
 
 # Story: 002-nixos-module-cleanup

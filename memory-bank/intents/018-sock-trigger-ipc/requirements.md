@@ -1,9 +1,9 @@
 ---
 intent: 018-sock-trigger-ipc
 phase: inception
-status: inception-complete
-created: 2026-05-03T15:44:51Z
-updated: 2026-05-03T16:03:16Z
+status: complete
+created: 2026-05-03T15:44:51.000Z
+updated: 2026-05-03T16:03:16.000Z
 ---
 
 # Requirements: Replace FIFO trigger IPC with `SOCK_DGRAM` UNIX socket
