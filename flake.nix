@@ -62,8 +62,10 @@
               substitute ${./systemd/media-control-daemon.service} \
                 $out/lib/systemd/user/media-control-daemon.service \
                 --replace '%h/.cargo/bin/media-control-daemon' "$out/bin/media-control-daemon"
-              cp ${./systemd/media-control-daemon.socket} \
-                $out/lib/systemd/user/media-control-daemon.socket
+              # Note: pre-018 versions also installed a media-control-daemon.socket
+              # unit. The daemon now binds its own SOCK_DGRAM socket on startup
+              # (intent 018) so the systemd .socket unit is dead code and was
+              # removed in the same release.
             '';
           });
       in {

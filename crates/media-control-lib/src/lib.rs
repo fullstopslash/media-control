@@ -9,6 +9,7 @@ pub mod error;
 pub mod hyprland;
 #[cfg(feature = "cli")]
 pub mod jellyfin;
+pub mod transport;
 pub mod window;
 
 #[cfg(any(test, feature = "test-helpers"))]

@@ -19,7 +19,17 @@ Bash-based media window control applet for Hyprland (Wayland compositor). Manage
   - `mark-watched`, `mark-watched-and-stop`, `mark-watched-and-next` - Jellyfin integration
   - `chapter next|prev` - mpv chapter navigation
 
-- **bash/media-avoider-trigger.sh** - Event-driven daemon listening to Hyprland socket events. Uses FIFO-based debouncing (15ms) to batch rapid events.
+- **bash/media-avoider-trigger.sh** - Event-driven daemon listening to Hyprland socket events. Uses socket-based debouncing (15ms) to batch rapid events.
+
+  External wakeups arrive on a `SOCK_DGRAM` UNIX socket at
+  `$XDG_RUNTIME_DIR/media-control-daemon.sock` (mode `0o600`). Send one with
+  `media-control kick`; this is the supported entry point for Hyprland
+  keybinds and scripts. Wire format (intent 018 / FR-9): a 0-byte datagram
+  is the canonical "re-evaluate placement" trigger and stays valid forever;
+  any non-empty datagram is reserved with byte 0 as protocol version and
+  is currently ignored with a `debug!` log per receipt. Pre-018 daemons
+  used a FIFO at `$XDG_RUNTIME_DIR/media-avoider-trigger.fifo`; the new
+  daemon best-effort unlinks it on startup.
 
 - **bash/jellyfin-control.sh** - Jellyfin server API client for session control (stop, mark watched, queue advancement). Uses credentials from `~/.config/jellyfin-mpv-shim/cred.json`.
 

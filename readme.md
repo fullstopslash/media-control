@@ -63,6 +63,8 @@ media-control close                   # close media window
 media-control pin-and-float           # pin and float current window
 media-control mark-watched            # mark current Jellyfin item watched
 media-control chapter next|prev       # chapter navigation
+media-control kick                    # wake the daemon to re-evaluate placement
+                                      # (use from Hyprland keybinds for layoutmsg etc.)
 media-control-daemon foreground       # start avoidance daemon
 ```
 

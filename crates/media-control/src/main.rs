@@ -34,6 +34,10 @@
 //! media-control random show           # optional store-specific type
 //! media-control status --json         # machine-readable status (waybar)
 //!
+//! # Daemon control
+//! media-control kick                  # wake the daemon to re-evaluate placement
+//!                                     # (used by Hyprland keybinds for layoutmsg etc.)
+//!
 //! # Tooling
 //! media-control completions zsh       # bash | zsh | fish | elvish | powershell
 //! ```
@@ -161,6 +165,14 @@ enum Commands {
         json: bool,
     },
 
+    /// Send a re-evaluate trigger to the running daemon.
+    ///
+    /// Used by Hyprland keybinds for events that don't emit Hyprland
+    /// socket signals (notably `layoutmsg togglesplit` on 0.54.x).
+    /// Connectionless `SOCK_DGRAM` send: silent and exit-0 if the
+    /// daemon is not running, never blocks the keybind shell.
+    Kick,
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -210,6 +222,25 @@ async fn main() {
             Ok(false) => std::process::exit(1),
             Err(e) => {
                 eprintln!("media-control: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Handle kick early (no config/context needed — pure transport send).
+    // FR-4/FR-5: ECONNREFUSED/ENOENT are silent (exit 0); any other error
+    // surfaces to stderr and exits 1 so script callers can debug. Never
+    // routes through `notify_error` — daemon-down is not a fatal
+    // condition for keybind shells.
+    if matches!(cli.command, Commands::Kick) {
+        use media_control_lib::transport::{KickOutcome, kick};
+        match kick() {
+            Ok(KickOutcome::Delivered | KickOutcome::DaemonDown) => return,
+            Err(e) => {
+                let path_hint = media_control_lib::transport::socket_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<socket path unavailable>".into());
+                eprintln!("media-control kick: {path_hint}: {e}");
                 std::process::exit(1);
             }
         }
@@ -353,6 +384,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::random::random(random_type.as_deref()).await?;
         }
         Commands::Status { .. } => unreachable!(), // handled before config loading
+        Commands::Kick => unreachable!(),          // handled before config loading
         Commands::Completions { .. } => unreachable!(),
     }
 

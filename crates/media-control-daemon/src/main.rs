@@ -3,8 +3,13 @@
 //! Event-driven daemon that listens to Hyprland socket events
 //! and triggers media window avoidance.
 //!
-//! Also supports manual triggers via FIFO for events that don't
-//! emit Hyprland socket events (like `layoutmsg togglesplit`).
+//! Also supports manual triggers via a `SOCK_DGRAM` UNIX socket at
+//! `$XDG_RUNTIME_DIR/media-control-daemon.sock` for events that don't
+//! emit Hyprland socket signals (like `layoutmsg togglesplit`). Send a
+//! kick with `media-control kick`. Wire format (intent 018 / FR-9):
+//! 0-byte datagram = canonical "re-evaluate" trigger; non-empty
+//! datagrams are reserved with byte 0 as protocol version and are
+//! ignored by this release with a `debug!` log per receipt.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -18,6 +23,7 @@ use media_control_lib::commands::{self, CommandContext, runtime_dir};
 use media_control_lib::config::Config;
 use media_control_lib::error::MediaControlError;
 use media_control_lib::hyprland::{Client, HyprlandError, runtime_socket_path};
+use media_control_lib::transport;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -226,16 +232,6 @@ fn get_pid_file_path() -> Result<PathBuf, MediaControlError> {
     Ok(runtime_dir()?.join("media-control-daemon.pid"))
 }
 
-/// Get the path to the trigger FIFO.
-///
-/// Placed in `$XDG_RUNTIME_DIR` (per-user, mode 0700 by default on systemd
-/// systems) rather than world-writable `/tmp`. This defends against symlink
-/// races and pre-creation attacks that would otherwise be possible at a
-/// predictable `/tmp` path on a multi-user host.
-fn get_fifo_path() -> Result<PathBuf, MediaControlError> {
-    Ok(runtime_dir()?.join("media-avoider-trigger.fifo"))
-}
-
 /// Get the path to Hyprland's socket2 (event stream).
 ///
 /// `async` because `runtime_socket_path` now probes for a live Hyprland
@@ -386,12 +382,15 @@ async fn trigger_avoid(ctx: &CommandContext, cache: &ClientCache, suppress: &Sup
     }
 }
 
-/// Create a trigger FIFO at `path`, hardened against pre-creation attacks.
+/// Bind a `SOCK_DGRAM` UNIX datagram socket at `path`, hardened against
+/// pre-creation attacks.
 ///
-/// Uses `lstat` (no symlink resolution) to inspect the existing entry,
-/// refuses to remove anything that isn't a real FIFO owned by us, and
-/// creates the new FIFO with mode 0o600.
-fn create_fifo_at(path: &Path) -> std::io::Result<()> {
+/// Mirrors the prior `create_fifo_at` posture: `lstat` (no symlink
+/// resolution) → reject symlink → reject non-socket → reject wrong-uid →
+/// unlink → bind → explicit `chmod 0o600`. The TOCTOU defense is
+/// identical because the hazard is identical (a hostile entry pre-
+/// positioned at our bind path).
+fn bind_trigger_socket_at(path: &Path) -> std::io::Result<tokio::net::UnixDatagram> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     // Use symlink_metadata (lstat) — does NOT follow symlinks. If an attacker
@@ -404,9 +403,9 @@ fn create_fifo_at(path: &Path) -> std::io::Result<()> {
                     "refusing to use {path:?}: it is a symlink"
                 )));
             }
-            if !ft.is_fifo() {
+            if !ft.is_socket() {
                 return Err(std::io::Error::other(format!(
-                    "refusing to use {path:?}: not a FIFO"
+                    "refusing to use {path:?}: not a socket"
                 )));
             }
             // Only remove if it's owned by us.
@@ -423,110 +422,121 @@ fn create_fifo_at(path: &Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
 
-    // mkfifo creates atomically; mode 0o600 is masked by umask, so a
-    // restrictive process umask (say 0o077) is fine but a permissive one
-    // (e.g. 0o022) would leave the FIFO group/other-readable. Force the
-    // intended mode with an explicit `set_permissions` after creation
-    // so the FIFO is always 0o600 regardless of inherited umask.
+    // bind() creates the socket file with mode masked by umask; force
+    // 0o600 explicitly so a permissive process umask (e.g. 0o022) cannot
+    // leave the socket group/other-accessible.
     //
-    // The previous symlink check + per-user runtime dir means a TOCTOU
-    // race here would require write access to $XDG_RUNTIME_DIR, which on
+    // The symlink check above + per-user runtime dir mean a TOCTOU race
+    // here would require write access to $XDG_RUNTIME_DIR, which on
     // systemd systems is the user's own 0700 directory.
-    nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))
-        .map_err(std::io::Error::other)?;
+    let sock = tokio::net::UnixDatagram::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(sock)
 }
 
-/// Create the trigger FIFO at the default daemon path.
-fn create_fifo() -> std::io::Result<PathBuf> {
-    let path = get_fifo_path().map_err(std::io::Error::other)?;
-    create_fifo_at(&path)?;
-    info!("Created trigger FIFO at {:?}", path);
-    Ok(path)
+/// Bind the trigger socket at the canonical daemon path.
+fn bind_trigger_socket() -> std::io::Result<tokio::net::UnixDatagram> {
+    let path = transport::socket_path().map_err(std::io::Error::other)?;
+    let sock = bind_trigger_socket_at(&path)?;
+    info!("Bound trigger socket at {:?}", path);
+    Ok(sock)
 }
 
-/// Remove the trigger FIFO.
+/// Remove the trigger socket file.
 ///
 /// Uses `symlink_metadata` (lstat) instead of `path.exists()` so we never
 /// follow a symlink that may have been planted at our path between the
 /// check and the unlink. `remove_file` itself does NOT follow symlinks.
-fn remove_fifo() {
-    let Ok(path) = get_fifo_path() else { return };
+fn remove_trigger_socket() {
+    let Ok(path) = transport::socket_path() else {
+        return;
+    };
     if std::fs::symlink_metadata(&path).is_ok() {
         let _ = std::fs::remove_file(&path);
     }
 }
 
-/// Listen for triggers on the FIFO and send them to the channel.
+/// Best-effort removal of the legacy FIFO at
+/// `$XDG_RUNTIME_DIR/media-avoider-trigger.fifo` (intent 018 / FR-8).
 ///
-/// The FIFO is opened in a loop because each write closes it on the writer side.
-/// Read errors are logged and bounded by [`FIFO_ERROR_BACKOFF`] to prevent a
-/// hot spin on persistent failure (e.g. underlying file removed by another
-/// process). EINTR is surfaced by tokio as `Interrupted`; we treat it the same
-/// as any other transient error and reopen.
+/// Pre-018 daemons used a FIFO at this path for manual triggers. We own
+/// the path's lifecycle, so cleaning up after an upgrade keeps the
+/// runtime dir tidy. `NotFound` is the clean-install path and is silent;
+/// other failures are debug-logged and ignored — cleanup must not block
+/// daemon startup. Runs only after a successful socket bind so a
+/// failed-bind daemon preserves the user's manual fallback.
+fn cleanup_legacy_fifo() {
+    let path = match runtime_dir() {
+        Ok(d) => d.join("media-avoider-trigger.fifo"),
+        Err(_) => return,
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => debug!("Cleaned up legacy FIFO at {:?}", path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => debug!("Legacy FIFO cleanup failed at {:?}: {}", path, e),
+    }
+}
+
+/// Listen for trigger datagrams on the bound socket and send them to the
+/// channel.
 ///
-/// Sends are non-blocking via `try_send` and coalesce on `Full`: every FIFO
-/// line is an idempotent "re-evaluate placement" trigger, so a flooding
-/// writer can't stall the listener — if there's already a pending event in
-/// the channel a second won't change behaviour. `await`ing `tx.send` here
-/// would let a flood backpressure the listener and drop events behind a
-/// queue we don't actually need.
-async fn fifo_listener(tx: mpsc::Sender<()>) {
+/// Wire format (intent 018 / FR-9): a 0-byte datagram is the canonical
+/// "re-evaluate placement" kick. Non-empty datagrams are reserved (byte 0
+/// is the protocol version) and ignored in this release with a single
+/// `debug!` log per receipt so future protocol additions are visible
+/// during tracing.
+///
+/// Sends are non-blocking via `try_send` and coalesce on `Full`: every
+/// kick is idempotent, so a flooding sender can't stall the listener — if
+/// there's already a pending event in the channel a second won't change
+/// behavior. `await`ing `tx.send` would let a flood backpressure the
+/// listener and queue events we don't actually need.
+///
+/// Recv errors other than `WouldBlock` are bounded by
+/// [`SOCKET_ERROR_BACKOFF`] to prevent a hot spin on persistent failure.
+async fn dgram_listener(socket: tokio::net::UnixDatagram, tx: mpsc::Sender<()>) {
     use tokio::sync::mpsc::error::TrySendError;
 
-    /// Backoff applied after any read or open error. Bounded so a missing
-    /// or broken FIFO can't burn CPU.
-    const FIFO_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+    /// Backoff applied after any recv error other than `WouldBlock`.
+    /// Bounded so a misbehaving socket can't burn CPU.
+    const SOCKET_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-    let path = match get_fifo_path() {
-        Ok(p) => p,
-        Err(e) => {
-            error!("FIFO listener cannot resolve path: {e}");
-            return;
-        }
-    };
+    // Buffer size for `recv_from`. We classify by length only — non-empty
+    // payloads are ignored in this release per FR-9 — so 16 bytes is more
+    // than enough to read the version byte on any reserved future short
+    // envelope.
+    let mut buf = [0u8; 16];
 
     loop {
-        // Open FIFO for reading (blocks until a writer connects)
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Failed to open FIFO: {}", e);
-                tokio::time::sleep(FIFO_ERROR_BACKOFF).await;
+        match socket.recv_from(&mut buf).await {
+            Ok((0, _)) => {
+                debug!("Received datagram trigger");
+                match tx.try_send(()) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(())) => {
+                        debug!("Datagram trigger coalesced (channel full)");
+                    }
+                    Err(TrySendError::Closed(())) => return,
+                }
+            }
+            Ok((n, _)) => {
+                // FR-9: non-empty datagrams are reserved. Log the version
+                // byte (byte 0) and total length so future protocol
+                // additions are distinguishable in tracing output.
+                debug!(
+                    "Ignoring v{:#04x} datagram ({} bytes, unsupported in this release)",
+                    buf[0], n
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Spurious WouldBlock — defensive; tokio's UnixDatagram
+                // shouldn't normally surface this for an awaited recv.
                 continue;
             }
-        };
-
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-
-        // Drain lines until EOF (writer closed) or hard error.
-        loop {
-            match lines.next_line().await {
-                Ok(Some(_)) => {
-                    debug!("Received FIFO trigger");
-                    match tx.try_send(()) {
-                        Ok(()) => {}
-                        // Coalesce: a pending event already exists in the
-                        // channel and will be processed; the duplicate is
-                        // semantically identical so we drop it silently.
-                        Err(TrySendError::Full(())) => {
-                            debug!("FIFO trigger coalesced (channel full)");
-                        }
-                        Err(TrySendError::Closed(())) => return,
-                    }
-                }
-                Ok(None) => break, // EOF — writer closed, reopen
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    // EINTR — retry the read without backoff
-                    continue;
-                }
-                Err(e) => {
-                    warn!("FIFO read error: {} — reopening after backoff", e);
-                    tokio::time::sleep(FIFO_ERROR_BACKOFF).await;
-                    break;
-                }
+            Err(e) => {
+                warn!("Datagram recv error: {} — continuing after backoff", e);
+                tokio::time::sleep(SOCKET_ERROR_BACKOFF).await;
             }
         }
     }
@@ -638,7 +648,7 @@ async fn run_event_session(
     cache: &ClientCache,
     suppress: &SuppressState,
     debounce_duration: Duration,
-    fifo_rx: &mut mpsc::Receiver<()>,
+    dgram_rx: &mut mpsc::Receiver<()>,
 ) -> Result<bool, MediaControlError> {
     let stream = connect_hyprland_socket().await?;
     let mut lines = BufReader::new(stream).lines();
@@ -680,8 +690,8 @@ async fn run_event_session(
                 }
             }
 
-            Some(()) = fifo_rx.recv() => {
-                debug!("Processing FIFO trigger");
+            Some(()) = dgram_rx.recv() => {
+                debug!("Processing trigger");
                 maybe_trigger(ctx, cache, suppress, &mut last_avoid_time, debounce_duration).await;
             }
         }
@@ -691,22 +701,14 @@ async fn run_event_session(
 /// RAII guard that aborts a spawned task when dropped.
 ///
 /// Without this, dropping a `JoinHandle` only releases our handle — the
-/// task continues running. We need active abort so that when
-/// `run_event_loop` is cancelled by the outer `tokio::select!` (SIGINT /
-/// SIGTERM) the FIFO listener cannot still be inside `File::open` against
-/// a path we are about to `unlink`. That race produced a noisy error log
-/// on every clean shutdown.
+/// task continues running. We need active abort so the spawned listener
+/// task is reliably cancelled on shutdown rather than left to hang on a
+/// recv that will never complete.
 struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
 
 impl AbortOnDrop {
     fn new(handle: tokio::task::JoinHandle<()>) -> Self {
         Self(Some(handle))
-    }
-
-    /// Take the inner handle, suppressing the abort-on-drop. Used when
-    /// caller wants to manage abort timing explicitly.
-    fn take(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        self.0.take()
     }
 }
 
@@ -734,18 +736,23 @@ async fn run_event_loop() -> Result<(), MediaControlError> {
     // has written the on-disk suppress file.
     let suppress_state = SuppressState::new();
 
-    // Create FIFO for manual triggers
-    create_fifo()?;
+    // Bind the trigger socket and clean up any legacy FIFO from a
+    // pre-018 daemon. Cleanup runs only after a successful bind so a
+    // failed-bind daemon preserves the user's manual fallback (FR-8
+    // symmetric error recovery).
+    let trigger_socket = bind_trigger_socket()?;
+    cleanup_legacy_fifo();
 
-    // Channel for FIFO triggers — persists across reconnections.
-    // The listener's `JoinHandle` is held in an RAII abort-guard so that
-    // any cancellation of this future (SIGTERM/SIGINT in the outer
-    // select!) actively aborts the listener before its drop. Without the
-    // active abort, the listener could still be mid-`File::open` on the
-    // FIFO path that `remove_fifo()` is about to unlink, producing a
-    // spurious error log every clean shutdown.
-    let (fifo_tx, mut fifo_rx) = mpsc::channel::<()>(16);
-    let mut fifo_listener_handle = AbortOnDrop::new(tokio::spawn(fifo_listener(fifo_tx)));
+    // Channel for trigger datagrams — persists across reconnections. The
+    // listener's `JoinHandle` is held in an RAII abort-guard so that any
+    // cancellation of this future (SIGTERM/SIGINT in the outer select!)
+    // actively aborts the listener instead of leaving it parked on a
+    // recv that will never complete.
+    let (dgram_tx, mut dgram_rx) = mpsc::channel::<()>(16);
+    let _dgram_listener_handle = AbortOnDrop::new(tokio::spawn(dgram_listener(
+        trigger_socket,
+        dgram_tx,
+    )));
 
     info!("Event loop started");
 
@@ -755,37 +762,16 @@ async fn run_event_loop() -> Result<(), MediaControlError> {
             &client_cache,
             &suppress_state,
             debounce_duration,
-            &mut fifo_rx,
+            &mut dgram_rx,
         )
         .await
         {
             Ok(true) => {
-                // Reconnect after brief delay
+                // Reconnect after brief delay. The trigger socket FD is
+                // owned by the listener task for the daemon's lifetime;
+                // no recreation needed across Hyprland reconnects.
                 info!("Reconnecting to Hyprland socket...");
                 tokio::time::sleep(Duration::from_millis(500)).await;
-
-                // Recreate FIFO in case it was cleaned up. Use lstat
-                // (symlink_metadata) instead of `.exists()` so a symlink
-                // planted at our path doesn't trick us into skipping the
-                // recreate; `create_fifo_at` will then reject the symlink
-                // explicitly with a clear error.
-                let fifo_missing = match get_fifo_path() {
-                    Ok(p) => std::fs::symlink_metadata(&p).is_err(),
-                    // Path resolution itself failed — treat as missing so
-                    // we attempt recreation (which will surface the same
-                    // error from `create_fifo`).
-                    Err(_) => true,
-                };
-                if fifo_missing && let Err(e) = create_fifo() {
-                    error!("Failed to recreate FIFO after reconnect: {e}");
-                    // Stop the listener so it doesn't burn CPU repeatedly
-                    // failing to open a FIFO we can't recreate. The main
-                    // loop continues handling Hyprland events; only manual
-                    // FIFO triggers are lost.
-                    if let Some(h) = fifo_listener_handle.take() {
-                        h.abort();
-                    }
-                }
             }
             Ok(false) => {
                 info!("Event loop ended (clean shutdown)");
@@ -843,9 +829,9 @@ async fn run_foreground() -> ExitCode {
         }
     };
 
-    // Clean up PID file and FIFO
+    // Clean up PID file and trigger socket
     remove_pid_file().await;
-    remove_fifo();
+    remove_trigger_socket();
 
     match result {
         Ok(()) => {
@@ -1222,32 +1208,35 @@ mod tests {
         assert!(!is_avoid_trigger(">>x"));
     }
 
-    /// FIFO creation must succeed at a fresh path and produce an actual FIFO
-    /// (not a regular file or symlink). Verifies the happy path.
-    #[test]
-    fn create_fifo_at_creates_fifo_at_fresh_path() {
+    /// Socket bind must succeed at a fresh path and produce an actual
+    /// socket (not a regular file or symlink). Asserts via `is_socket()`,
+    /// **not** inode equality — tmpfs in the nix build sandbox reuses
+    /// inodes immediately on unlink and would flake an inode comparison
+    /// (per CLAUDE.md memory `media-control-t8d`).
+    #[tokio::test]
+    async fn bind_trigger_socket_at_binds_at_fresh_path() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("trigger.fifo");
+        let path = dir.path().join("trigger.sock");
 
-        create_fifo_at(&path).expect("fresh-path create should succeed");
+        let _sock = bind_trigger_socket_at(&path).expect("fresh-path bind should succeed");
 
         let meta = std::fs::symlink_metadata(&path).unwrap();
-        assert!(meta.file_type().is_fifo());
+        assert!(meta.file_type().is_socket(), "path must be a socket");
     }
 
-    /// FIFO creation must REFUSE to remove an existing symlink, even one
+    /// Socket bind must REFUSE to remove an existing symlink, even one
     /// pointing at a valid target. This is the symlink-attack defense.
-    #[test]
-    fn create_fifo_at_rejects_symlink() {
+    #[tokio::test]
+    async fn bind_trigger_socket_at_rejects_symlink() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real-target");
         std::fs::write(&target, "data").unwrap();
-        let link = dir.path().join("link.fifo");
+        let link = dir.path().join("link.sock");
         symlink(&target, &link).unwrap();
 
-        let err = create_fifo_at(&link).expect_err("symlink must be rejected");
+        let err = bind_trigger_socket_at(&link).expect_err("symlink must be rejected");
         assert!(
             err.to_string().contains("symlink"),
             "error should mention symlink: {err}"
@@ -1256,53 +1245,103 @@ mod tests {
         assert!(target.exists());
     }
 
-    /// FIFO creation must refuse a non-FIFO file (e.g. a regular file
+    /// Socket bind must refuse a non-socket file (e.g. a regular file
     /// planted at the path).
-    #[test]
-    fn create_fifo_at_rejects_regular_file() {
+    #[tokio::test]
+    async fn bind_trigger_socket_at_rejects_regular_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("not-a-fifo");
-        std::fs::write(&path, "not a fifo").unwrap();
+        let path = dir.path().join("not-a-sock");
+        std::fs::write(&path, "not a socket").unwrap();
 
-        let err = create_fifo_at(&path).expect_err("regular file must be rejected");
-        assert!(err.to_string().contains("not a FIFO"), "{err}");
+        let err = bind_trigger_socket_at(&path).expect_err("regular file must be rejected");
+        assert!(err.to_string().contains("not a socket"), "{err}");
     }
 
-    /// FIFO creation must refuse a stale FIFO owned by a different uid.
-    /// We can't easily create cross-uid files in tests without root, so we
-    /// assert via the code path: when an existing FIFO is ours, the second
-    /// `create_fifo_at` call returns `Ok` and leaves a FIFO at the path.
+    /// Socket bind must succeed against a stale socket owned by us
+    /// (e.g. from a previous daemon run that didn't clean up). The
+    /// contract being tested — "calling against our own existing socket
+    /// does not error" — is load-bearing because `bind(2)` returns
+    /// `EADDRINUSE` against any extant socket file: if the implementation
+    /// forgot to unlink first, the second call here would have already
+    /// panicked at `expect("rebind-our-own")`.
     ///
-    /// We do NOT compare inode numbers between the two calls. Inode-reuse is
-    /// allowed by POSIX and tmpfs (which the nix build sandbox uses) reuses
-    /// the inode of a just-unlinked file immediately, so an inode equality
-    /// flake is built into that storage layer. The actual contract being
-    /// tested — "calling against our own existing FIFO does not error" — is
-    /// load-bearing because `mkfifo(2)` returns `EEXIST` against any extant
-    /// path: if the implementation forgot to unlink first, the second call
-    /// here would have already panicked at `expect("recreate-our-own")`.
-    #[test]
-    fn create_fifo_at_replaces_our_own_existing_fifo() {
-        use std::os::unix::fs::FileTypeExt;
-
+    /// We do NOT compare inode numbers between the two calls. Inode-reuse
+    /// is allowed by POSIX and tmpfs reuses the inode of a just-unlinked
+    /// file immediately, so an inode equality assertion would flake in
+    /// the nix build sandbox.
+    #[tokio::test]
+    async fn bind_trigger_socket_at_rebinds_over_our_own_existing_socket() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("replace.fifo");
+        let path = dir.path().join("rebind.sock");
 
-        // First creation
-        create_fifo_at(&path).expect("first create");
+        // First bind, then drop the socket so the file persists but no
+        // process holds the kernel-side bind.
+        drop(bind_trigger_socket_at(&path).expect("first bind"));
 
-        // Second creation must succeed against the existing FIFO we own.
-        // If `create_fifo_at` had skipped the unlink step, `mkfifo` would
-        // surface EEXIST and this `expect` would have panicked.
-        create_fifo_at(&path).expect("recreate-our-own");
+        // Second bind must succeed against the existing socket we own.
+        // If `bind_trigger_socket_at` had skipped the unlink step, the
+        // kernel would surface EADDRINUSE and this `expect` would have
+        // panicked.
+        let _sock2 = bind_trigger_socket_at(&path).expect("rebind-our-own");
 
-        // And the path must still be a FIFO afterwards (not, e.g., silently
-        // turned into a regular file by a future implementation regression).
-        let meta = std::fs::symlink_metadata(&path).expect("stat after recreate");
+        let meta = std::fs::symlink_metadata(&path).expect("stat after rebind");
         assert!(
-            meta.file_type().is_fifo(),
-            "path must still be a FIFO after recreate"
+            meta.file_type().is_socket(),
+            "path must still be a socket after rebind"
         );
+    }
+
+    /// FR-2 / FR-9: a 0-byte datagram round-trips through `dgram_listener`
+    /// and arrives in the channel as exactly one `()` send. Locks the
+    /// canonical kick wire contract from the receiver direction.
+    #[tokio::test]
+    async fn dgram_listener_forwards_zero_byte_kick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("listen.sock");
+        let server = bind_trigger_socket_at(&path).expect("bind server socket");
+        let (tx, mut rx) = mpsc::channel::<()>(16);
+        let _h = AbortOnDrop::new(tokio::spawn(dgram_listener(server, tx)));
+
+        // Send a 0-byte kick from a separate connectionless socket.
+        let client = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        client.send_to(&[], &path).expect("kick send");
+
+        // Wait briefly for the listener to process; coalescing means at
+        // most one event in the channel.
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("kick must arrive within 1s")
+            .expect("channel must yield");
+        assert_eq!(received, ());
+    }
+
+    /// FR-9: a non-empty datagram (any version byte) does NOT trigger a
+    /// channel send. The listener treats it as reserved-for-future and
+    /// silently ignores the wakeup intent.
+    #[tokio::test]
+    async fn dgram_listener_ignores_non_empty_datagrams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ignore.sock");
+        let server = bind_trigger_socket_at(&path).expect("bind server");
+        let (tx, mut rx) = mpsc::channel::<()>(16);
+        let _h = AbortOnDrop::new(tokio::spawn(dgram_listener(server, tx)));
+
+        let client = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        // v1 envelope marker — currently reserved/unsupported.
+        client.send_to(&[0x01], &path).expect("v1 send");
+        // Arbitrary reserved version byte.
+        client.send_to(&[0xFF, 0xAA], &path).expect("vFF send");
+
+        // Listener should NOT have queued any channel sends. Wait a beat
+        // longer than recv processing latency, then assert empty.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match rx.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            other => panic!(
+                "non-empty datagrams must not produce channel sends, got {:?}",
+                other
+            ),
+        }
     }
 
     /// `is_process_running` must reject PIDs whose `/proc/.../comm` does

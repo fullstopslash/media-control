@@ -36,4 +36,10 @@ tags: []
   - **Fix location**: `~/projects/jellyfin-mpv-shim-fork/jellyfin_mpv_shim/player.py` — the `_play_media` method needs to cancel in-progress loads when a new play command arrives.
   - **Blocked on**: Fix must be implemented in the shim fork project, not here.
 
+  - **What**: Replace the daemon's FIFO trigger transport (`$XDG_RUNTIME_DIR/media-avoider-trigger.fifo`) with a `SOCK_DGRAM` UNIX socket and consolidate IPC onto a single transport. Today the daemon binds a FIFO for manual avoid kicks; the systemd `.socket` unit at `%t/media-control-daemon.sock` is configured but is **dead code** — the daemon never accepts on it.
+  - **Why**: The FIFO has a real footgun (`echo > $fifo` blocks the keybind shell forever if the daemon is down) and the bifurcation between the dead `.socket` and the live FIFO is misleading to anyone reading the systemd config. SOCK_DGRAM eliminates the writer-blocks hazard, fits the trigger model better (one syscall, drops cleanly when the daemon is down), and lets us delete the dead unit.
+  - **Scope** (estimate ~250-300 LOC, ~60% mechanical): rewrite `create_fifo_at` → `bind_socket_at` and `fifo_listener` → `dgram_listener` in the daemon (~110 LOC), add a `media-control kick` CLI subcommand (~30 LOC), swap 9 Hyprland keybinds in `~/.config/hypr/conf.d/common.conf` from `echo > $fifo` to `media-control kick`, delete the dead `systemd.user.sockets.media-control-daemon` block in `~/nix/modules/apps/media/media-control.nix`, adapt 4 daemon unit tests, update CLAUDE.md / readme.md / daemon docstring.
+  - **Inception spec**: `intents/sock-trigger-ipc.md` (full FRs, non-goals, touchpoints, open questions, definition of done).
+  - **Next action**: Run the `specsmd-inception-agent` against `intents/sock-trigger-ipc.md` to produce stories + bolt plan.
+
 ## Completed <!-- the-desk:filter project:media-control status:completed -->

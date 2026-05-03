@@ -1,11 +1,11 @@
 # Global Story Index
 
 ## Overview
-- **Total stories**: 48
-- **Generated**: 30
+- **Total stories**: 56
+- **Generated**: 38
 - **Completed**: 3
 - **Planned**: 15
-- **Last updated**: 2026-04-29
+- **Last updated**: 2026-05-03
 
 ---
 
@@ -109,11 +109,25 @@
 **Unit: 002-daemon-reconnect-re-resolution** (1 story)
 - [ ] **001-connect-loop-re-resolves** (daemon-reconnect-re-resolution): Move resolve call inside connect_hyprland_socket() loop body; swap-mid-retry test - Should - PLANNED
 
+### 018-sock-trigger-ipc
+
+**Unit: 001-socket-transport** (5 stories)
+- [x] **001-daemon-binds-sock-dgram** (socket-transport): TOCTOU-safe SOCK_DGRAM bind + socket_path() lib helper; 4 socket tests replacing 4 FIFO tests via is_socket() - Must - ✅ GENERATED
+- [x] **002-dgram-listener-replaces-fifo** (socket-transport): dgram_listener task; 0-byte = canonical kick; non-empty ignored with debug log (FR-9 lock); bounded recv-error backoff - Must - ✅ GENERATED
+- [x] **003-cli-kick-subcommand** (socket-transport): media-control kick + lib kick() helper; ECONNREFUSED/ENOENT silent (exit 0); p99 < 100ms in all daemon states - Must - ✅ GENERATED
+- [x] **004-daemon-fifo-cleanup** (socket-transport): Best-effort unlink of legacy FIFO at startup; delete ~118 LOC of FIFO machinery + 4 FIFO tests - Should - ✅ GENERATED
+- [x] **005-docs-update** (socket-transport): CLAUDE.md + readme.md + daemon docstring reflect new transport, FR-9 wire format, kick subcommand - Must - ✅ GENERATED
+
+**Unit: 002-rollout-migration** (3 stories)
+- [x] **001-hyprland-keybind-migration** (rollout-migration): Replace 9 layoutmsg keybinds in ~/.config/hypr/conf.d/common.conf from FIFO echo to media-control kick - Must - ✅ GENERATED
+- [x] **002-nixos-module-cleanup** (rollout-migration): Remove dead systemd.user.sockets.media-control-daemon block from ~/nix/modules/apps/media/media-control.nix; nixos-rebuild - Must - ✅ GENERATED
+- [x] **003-end-to-end-validation** (rollout-migration): Run DoD validation matrix on malphas; document outcome of intent-017 daemon-stop-hang side issue - Must - ✅ GENERATED
+
 ---
 
 ## Stories by Status
 
 - **Planned**: 15
-- **Generated**: 30
+- **Generated**: 38
 - **In Progress**: 0
 - **Completed**: 3
